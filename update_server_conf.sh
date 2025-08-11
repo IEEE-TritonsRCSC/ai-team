@@ -21,7 +21,8 @@ replace_server_param() {
     local new_value="$2"
     
     # Use sed to find and replace the line starting with the parameter
-    sed -i "s/^server::${param_name} = .*/server::${param_name} = ${new_value}/" "$CONFIG_FILE"
+    # Using | as delimiter to handle paths with forward slashes
+    sed -i "s|^server::${param_name} = .*|server::${param_name} = ${new_value}|" "$CONFIG_FILE"
     
     # Check if the replacement was successful
     if grep -q "^server::${param_name} = ${new_value}" "$CONFIG_FILE"; then
