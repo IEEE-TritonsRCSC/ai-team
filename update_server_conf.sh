@@ -32,8 +32,8 @@ replace_server_param() {
     fi
 }
 
-replace_server_param "text_log_dir" "./text_logs/"
-replace_server_param "game_log_dir" "./game_logs/"
+replace_server_param "text_log_dir" "'./text_logs/'"
+replace_server_param "game_log_dir" "'./game_logs/'"
 replace_server_param "kick_off_wait" "10"
 replace_server_param "kick_rand" "0.01"
 replace_server_param "player_rand" "0.01"
