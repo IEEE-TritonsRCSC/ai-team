@@ -10,24 +10,63 @@ UDP_CONFIG = (UDP_IP, UDP_PORT)
 
 # UDP client to send a message to the simulation server
 class TritonClient:
-    def __init__(self, teamname: str, side: str, id: int, orientations: tuple):
+    def __init__(self, teamname: str, side: str, id: int, fullstate: bool = True):
         self.teamname = teamname
         self.side = side
         self.id = id
-        self.orientations = orientations
+        self.fullstate = fullstate
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.running = True
         self.last_action = None
         self.kicked_off = False  # Track if the client has kicked off
         self.next_action = None  # Store next manual action to execute
         self.received_message = None
+        self.server_addr = UDP_CONFIG  # Initialize with default, will be updated after connect
         self.connect()
         self.start_listening()
 
     def connect(self):
-        init_message = f"(init {self.teamname})"
+        init_message = f"(init {self.teamname} (version 19))\0"
         self.sock.sendto(init_message.encode(), UDP_CONFIG)
         print(f"Sent: {init_message}")
+        
+        # Wait for server response to get the assigned port and confirm registration
+        try:
+            data, addr = self.sock.recvfrom(8192)
+            message = data.decode('utf-8', errors='ignore')
+            print(f"Init response: {message}")
+            
+            # Parse the init response to extract player info
+            # Expected format: (init l 1 before_kick_off) or (init r 2 before_kick_off)
+            init_regex = r'\(init ([lr]) (\d+) ([^)]+)\)'
+            match = re.search(init_regex, message)
+            
+            if match:
+                confirmed_side = match.group(1)
+                assigned_id = int(match.group(2))
+                game_mode = match.group(3)
+                
+                print(f"Registration confirmed:")
+                print(f"  Side: {confirmed_side}")
+                print(f"  Player ID: {assigned_id}")
+                print(f"  Game mode: {game_mode}")
+                
+                # Update player ID if it was assigned by server
+                self.id = assigned_id
+                self.side = confirmed_side
+                
+                # Update the server address to use the port from the response
+                self.server_addr = addr
+                print(f"Server assigned address: {self.server_addr}")
+                
+                return True
+            else:
+                print(f"Error: Could not parse init response: {message}")
+                return False
+                
+        except Exception as e:
+            print(f"Error during connection: {e}")
+            return False
 
     def start_listening(self):
         """Start a background thread to listen for incoming messages"""
@@ -44,11 +83,11 @@ class TritonClient:
                 print(f"Received: {message}")
                 
                 # Check if this is a sensory message that requires a response
-                if message.startswith('(see') or message.startswith('(hear') or message.startswith('(sense_body'):
-                    if '(hear 0 referee kick_off_l)' in message:
-                        self.kicked_off = True
-                    self.received_message = message  # Store the received message
-                    self.send_cycle_action()
+                if '(hear 0 referee kick_off_l)' in message:
+                    self.kicked_off = True
+                self.received_message = message  # Store the received message
+                self.send_cycle_action()
+                # time.sleep(0.1)
                     
             except socket.timeout:
                 continue  # Continue listening if timeout occurs
@@ -65,11 +104,12 @@ class TritonClient:
             self.last_action = self.next_action
             self.next_action = None  # Clear the queued action
         else:
-            # Default behavior: simple movement pattern
-            if self.last_action:
+            if self.last_action and not self.kicked_off:
                 action_type, args = self.last_action
-            else:
+            elif self.kicked_off:
                 action_type, args = 'turn', [0]
+            else:
+                return
 
         if action_type == 'turn':
             self._send_turn(args[0])
@@ -84,28 +124,28 @@ class TritonClient:
 
     # Internal methods that actually send the commands
     def _send_turn(self, angle):
-        message = f"(turn {angle})"
-        self.sock.sendto(message.encode(), UDP_CONFIG)
+        message = f"(turn {angle})\0"
+        self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
     def _send_dash(self, power):
-        message = f"(dash {power})"
-        self.sock.sendto(message.encode(), UDP_CONFIG)
+        message = f"(dash {power})\0"
+        self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
     def _send_kick(self, power, angle=0):
-        message = f"(kick {power} {angle})"
-        self.sock.sendto(message.encode(), UDP_CONFIG)
+        message = f"(kick {power} {angle})\0"
+        self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
     def _send_catch(self, angle=0):
-        message = f"(catch {angle})"
-        self.sock.sendto(message.encode(), UDP_CONFIG)
+        message = f"(catch {angle})\0"
+        self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
     def _send_move(self, x, y):
-        message = f"(move {x} {y})"
-        self.sock.sendto(message.encode(), UDP_CONFIG)
+        message = f"(move {x} {y})\0"
+        self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
     def turn(self, angle):
@@ -138,12 +178,25 @@ class TritonClient:
         self.next_action = ('move', [x, y])
         print(f"Queued: move {x} {y}")
 
+    def get_pos(self, message):
+        if self.fullstate:
+            pos_regex = rf'\(\(p {self.side} {self.id} \d\)\s+([\d\.\-]+)\s+([\d\.\-]+)'
+            match = re.search(pos_regex, message)
+            if match:
+                x = float(match.group(1))
+                y = float(match.group(2))
+                return (x, y)
+            else:
+                return None
+        else:
+            raise NotImplementedError("Position extraction not implemented for non-fullstate mode")
+            
     def chase_ball(self, message):
         ball_regex = r'\(\(ball\)\s+([\d\.\-]+)\s+([\d\.\-]+)(\s+([\d\.\-]+))?(\s+([\d\.\-]+))?\)'
         match = re.search(ball_regex, message)
         if match:
-            distance = float(match.group(1))  # 0.7
-            angle = float(match.group(2))      # 64
+            distance = float(match.group(1))
+            angle = float(match.group(2))
             print(distance, angle)
             if abs(distance) < KICKABLE_MARGIN:
                 return True
@@ -157,8 +210,8 @@ class TritonClient:
 
     def disconnect(self):
         self.running = False  # Stop the listening thread
-        message = "(bye)"
-        self.sock.sendto(message.encode(), UDP_CONFIG)
+        message = "(bye)\0"
+        self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
         time.sleep(0.1)  # Give time for the message to be sent
         self.sock.close()
