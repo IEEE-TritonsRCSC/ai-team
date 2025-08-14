@@ -41,13 +41,13 @@ class TritonClient:
             self.send("(kick 100 0)")
             time.sleep(1)
 
-            for i in range(38):
+            for i in range(44):
                 self.send("(dash 100)")
                 time.sleep(0.1)
             
             time.sleep(2)
-            self.send("(kick 100 0)")
-            time.sleep(1)
+            self.send("(kick 50 0)")
+            time.sleep(10)
                 
         except KeyboardInterrupt:
             print("Shutting down...")
