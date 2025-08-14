@@ -4,7 +4,7 @@ import math
 import re
 import threading
 
-UDP_IP = "172.20.252.115"
+UDP_IP = "127.0.0.1"
 UDP_PORT = 6000
 UDP_CONFIG = (UDP_IP, UDP_PORT)
 
@@ -65,7 +65,7 @@ class TritonClient:
         """Receive and process sensor data from the server"""
         while True:
             try:
-                data, addr = self.sock.recvfrom(4096)
+                data, addr = self.sock.recvfrom(8192)
                 message = data.decode('utf-8')
                 print(message)
                 
@@ -149,7 +149,8 @@ class TritonClient:
 ### MAIN COMMANDS ###
     def connect(self):
         """Connect to the soccer server"""
-        self.send("(init TritonBot)")
+        self.sock.bind((UDP_IP, 0))
+        self.send("(init TritonBot (version 19))")
         print("Connected to server")
 
     def disconnect(self):
@@ -169,3 +170,5 @@ client = TritonClient("Triton", "left", 0, (0, 0, 0))
 
 if __name__ == "__main__":
     client.main()
+    client.start_listening()
+    client.receive_and_process()
