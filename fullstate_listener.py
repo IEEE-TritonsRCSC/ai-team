@@ -1,22 +1,20 @@
 import time
 from soccer_client import TritonClient
 
+# UDP_IP = "127.0.0.1"
+# UDP_PORT = 
+# UDP_CONFIG = (UDP_IP, UDP_PORT)
+
 if __name__ == "__main__":
     client = TritonClient("TritonBot", "l", 1, (0, 0, 0))
     try:
-        client.move(-10, 0)
-
-        while not client.kicked_off:
-            time.sleep(0.1)
+        time.sleep(5)
+        client.move(-10, 10)
 
         while True:
-            if client.received_message and client.chase_ball(client.received_message):
-                print("Got ball!")
-                client.kick(100)
-                break
+            if client.received_message and client.received_message.startswith("(fullstate"):
+                print("self position:", client.get_pos(client.received_message))
             time.sleep(0.1)
-        
-        time.sleep(5)
         
     except KeyboardInterrupt:
         print("\nShutting down...")

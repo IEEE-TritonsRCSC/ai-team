@@ -2,6 +2,7 @@ import socket
 import time
 import threading
 import re
+import numpy as np
 from constants.client_constants import *
 
 UDP_IP = "127.0.0.1"
@@ -10,17 +11,19 @@ UDP_CONFIG = (UDP_IP, UDP_PORT)
 
 # UDP client to send a message to the simulation server
 class TritonClient:
-    def __init__(self, teamname: str, side: str, id: int, fullstate: bool = True):
+    def __init__(self, teamname: str, side: str, id: int, fullstate: bool = True, print_messages=True):
         self.teamname = teamname
         self.side = side
         self.id = id
         self.fullstate = fullstate
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.state = {}
         self.running = True
         self.last_action = None
         self.kicked_off = False  # Track if the client has kicked off
         self.next_action = None  # Store next manual action to execute
-        self.received_message = None
+        self.print_messages = print_messages
+        # self.received_messages = []
         self.server_addr = UDP_CONFIG  # Initialize with default, will be updated after connect
         self.connect()
         self.start_listening()
@@ -80,12 +83,18 @@ class TritonClient:
             try:
                 data, addr = self.sock.recvfrom(8192)  # Buffer size of 8192 bytes
                 message = data.decode('utf-8', errors='ignore')
-                print(f"Received: {message}")
+                if self.print_messages:
+                    print(f"Received: {message}")
                 
                 # Check if this is a sensory message that requires a response
                 if '(hear 0 referee kick_off_l)' in message:
                     self.kicked_off = True
-                self.received_message = message  # Store the received message
+                elif message.startswith("(fullstate"):
+                    self.get_pos(message)  # Update self position from fullstate message
+                    self.get_ball(message)
+                # self.received_messages.append(message)
+                # if len(self.received_messages) > 5:
+                #     self.received_messages.pop(0)
                 self.send_cycle_action()
                 # time.sleep(0.1)
                     
@@ -114,7 +123,7 @@ class TritonClient:
         if action_type == 'turn':
             self._send_turn(args[0])
         elif action_type == 'dash':
-            self._send_dash(args[0])
+            self._send_dash(args[0], args[1])
         elif action_type == 'kick':
             self._send_kick(args[0], args[1] if len(args) > 1 else 0)
         elif action_type == 'catch':
@@ -128,8 +137,8 @@ class TritonClient:
         self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
-    def _send_dash(self, power):
-        message = f"(dash {power})\0"
+    def _send_dash(self, power, angle=0.0):
+        message = f"(dash {power} {angle})\0"
         self.sock.sendto(message.encode(), self.server_addr)
         print(f"Sent: {message}")
 
@@ -180,33 +189,53 @@ class TritonClient:
 
     def get_pos(self, message):
         if self.fullstate:
-            pos_regex = rf'\(\(p {self.side} {self.id} \d\)\s+([\d\.\-]+)\s+([\d\.\-]+)'
+            pos_regex = rf'\(\(p {self.side} {self.id} \d\)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)'
             match = re.search(pos_regex, message)
             if match:
                 x = float(match.group(1))
                 y = float(match.group(2))
-                return (x, y)
-            else:
-                return None
+                vel_x = float(match.group(3))
+                vel_y = float(match.group(4))
+                body_angle = float(match.group(5))
+                neck_angle = float(match.group(6))
+                self.state['self_pose'] = (x, y, vel_x, vel_y, body_angle, neck_angle)
+                # print('Extracted self position:', self.state['self_pose'])
+                return self.state['self_pose']
+            return self.state.get('self_pose', None)
         else:
             raise NotImplementedError("Position extraction not implemented for non-fullstate mode")
-            
-    def chase_ball(self, message):
-        ball_regex = r'\(\(ball\)\s+([\d\.\-]+)\s+([\d\.\-]+)(\s+([\d\.\-]+))?(\s+([\d\.\-]+))?\)'
-        match = re.search(ball_regex, message)
-        if match:
-            distance = float(match.group(1))
-            angle = float(match.group(2))
-            print(distance, angle)
-            if abs(distance) < KICKABLE_MARGIN:
-                return True
-            if abs(angle) >= 3.0:
-                self.turn(angle)
-                return False
-            self.dash(min(50, distance * 10))
-            return False
+        
+    def get_ball(self, message):
+        if self.fullstate:
+            ball_regex = rf'\(\(b\)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)'
+            match = re.search(ball_regex, message)
+            if match:
+                x = float(match.group(1))
+                y = float(match.group(2))
+                vel_x = float(match.group(3))
+                vel_y = float(match.group(4))
+                self.state['ball_pose'] = (x, y, vel_x, vel_y)
+                return self.state['ball_pose']
+            return self.state.get('ball_pose', None)
         else:
+            raise NotImplementedError("Position extraction not implemented for non-fullstate mode")
+
+    def goto(self, x, y, margin=KICKABLE_MARGIN, theta=None, speed=50):
+        self_pos = self.state.get('self_pose', None)
+        if not self_pos:
+            print("No self position available")
             return False
+        destination = np.array([x, y])
+        self_pos_xy = np.array(self_pos[:2])
+        distance = np.linalg.norm(destination - self_pos_xy)
+        angle = np.degrees(np.arctan2(destination[1] - self_pos[1], destination[0] - self_pos[0])) - self_pos[4]
+        if distance < margin:
+            if theta is not None:
+                angle_diff = (theta - self_pos[4] + 180) % 360 - 180
+                self.turn(angle_diff)
+            return True
+        self.dash(min(speed, distance * 10), angle)
+        return False
 
     def disconnect(self):
         self.running = False  # Stop the listening thread
