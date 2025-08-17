@@ -1,4 +1,6 @@
+*.pyc
 .vscode/
 Downloads/
 game_logs/
 text_logs/
+__pycache__
