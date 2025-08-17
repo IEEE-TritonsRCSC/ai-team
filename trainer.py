@@ -97,11 +97,16 @@ class Trainer:
         return actions
     
     def execute_actions(self, actions):
+        if args.hardware:
+            msg = ""
         for player, action in zip(self.players[1::], actions):
             player.execute_action(action)
-        if args.hardware:
-            msg = "\n".join(actions) + "\0"
-            self.esp_sock.sendto(msg.encode(), ESP_ADDR)
+            if args.hardware:
+                if action is not None:
+                    msg += "\n" + action
+        if args.hardware and len(msg) > 0:
+            msg += "\0"
+            self.esp_sock.sendto(msg[1::].encode(), ESP_ADDR)
 
     def receive_information(self):
         """Receive information from the server."""
