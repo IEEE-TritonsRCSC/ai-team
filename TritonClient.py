@@ -3,7 +3,6 @@ import socket
 import time
 import math
 import re
-import threading
 import multiprocessing
 import trainer
 from multiprocessing import Manager
@@ -31,14 +30,17 @@ global_trainer_data.update({
 
 
 ### GETTERS ###
+def get_cycle():
+    return global_trainer_data['cycle']
+
 def get_ball_position():
     return (global_trainer_data['ball_x'], global_trainer_data['ball_y'])
 
 def get_ball_speed():
     return (global_trainer_data['ball_speed_x'], global_trainer_data['ball_speed_y'])
 
-def get_cycle():
-    return global_trainer_data['cycle']
+def get_all_players():
+    return global_trainer_data['players'].copy()
 
 def get_player_position(team_name, player_id):
     player_key = f"{team_name}_{player_id}"
@@ -47,8 +49,19 @@ def get_player_position(team_name, player_id):
         return (players[player_key]['x'], players[player_key]['y'])
     return None
 
-def get_all_players():
-    return global_trainer_data['players'].copy()
+def get_player_speed(team_name, player_id):
+    player_key = f"{team_name}_{player_id}"
+    players = global_trainer_data['players']
+    if player_key in players:
+        return (players[player_key]['speed_x'], players[player_key]['speed_y'])
+    return None
+
+def get_player_orientation(team_name, player_id):
+    player_key = f"{team_name}_{player_id}"
+    players = global_trainer_data['players']
+    if player_key in players:
+        return (players[player_key]['body_angle'], players[player_key]['neck_angle'])
+    return None
 
 
 ### ROBOT CLASS ###
@@ -73,7 +86,7 @@ class TritonClient:
             for i in range(10):
                 self.send("(dash 100)")
                 time.sleep(0.1)
-                print("YOOO IT WORKS " + str(get_ball_position()))
+                print("YOOO IT WORKS " + str(get_player_position(self.teamname, self.id)))
             
             time.sleep(1)
             self.send("(kick 100 0)")
@@ -126,11 +139,7 @@ class TritonClient:
 
     def send(self, msg):
         try:
-            if isinstance(msg, str):
-                msg_bytes = msg.encode() + b'\0'
-            else:
-                msg_bytes = msg
-            
+            msg_bytes = msg.encode() + b'\0'
             self.sock.sendto(msg_bytes, self.addr)
             print(f"Sent: {msg}")
         except Exception as e:

@@ -25,7 +25,6 @@ class Trainer:
         self.global_data = None
 
     def set_global_data(self, global_data):
-        """Set global data reference for inter-process communication"""
         self.global_data = global_data
 
     ### PARSING LOGIC ###
@@ -88,7 +87,6 @@ class Trainer:
 
     ### PRINT LOGS ###
     def print_game_state(self):
-        """Print a more compact version of the game state"""
         print(f"Cycle {self.cycle:3d} | Ball: ({self.ball['x']:6.1f}, {self.ball['y']:6.1f}) | "
               f"Speed: ({self.ball['speed_x']:6.2f}, {self.ball['speed_y']:6.2f}) | "
               f"Players: {len(self.players)}")
