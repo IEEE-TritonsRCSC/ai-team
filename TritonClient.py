@@ -1,13 +1,57 @@
+### IMPORTS ###
 import socket
 import time
 import math
 import re
 import threading
+import multiprocessing
+import trainer
+from multiprocessing import Manager
 
+
+### CONSTANTS ###
 UDP_IP = "127.0.0.1"
 UDP_PORT = 6000
 UDP_CONFIG = (UDP_IP, UDP_PORT)
+INIT_PATTERN = r"\(init ([lr]) ([1-9]|10|11) before_kick_off\)"
 
+
+### GLOBAL TRAINER DATA ###
+manager = Manager()
+global_trainer_data = manager.dict()
+global_trainer_data.update({
+    'cycle': 0,
+    'ball_x': 0.0,
+    'ball_y': 0.0,
+    'ball_speed_x': 0.0,
+    'ball_speed_y': 0.0,
+    'players': {},
+    'goals': {'left': {'x': -52.5, 'y': 0}, 'right': {'x': 52.5, 'y': 0}}
+})
+
+
+### GETTERS ###
+def get_ball_position():
+    return (global_trainer_data['ball_x'], global_trainer_data['ball_y'])
+
+def get_ball_speed():
+    return (global_trainer_data['ball_speed_x'], global_trainer_data['ball_speed_y'])
+
+def get_cycle():
+    return global_trainer_data['cycle']
+
+def get_player_position(team_name, player_id):
+    player_key = f"{team_name}_{player_id}"
+    players = global_trainer_data['players']
+    if player_key in players:
+        return (players[player_key]['x'], players[player_key]['y'])
+    return None
+
+def get_all_players():
+    return global_trainer_data['players'].copy()
+
+
+### ROBOT CLASS ###
 class TritonClient:
     def __init__(self, teamname: str, side: str, id: int, orientations: tuple):
         self.teamname = teamname
@@ -15,16 +59,9 @@ class TritonClient:
         self.id = id
         self.orientations = orientations
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.1)  # Set timeout for non-blocking receive
-
-        self.ball_distance = float('inf')
-        self.ball_direction = 0
-        self.player_x = 0
-        self.player_y = 0
-        self.goal_x = 52.5 if side == "left" else -52.5  # Goal position based on side
-        self.goal_y = 0
 
         self.connect()
+
 
 ### MAIN FUNCTION ###
     def main(self):
@@ -36,6 +73,7 @@ class TritonClient:
             for i in range(10):
                 self.send("(dash 100)")
                 time.sleep(0.1)
+                print("YOOO IT WORKS " + str(get_ball_position()))
             
             time.sleep(1)
             self.send("(kick 100 0)")
@@ -55,120 +93,82 @@ class TritonClient:
             self.disconnect()
             print("done")
 
-### DATA PROCESSING LOGIC ###
-    def start_listening(self):
-        """Start a background thread to listen for incoming messages"""
-        self.listen_thread = threading.Thread(target=self.receive_and_process, daemon=True)
-        self.listen_thread.start()
-
-    def receive_and_process(self):
-        """Receive and process sensor data from the server"""
-        while True:
-            try:
-                data, addr = self.sock.recvfrom(8192)
-                message = data.decode('utf-8')
-                print(message)
-                
-                # Parse vision data to find ball
-                #if "(see" in message:
-                if message.startswith('(see') or message.startswith('(hear') or message.startswith('(sense_body'):
-                    self.parse_vision_data(message)
-                    
-            except socket.timeout:
-                pass  # No data received, continue
-            except Exception as e:
-                print(f"Error receiving data: {e}")
-
-    def parse_vision_data(self, message):
-        """Parse vision data to extract ball and player positions"""
-        try:
-            # Extract ball information from vision data
-            ball_match = re.search(r'\(\(ball\)\s+([\d\.\-]+)\s+([\d\.\-]+)(\s+([\d\.\-]+))?(\s+([\d\.\-]+))?\)', message)
-            if ball_match:
-                self.ball_distance = float(ball_match.group(1))
-                self.ball_direction = float(ball_match.group(2))
-                print(f"Ball: dist={self.ball_distance:.2f}, dir={self.ball_direction:.2f}")
-            
-            # Extract player position (if available)
-            player_match = re.search(r'\(self\)\s+\(pol\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)', message)
-            if player_match:
-                self.player_x = float(player_match.group(1))
-                self.player_y = float(player_match.group(2))
-                
-        except Exception as e:
-            print(f"Error parsing vision data: {e}")
 
 ### BALL CHASING LOGIC ###
     def chase_ball(self):
         """Main ball chasing logic"""
-        if self.ball_distance == float('inf'):
-            # No ball visible, search by turning
-            self.send("(turn 45)")
-            return
-        
-        # If ball is very close, try to kick it towards goal
-        if self.ball_distance < 1.0:
-            self.kick_towards_goal()
-        else:
-            # Move towards the ball
-            self.move_towards_ball()
+        pass
 
-    def move_towards_ball(self):
-        """Move towards the ball"""
-        # Turn towards the ball
-        if abs(self.ball_direction) > 5:  # If ball is not directly in front
-            turn_angle = self.ball_direction
-            # Limit turn angle to prevent excessive turning
-            turn_angle = max(-45, min(45, turn_angle))
-            self.send(f"(turn {turn_angle})")
-        else:
-            # Ball is in front, dash towards it
-            dash_power = min(100, max(20, self.ball_distance * 10))  # Adjust power based on distance
-            self.send(f"(dash {dash_power})")
 
 ### KICKING TOWARDS GOAL LOGIC ###
     def kick_towards_goal(self):
         """Kick the ball towards the goal"""
-        # Calculate angle to goal
-        goal_angle = self.calculate_goal_angle()
-        
-        # Turn towards goal if needed
-        if abs(goal_angle) > 10:
-            self.send(f"(turn {goal_angle})")
-        else:
-            # Kick towards goal
-            kick_power = 100  # Strong kick
-            self.send(f"(kick {kick_power} {goal_angle})")
+        pass
 
     def calculate_goal_angle(self):
         """Calculate the angle to the goal"""
-        # Simple calculation - in a real implementation you'd use trigonometry
-        # For now, use the ball direction as approximation
-        return self.ball_direction
+        pass
 
-### MAIN COMMANDS ###
+
+### CORE FUNCTIONS ###
     def connect(self):
-        """Connect to the soccer server"""
-        self.sock.bind((UDP_IP, 0))
-        self.send("(init TritonBot (version 19))")
-        print("Connected to server")
+        self.sock.sendto(b"(init TritonBot (version 19))\0", UDP_CONFIG)
+        (data, address) = self.sock.recvfrom(64)
+        if m := re.search(INIT_PATTERN, data.decode()):
+            self.side = m.group(1)
+            self.id = int(m.group(2))
+            self.addr = address
+        else:
+            raise Exception(f"Unexpected response: {data} from {address}")
 
     def disconnect(self):
-        """Disconnect from the soccer server"""
         self.send("(bye)")
 
-    def send(self, msg: str):
-        """Send a command to the server"""
+    def send(self, msg):
         try:
-            self.sock.sendto(msg.encode(), UDP_CONFIG)
+            if isinstance(msg, str):
+                msg_bytes = msg.encode() + b'\0'
+            else:
+                msg_bytes = msg
+            
+            self.sock.sendto(msg_bytes, self.addr)
             print(f"Sent: {msg}")
         except Exception as e:
             print(f"Error sending command: {e}")
 
-# Create and run the client
-client = TritonClient("Triton", "left", 0, (0, 0, 0))
+### RUN METHODS ###
+def run_trainer():
+    trainer_instance = trainer.Trainer()
+    trainer_instance.set_global_data(global_trainer_data)
+    trainer_instance.main()
 
-if __name__ == "__main__":
+def run_client():
+    client = TritonClient("Triton", "left", 0, (0, 0, 0))
     client.main()
-    client.start_listening()
-    client.receive_and_process()
+
+### MAIN ###
+if __name__ == "__main__":
+    client_process = multiprocessing.Process(target=run_client, name="TritonClient")
+    trainer_process = multiprocessing.Process(target=run_trainer, name="Trainer")
+    
+    try:
+        print("Starting trainer process...")
+        trainer_process.start()
+        print("Starting client process...")
+        client_process.start()
+        
+        # Wait for both processes to complete
+        client_process.join()
+        trainer_process.join()
+        
+    except KeyboardInterrupt:
+        print("Shutting down processes...")
+        if client_process.is_alive():
+            client_process.terminate()
+        if trainer_process.is_alive():
+            trainer_process.terminate()
+        
+        # Wait for processes to finish
+        client_process.join()
+        trainer_process.join()
+        print("All processes terminated.")
