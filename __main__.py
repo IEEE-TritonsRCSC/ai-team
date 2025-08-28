@@ -1,3 +1,10 @@
+"""
+Main entry point for the AI Team soccer robot control system.
+
+This module provides the main program for controlling RoboCup soccer teams
+in various environments including simulation and physical robot scenarios.
+"""
+
 import argparse
 import threading
 from networking.networker import TeamInfo, GameState, Networker
@@ -16,6 +23,12 @@ parser.add_argument("--env", choices=[
 
 
 def main():
+    """
+    Main execution function for the soccer AI system.
+    
+    Parses command-line arguments, initializes team information and AI components,
+    and runs the main game loop that processes game states and executes AI decisions.
+    """
     args = parser.parse_args()
     team_infos = [TeamInfo(args.teamname, 6), TeamInfo("TeamB", 6)]
     soccer_ai = SoccerAI()
@@ -53,6 +66,15 @@ def main():
 
 def process_team(soccer_ai: SoccerAI, networker: Networker,
                  game_state: GameState, team_name: str):
+    """
+    Process AI decisions for a specific team.
+    
+    Args:
+        soccer_ai: The AI instance that makes decisions
+        networker: The networking component for command execution
+        game_state: Current state of the game
+        team_name: Name of the team to process
+    """
     ai_output = soccer_ai.decide_action(game_state, team_name)
     translated = soccer_ai.translate_ai_output(ai_output)
     networker.execute_ai_output(translated, team_name)
