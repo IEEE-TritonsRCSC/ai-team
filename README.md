@@ -1,1 +1,182 @@
-# ai-team
+# AI Team - RoboCup Soccer AI System
+
+A Python-based AI framework for controlling robotic soccer teams in both simulation and real-world environments. The system supports the RoboCup Soccer Simulation Server and can be extended for physical robot control.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+  - [Core Components](#core-components)
+  - [Directory Structure](#directory-structure)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Basic Usage](#basic-usage)
+  - [Command Line Options](#command-line-options)
+- [Development](#development)
+  - [Implementing Custom AI](#implementing-custom-ai)
+  - [Game State Structure](#game-state-structure)
+- [Environment Modes](#environment-modes)
+  - [Simulation Only](#simulation-only-sim-only)
+  - [Mixed Mode](#mixed-mode-sim-mixed)
+  - [Field Practice](#field-practice-field-practice)
+  - [Tournament Mode](#tournament-mode-field-tournament)
+- [Technical Details](#technical-details)
+  - [Networking Protocol](#networking-protocol)
+  - [Data Processing](#data-processing)
+  - [Threading Model](#threading-model)
+- [License](#license)
+- [Contact](#contact)
+
+## Overview
+
+This project provides a complete infrastructure for developing AI strategies for soccer-playing robots. It includes networking components for communication with simulators and robots, data processing utilities, and a modular AI interface for implementing custom strategies.
+
+## Features
+
+- **Multi-environment Support**: Works with simulation, mixed simulation/physical, and field environments
+- **Concurrent Team Control**: Can control multiple teams simultaneously using threading
+- **Modular AI Interface**: Easy-to-extend AI system for implementing custom strategies
+- **Real-time Game State Processing**: Efficient parsing and processing of game state data
+- **Flexible Network Communication**: Support for both simulator and robot communication protocols
+
+## Architecture
+
+### Core Components
+
+- **Main Entry Point** (`__main__.py`): Application entry point with command-line interface
+- **AI Interface** (`ai_interface/`): Pluggable AI system for decision making
+- **Networking** (`networking/`): Communication layer for simulators and robots
+  - `networker.py`: High-level networking coordinator
+  - `socket_utils.py`: Socket management and communication protocols
+  - `data_utils.py`: Data serialization/deserialization utilities
+
+### Directory Structure
+
+```
+ai-team/
+├── __main__.py           # Main application entry point
+├── ai_interface/         # AI strategy implementations
+│   └── naive.py         # Basic AI implementation
+├── networking/          # Network communication layer
+│   ├── networker.py     # Main networking coordinator
+│   ├── socket_utils.py  # Socket utilities and protocols
+│   └── data_utils.py    # Data processing utilities
+├── game_logs/           # Game state logs (generated)
+└── text_logs/           # Debug/info logs (generated)
+```
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd ai-team
+```
+
+## Usage
+
+### Basic Usage
+
+Run the AI system with default settings:
+```bash
+python .
+```
+
+### Command Line Options
+
+- `--teamname`: Set team name (default: "TritonBots")
+- `--env`: Set environment mode
+  - `sim-only`: Simulator only (default)
+  - `sim-mixed`: Mixed simulator and physical robots
+  - `field-practice`: Physical robots with camera
+  - `field-tournament`: Tournament mode (own team only)
+
+## Development
+
+### Implementing Custom AI
+
+1. Create a new AI class in `my_custom_ai.py` under `ai_interface/`:
+
+```python
+from networking.data_utils import GameState
+
+class SoccerAI:
+    def __init__(self):
+        # Initialize your AI
+        pass
+    
+    def decide_action(self, game_state: GameState, teamname: str):
+        # Implement your decision logic
+        output = None
+        # ... your logic here
+        return output
+
+    def translate_ai_output(self, ai_output):
+        # Translate AI decisions to robot commands
+        return ai_output
+```
+
+2. Update `__main__.py` to use your custom AI:
+
+```python
+from ai_interface.my_custom_ai import SoccerAI
+```
+
+### Game State Structure
+
+The `GameState` object contains:
+- `count`: Server cycle number
+- `timestamp`: Current timestamp
+- `ball_pos`: Ball position (x, y)
+- `robot_poses`: Dictionary of team robot positions
+
+## Environment Modes
+
+### Simulation Only (`sim-only`)
+- One or both teams controlled by AI in simulation
+- Uses RoboCup Soccer Server
+- Ideal for development and testing
+
+### Mixed Mode (`sim-mixed`)
+- Combination of simulated and physical robots
+- Requires additional hardware setup
+
+### Field Practice (`field-practice`)
+- Physical robots with camera system
+- One or both teams can be controlled
+
+### Tournament Mode (`field-tournament`)
+- Only controls your own team
+- Other team controlled by opponents
+- Camera-based positioning
+
+## Technical Details
+
+### Networking Protocol
+
+The system communicates with the Simulation Server using UDP sockets on localhost:
+- **Client Port**: 6000 (robot commands)
+- **Trainer Port**: 6001 (game state monitoring)
+
+### Data Processing
+
+Game state data is parsed using regex patterns to extract:
+- Ball position from simulation messages
+- Robot poses and orientations
+- Game timing information
+
+### Threading Model
+
+The system uses threading to:
+- Process multiple teams concurrently
+- Send commands to multiple robots simultaneously
+- Maintain responsive network communication
+
+## License
+
+[Add license information here]
+
+## Contact
+
+[Add contact information here]
