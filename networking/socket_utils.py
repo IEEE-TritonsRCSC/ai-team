@@ -12,6 +12,10 @@ SIM_CLIENT_ADDR = (LOCALHOST_IP, 6000)
 SIM_TRAINER_ADDR = (LOCALHOST_IP, 6001)
 INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) before_kick_off\)"
 
+# Multicast settings for real robots
+COMMAND_IP = "239.42.42.42"
+COMMAND_PORT = 10000
+
 TeamInfo = namedtuple("TeamInfo", ["name", "n_players"])
 
 class Listener:
@@ -125,11 +129,14 @@ class Commander:
 
         if environment in ["sim-only", "sim-mixed"]:
             self.create_sim_clients()
-        
+
+        self.socks, self.addrs = {}, {}
         if environment != "sim-only":
-            # TODO: use multicasting
-            for team_info in team_infos:
-                self.socks[team_info.name] = None
+            for i, team_info in enumerate(team_infos):
+                teamname = team_info.name
+                port_num = COMMAND_PORT + (i * 1000)
+                self.socks[teamname] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.addrs[teamname] = (COMMAND_IP, port_num)
 
     def create_sim_clients(self):
         self.sim_clients = {}
@@ -154,9 +161,8 @@ class Commander:
             thread.join()
 
     def send_to_robots(self, teamname: str, command: bytes):
-        sock = self.socks[teamname]
-        # TODO: implement robot communication using multicast
-        pass
+        sock, addr = self.socks[teamname], self.addrs[teamname]
+        sock.sendto(command, addr)
 
     def disconnect_from_sim(self):
         threads = []
