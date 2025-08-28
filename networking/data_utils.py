@@ -1,3 +1,10 @@
+"""
+Data structures and serialization utilities for game state processing.
+
+This module handles parsing and serializing game data between different formats
+used by simulators, cameras, and robot communication protocols.
+"""
+
 import re
 import time
 from collections import namedtuple
@@ -10,7 +17,17 @@ GameState = namedtuple(
 )
 
 class Deserializer:
+    """Deserializes game data from various sources into GameState objects."""
     def sim_deserialize(self, data: bytes) -> GameState:
+        """
+        Parse simulator data into a GameState object.
+        
+        Args:
+            data: Raw bytes from simulator
+            
+        Returns:
+            Parsed GameState or None if parsing fails
+        """
         message = data.decode()
         
         # count (server cycle number)
@@ -38,6 +55,15 @@ class Deserializer:
         return GameState(count, timestamp, ball_pos, robot_poses)
 
     def sim_get_ball_pos(self, message: str) -> tuple:
+        """
+        Extract ball position from simulator message.
+        
+        Args:
+            message: Simulator message string
+            
+        Returns:
+            Tuple of (remaining_message, ball_position) or None
+        """
         if m := re.search(SIM_BALL_POS_REGEX, message):
             description = m.group(1).split()
             ball_pos = tuple(float(value) for value in description[0:2])
@@ -45,6 +71,15 @@ class Deserializer:
         return None
 
     def sim_get_robot_poses(self, message: str) -> dict[list[tuple]]:
+        """
+        Extract robot poses from simulator message.
+        
+        Args:
+            message: Simulator message string
+            
+        Returns:
+            Dictionary mapping team names to lists of robot poses
+        """
         robot_poses = {}
         while m := re.match(SIM_ROBOT_POSE_REGEX, message):
             teamname = m.group(1)
@@ -60,17 +95,30 @@ class Deserializer:
         return robot_poses
 
     def cam_deserialize(self, data: bytes) -> GameState:
+        """Parse camera data into GameState (placeholder implementation)."""
         return None
 
     def cam_get_ball_pos(self, message: str) -> tuple:
+        """Extract ball position from camera data (placeholder implementation)."""
         return None
 
     def cam_get_robot_poses(self, message: str) -> dict[list[tuple]]:
+        """Extract robot poses from camera data (placeholder implementation)."""
         return None
 
 
 class Serializer:
+    """Serializes commands into formats suitable for different targets."""
     def sim_serialize(self, actions) -> list[bytes]:
+        """
+        Serialize actions for simulator communication.
+        
+        Args:
+            actions: List of action strings
+            
+        Returns:
+            List of serialized command bytes
+        """
         messages = [None] * len(actions)
         for i, action in enumerate(actions):
             if action is None:
@@ -80,6 +128,15 @@ class Serializer:
         return messages
 
     def robot_serialize(self, actions) -> bytes:
+        """
+        Serialize actions for robot communication.
+        
+        Args:
+            actions: List of action strings
+            
+        Returns:
+            Serialized command bytes for robot transmission
+        """
         message = ""
         for action in actions:
             if action is None:
