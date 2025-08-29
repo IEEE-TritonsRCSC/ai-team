@@ -65,7 +65,7 @@ class Deserializer:
         """
         if m := re.search(SIM_BALL_POS_REGEX, message):
             description = m.group(1).split()
-            ball_pos = tuple(float(value) for value in description[0:2])
+            ball_pos = tuple(map(float, description[:2]))
             return message[m.end():], ball_pos
         return None
 
