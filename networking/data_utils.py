@@ -47,9 +47,8 @@ class Deserializer:
             return None
 
         # robot poses
-        if robot_poses := self.sim_get_robot_poses(message):
-            robot_poses = robot_poses
-        else:
+        robot_poses = self.sim_get_robot_poses(message)
+        if robot_poses is None:
             return None
 
         return GameState(count, timestamp, ball_pos, robot_poses)
