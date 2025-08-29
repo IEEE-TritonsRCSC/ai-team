@@ -237,7 +237,3 @@ class Commander:
             for client in team_clients:
                 time.sleep(0.1)
                 client.disconnect_from_sim()
-        
-        for thread in threads:
-            thread.join()
-
