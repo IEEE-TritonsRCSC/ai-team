@@ -233,7 +233,6 @@ class Commander:
 
     def disconnect_from_sim(self):
         """Disconnect all simulator clients."""
-        threads = []
         for team_clients in self.sim_clients.values():
             for client in team_clients:
                 time.sleep(0.1)

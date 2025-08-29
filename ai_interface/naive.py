@@ -33,7 +33,7 @@ class SoccerAI:
         actions = []
         kick = game_state.count % 2 == 0
         for robot in game_state.robot_poses[teamname]:
-            unum = int(list(robot.keys())[0])
+            unum = int(next(iter(robot.keys())))
             if unum == 1:
                 actions.append("kick 100 0" if kick else "dash 100")
             else:
