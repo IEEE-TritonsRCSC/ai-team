@@ -69,7 +69,7 @@ class Deserializer:
             return message[m.end():], ball_pos
         return None
 
-    def sim_get_robot_poses(self, message: str) -> dict[list]:
+    def sim_get_robot_poses(self, message: str) -> dict[str, list]:
         """
         Extract robot poses from simulator message.
         
@@ -101,7 +101,7 @@ class Deserializer:
         """Extract ball position from camera data (placeholder implementation)."""
         return None
 
-    def cam_get_robot_poses(self, message: str) -> dict[list[tuple]]:
+    def cam_get_robot_poses(self, message: str) -> dict[str, list]:
         """Extract robot poses from camera data (placeholder implementation)."""
         return None
 
