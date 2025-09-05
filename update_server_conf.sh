@@ -40,5 +40,6 @@ replace_server_param "player_rand" "0.01"
 replace_server_param "ball_rand" "0.01"
 replace_server_param "fullstate_l" "true"
 replace_server_param "fullstate_r" "true"
+replace_server_param "coach" "true"
 
 echo "Configuration file updated: $CONFIG_FILE"
