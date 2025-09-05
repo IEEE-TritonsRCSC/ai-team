@@ -36,5 +36,6 @@ replace_server_param "text_log_dir" "'./text_logs/'"
 replace_server_param "game_log_dir" "'./game_logs/'"
 replace_server_param "kick_rand" "0.01"
 replace_server_param "ball_rand" "0.01"
+replace_server_param "coach_w_referee" "true"
 
 echo "Configuration file updated: $CONFIG_FILE"
