@@ -9,7 +9,14 @@ import re
 import time
 from collections import namedtuple
 
+# Matches "(see_global <digits> <content>)" and captures server cycle number and
+# remaining data until " ((b"
+SIM_COUNT_REGEX = r"\(see_global (\d+) (.*?)(?=\s\(\(b)"
+# Matches " ((b) <data>)" and captures ball position data between ((b) and 
+# " ((p" markers
 SIM_BALL_POS_REGEX = r"\s\(\(b\) (.*?)(?=\s\(\(p)"
+# Matches " ((p "<team>" <uniform_num>) <pose_data>)" capturing team name, 
+# uniform number (1-11), and pose coordinates
 SIM_ROBOT_POSE_REGEX = r"\s\(\(p \"(\w*)\" (1[0-1]|[1-9])\) ([^\)]+)\)"
 
 GameState = namedtuple(
@@ -31,7 +38,7 @@ class Deserializer:
         message = data.decode()
         
         # count (server cycle number)
-        if m := re.match(r"\(see_global (\d+) (.*?)(?=\s\(\(b)", message):
+        if m := re.match(SIM_COUNT_REGEX, message):
             count = int(m.group(1))
             message = message[m.end():]
         else:
