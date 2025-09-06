@@ -37,6 +37,7 @@ class Listener:
         self.parser = Deserializer()
         self.addr = SIM_TRAINER_ADDR
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(0.2)    # Non-blocking with timeout
         
         if environment in ["sim-only", "sim-mixed"]:
             self.source = "simulator"
