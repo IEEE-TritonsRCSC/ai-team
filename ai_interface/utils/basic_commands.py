@@ -26,18 +26,35 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float
             return "done"
     return f"dash {min(speed, distance * 10)} {angle}"
 
-def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, goal: np.ndarray | Tuple | List) -> str: 
-    if not np.isclose(self_pose[:2], ball_pose[:2], atol=KICKABLE_MARGIN):
+def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
+          target: np.ndarray | Tuple | List, kick_power: float = 80.0, 
+          kickable_tolerance: float = KICKABLE_MARGIN, angle_tolerance: float = 5.0) -> str:
+    
+    if not np.isclose(self_pose[:2], ball_pose[:2], atol=kickable_tolerance):
         return "failed"
-    ball_dir = _normalize_angle(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0]))
-    if not np.isclose(ball_dir, self_pose[2], atol=5):
+    
+    ball_dir = _normalize_angle(np.degrees(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0])))
+    if not np.isclose(ball_dir, self_pose[2], atol=angle_tolerance):
         return "failed"
-    angle_to_goal = np.degrees(np.arctan2(goal[1] - self_pose[1], goal[0] - self_pose[0]))
-    angle_diff = _normalize_angle(angle_to_goal - self_pose[2])
-    return f"kick 80 {angle_diff}"
+    
+    angle_to_target = np.degrees(np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0]))
+    angle_diff = _normalize_angle(angle_to_target - self_pose[2])
+    return f"kick {kick_power} {angle_diff}"
 
-def calculate_shooting_pose(ball_pose: np.ndarray | Tuple | List, goal: np.ndarray | Tuple | List) -> np.ndarray:
-    vec = np.array(ball_pose[:2]) - np.array(goal)
-    destination = np.array(goal) + vec + (vec / np.linalg.norm(vec)) * KICKABLE_MARGIN / 2
+def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
+                  goal: np.ndarray | Tuple | List, kick_power: float = 80.0) -> str:
+    
+    return shoot(self_pose, ball_pose, goal, kick_power)
+
+
+def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+                     teammate_pose: np.ndarray | Tuple | List, kick_power: float = 60.0) -> str:
+    
+    return shoot(self_pose, ball_pose, teammate_pose[:2], kick_power)
+
+def calculate_shooting_pose(ball_pose: np.ndarray | Tuple | List, target: np.ndarray | Tuple | List) -> np.ndarray:
+    
+    vec = np.array(ball_pose[:2]) - np.array(target)
+    destination = np.array(target) + vec + (vec / np.linalg.norm(vec)) * KICKABLE_MARGIN / 2
     destination_theta = _normalize_angle(np.degrees(np.arctan2(vec[1], vec[0])))
     return np.array([destination[0], destination[1], destination_theta])
