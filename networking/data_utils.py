@@ -144,11 +144,13 @@ class Serializer:
             Serialized command bytes for robot transmission
         """
         message = ""
+        robot_id = 1
         for action in actions:
             if action is None:
-                message += "None\n"
+                message += f"{robot_id} None\n"
             else:
-                message += action + "\n"
+                message += f"{robot_id} {action}\n"
+            robot_id += 1
         
         return message.encode()
 
