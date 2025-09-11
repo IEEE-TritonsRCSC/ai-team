@@ -10,6 +10,7 @@ import time
 import math
 from collections import namedtuple
 
+SIM_TIMESTEP = 0.1    # seconds
 # Matches "(see_global <digits> <content>)" and captures server cycle number and
 # remaining data until " ((b"
 SIM_COUNT_REGEX = r"\(see_global (\d+) (.*?)(?=\s\(\(b)"
@@ -132,9 +133,10 @@ class Serializer:
         tail = " ".join(parts[convert_index + 1:])
 
         rad_per_sec = float(parts[convert_index])
-        degrees = (rad_per_sec / math.pi) * 18
-        
-        return f"{head} {degrees} {tail}"
+        degrees = (rad_per_sec / math.pi) * 180.0 * SIM_TIMESTEP
+        normalized_degrees = ((degrees + 180) % 360) - 180
+
+        return f"{head} {normalized_degrees} {tail}"
 
     def sim_serialize(self, actions) -> list[bytes]:
         """
