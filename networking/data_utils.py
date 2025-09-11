@@ -136,7 +136,7 @@ class Serializer:
         degrees = (rad_per_sec / math.pi) * 180.0 * SIM_TIMESTEP
         normalized_degrees = ((degrees + 180) % 360) - 180
 
-        return f"{head} {normalized_degrees} {tail}"
+        return f"{head} {normalized_degrees} {tail}".strip()
 
     def sim_serialize(self, actions) -> list[bytes]:
         """
