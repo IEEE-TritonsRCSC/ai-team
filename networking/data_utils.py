@@ -133,7 +133,8 @@ class Serializer:
         tail = " ".join(parts[convert_index + 1:])
 
         rad_per_sec = float(parts[convert_index])
-        degrees = (rad_per_sec / math.pi) * 180.0 * SIM_TIMESTEP
+        degrees_per_sec = math.degrees(rad_per_sec)
+        degrees =  degrees_per_sec * SIM_TIMESTEP
         normalized_degrees = ((degrees + 180) % 360) - 180
 
         return f"{head} {normalized_degrees} {tail}".strip()
