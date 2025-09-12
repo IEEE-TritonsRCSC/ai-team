@@ -7,8 +7,10 @@ used by simulators, cameras, and robot communication protocols.
 
 import re
 import time
+import math
 from collections import namedtuple
 
+SIM_TIMESTEP = 0.1    # seconds
 # Matches "(see_global <digits> <content>)" and captures server cycle number and
 # remaining data until " ((b"
 SIM_COUNT_REGEX = r"\(see_global (\d+) (.*?)(?=\s\(\(b)"
@@ -115,6 +117,28 @@ class Deserializer:
 
 class Serializer:
     """Serializes commands into formats suitable for different targets."""
+    def _convert_command_for_simulator(self, action: str, convert_index: int) -> str:
+        """
+        Convert robot angle commands (rad/s) to simulator commands (degrees).
+        
+        Args:
+            action: Robot command string
+            convert_index: Index of the rad/s value to convert
+            
+        Returns:
+            Simulator command string with degrees
+        """
+        parts = action.split()
+        head = " ".join(parts[:convert_index])
+        tail = " ".join(parts[convert_index + 1:])
+
+        rad_per_sec = float(parts[convert_index])
+        degrees_per_sec = math.degrees(rad_per_sec)
+        degrees =  degrees_per_sec * SIM_TIMESTEP
+        normalized_degrees = ((degrees + 180) % 360) - 180
+
+        return f"{head} {normalized_degrees} {tail}".strip()
+
     def sim_serialize(self, actions) -> list[bytes]:
         """
         Serialize actions for simulator communication.
@@ -129,6 +153,12 @@ class Serializer:
         for i, action in enumerate(actions):
             if action is None:
                 continue
+
+            # Convert rad/s to degrees for simulator
+            if action.startswith("turn "):
+                action = self._convert_command_for_simulator(action, 1)
+            elif action.startswith("dash "):
+                action = self._convert_command_for_simulator(action, 2)
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages
