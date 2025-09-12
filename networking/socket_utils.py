@@ -10,9 +10,10 @@ import random
 import time
 import socket
 import threading
-from collections import namedtuple
-from .data_utils import GameState, Deserializer
+import sslclient
+from .data_utils import GameState, TeamInfo, Deserializer
 
+# Network constants for listening to simulator data
 BUFFER_SIZE = 1536
 LOCALHOST_IP = "127.0.0.1"
 SIM_CLIENT_ADDR = (LOCALHOST_IP, 6000)
@@ -23,28 +24,28 @@ INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) before_kick_off\)"
 COMMAND_IP = "239.42.42.42"
 COMMAND_PORT = 10000
 
-TeamInfo = namedtuple("TeamInfo", ["name", "n_players"])
-
 class Listener:
     """Listens for game state updates from simulators or cameras."""
-    def __init__(self, environment: str):
+    def __init__(self, team_infos: list[TeamInfo], environment: str):
         """
         Initialize listener for the specified environment.
         
         Args:
+            team_infos: List of team information including names and player counts
             environment: Type of environment to listen to
         """
-        self.parser = Deserializer()
-        self.addr = SIM_TRAINER_ADDR
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.2)    # Non-blocking with timeout
-        
+        self.parser = Deserializer(team_infos)
+
         if environment in ["sim-only", "sim-mixed"]:
             self.source = "simulator"
+            self.addr = SIM_TRAINER_ADDR
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.settimeout(0.2)    # Non-blocking with timeout
             self.connect_to_sim()
         else:
             self.source = "camera"
-            # TODO: setup multicast socket for camera data
+            self.vision_client = sslclient.client()
+            self.vision_client.connect()
 
     def watch_game(self) -> GameState:
         """
@@ -58,9 +59,15 @@ class Listener:
             if address == self.addr:
                 game_state = self.parser.sim_deserialize(data)
                 return game_state
+            else:
+                return None
         else:
-            # TODO: receive multicasted data, call deserializer.cam_deserialize
-            pass
+            data = self.vision_client.receive()
+            if data.HasField("detection"):
+                game_state = self.parser.cam_deserialize(data.detection)
+                return game_state
+            else:
+                return None
 
     def connect_to_sim(self):
         """Establish connection to simulator and initialize monitoring."""

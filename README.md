@@ -35,10 +35,11 @@ This project provides a complete infrastructure for developing AI strategies for
 ## Features
 
 - **Multi-environment Support**: Works with simulation, mixed simulation/physical, and field environments
+- **SSL Vision Integration**: Camera-based game state processing using SSL vision protocol
 - **Concurrent Team Control**: Can control multiple teams simultaneously using threading
 - **Modular AI Interface**: Easy-to-extend AI system for implementing custom strategies
-- **Real-time Game State Processing**: Efficient parsing and processing of game state data
-- **Flexible Network Communication**: Support for both simulator and robot communication protocols
+- **Real-time Game State Processing**: Efficient parsing and processing of game state data from simulators and cameras
+- **Flexible Network Communication**: Support for simulator, robot, and camera communication protocols
 
 ## Architecture
 
@@ -68,10 +69,29 @@ ai-team/
 
 ## Installation
 
+**Prerequisites**: conda must be installed on your system.
+
 1. Clone the repository:
 ```bash
 git clone <repository-url>
 cd ai-team
+```
+
+2. Create the conda environment with all dependencies:
+```bash
+conda env create
+```
+
+This creates a new "rcai" Python 3.11 environment with all required dependencies including `sslclient` for camera integration.
+
+3. Activate the environment:
+```bash
+conda activate rcai
+```
+
+**Note for developers**: When adding dependencies, regenerate the environment file using:
+```bash
+conda env export --no-build | grep -vE "prefix: |_libgcc_mutex|_openmp_mutex|ld_impl_linux-64|libgcc-ng|libgomp|libstdcxx-ng" > environment.yml
 ```
 
 ## Usage
@@ -143,28 +163,41 @@ The `GameState` object contains:
 - Requires additional hardware setup
 
 ### Field Practice (`field-practice`)
-- Physical robots with camera system
+- Physical robots with SSL vision camera system
+- Real-time ball and robot detection via camera
 - One or both teams can be controlled
 
 ### Tournament Mode (`field-tournament`)
 - Only controls your own team
 - Other team controlled by opponents
-- Camera-based positioning
+- SSL vision-based positioning and game state
 
 ## Technical Details
 
 ### Networking Protocol
 
-The system communicates with the Simulation Server using UDP sockets on localhost:
+**Simulation Mode**: Communicates with the Simulation Server using UDP sockets on localhost:
 - **Client Port**: 6000 (robot commands)
 - **Trainer Port**: 6001 (game state monitoring)
 
+**Camera Mode**: Uses SSL vision protocol via `sslclient`:
+- Receives detection data with ball and robot positions
+- Processes protobuf-formatted vision messages
+- Real-time field coordinate system
+
 ### Data Processing
 
-Game state data is parsed using regex patterns to extract:
+The system processes game state data from two sources:
+
+**Simulator Data**: Parsed using regex patterns to extract:
 - Ball position from simulation messages
 - Robot poses and orientations
 - Game timing information
+
+**Camera Data**: Processed from SSL vision protocol to extract:
+- Ball position with confidence filtering
+- Robot detection with pattern IDs
+- Real-time field coordinates and orientations
 
 ### Threading Model
 
@@ -175,7 +208,9 @@ The system uses threading to:
 
 ## License
 
-[Add license information here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2025 UCSD RoboCup TritonBots
 
 ## Contact
 

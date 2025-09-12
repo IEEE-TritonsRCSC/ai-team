@@ -1,0 +1,31 @@
+name: rcai
+channels:
+  - defaults
+dependencies:
+  - bzip2=1.0.8
+  - ca-certificates=2025.7.15
+  - expat=2.7.1
+  - libcxx=20.1.8
+  - libffi=3.4.4
+  - libuuid=1.41.5
+  - libxcb=1.17.0
+  - ncurses=6.5
+  - openssl=3.0.17
+  - pip=25.2
+  - pthread-stubs=0.3
+  - python=3.11.13
+  - readline=8.3
+  - setuptools=78.1.1
+  - sqlite=3.50.2
+  - tk=8.6.15
+  - tzdata=2025b
+  - wheel=0.45.1
+  - xorg-libx11=1.8.12
+  - xorg-libxau=1.0.12
+  - xorg-libxdmcp=1.1.5
+  - xorg-xorgproto=2024.1
+  - xz=5.6.4
+  - zlib=1.2.13
+  - pip:
+      - protobuf==3.20.0
+      - sslclient==1.1.2
