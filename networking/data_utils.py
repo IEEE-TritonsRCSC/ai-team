@@ -167,8 +167,13 @@ class Deserializer:
             for robot in team_robots:
                 pattern_id = robot.robot_id
                 theta = robot.orientation
-                # Convert radians to degrees and normalize to [-180.0, 180.0]
-                orientation = 180.0 - (theta * 180.0 / math.pi)
+                # Convert camera radians [-π, π] to simulator degrees [-180, 180]
+                # Camera and simulator have 180° reference difference, 
+                # both use clockwise direction
+                orientation = math.degrees(theta) + 180
+                # Normalize to [-180, 180] range
+                if orientation > 180:
+                    orientation -= 360
                 pose = (robot.x, robot.y, orientation)
                 robot_poses[teamname].append({pattern_id: pose})
         return robot_poses
