@@ -34,12 +34,8 @@ replace_server_param() {
 
 replace_server_param "text_log_dir" "'./text_logs/'"
 replace_server_param "game_log_dir" "'./game_logs/'"
-replace_server_param "kick_off_wait" "10"
 replace_server_param "kick_rand" "0.01"
-replace_server_param "player_rand" "0.01"
 replace_server_param "ball_rand" "0.01"
-replace_server_param "fullstate_l" "true"
-replace_server_param "fullstate_r" "true"
-replace_server_param "coach" "true"
+replace_server_param "coach_w_referee" "true"
 
 echo "Configuration file updated: $CONFIG_FILE"
