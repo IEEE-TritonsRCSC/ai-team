@@ -5,8 +5,8 @@ This module provides the Networker class which coordinates communication
 between the AI system and various game environments (simulators and real robots).
 """
 
-from .data_utils import GameState, Serializer
-from .socket_utils import TeamInfo, Listener, Commander
+from .data_utils import GameState, TeamInfo, Serializer
+from .socket_utils import Listener, Commander
 
 class Networker:
     """
@@ -27,7 +27,7 @@ class Networker:
         self.environment = environment
         self.serializer = Serializer()
         self.commander = Commander(team_infos, environment)
-        self.game_watcher = Listener(environment)
+        self.game_watcher = Listener(team_infos, environment)
 
     def get_game_state(self) -> GameState:
         """
