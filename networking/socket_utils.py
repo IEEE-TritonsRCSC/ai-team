@@ -34,10 +34,8 @@ class Listener:
             team_infos: List of team information including names and player counts
             environment: Type of environment to listen to
         """
-        self.parser = Deserializer()
-        self.addr = SIM_TRAINER_ADDR
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
+        self.parser = Deserializer(team_infos)
+
         if environment in ["sim-only", "sim-mixed"]:
             self.source = "simulator"
             self.addr = SIM_TRAINER_ADDR
