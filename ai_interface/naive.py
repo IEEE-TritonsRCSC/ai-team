@@ -35,9 +35,9 @@ class SoccerAI:
         for robot in game_state.robot_poses[teamname]:
             unum = int(next(iter(robot.keys())))
             if unum == 1:
-                actions.append("kick 100 0" if kick else "dash 100")
+                actions.append("kick 100 0" if kick else "dash 100 0")
             else:
-                actions.append("dash 20")
+                actions.append("dash 20 0")
         return actions
 
     def translate_ai_output(self, ai_output) -> list[str]:
