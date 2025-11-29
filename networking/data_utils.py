@@ -184,22 +184,25 @@ class Serializer:
     """Serializes commands into formats suitable for different targets."""
     def _convert_command_for_simulator(self, action: str, convert_index: int) -> str:
         """
-        Convert robot angle commands (rad/s) to simulator commands (degrees).
+        Convert robot angle commands consisting of radians to simulator commands
+        consisting of degrees.
         
         Args:
             action: Robot command string
-            convert_index: Index of the rad/s value to convert
+            convert_index: Index of the value containing radians in the command
             
         Returns:
-            Simulator command string with degrees
+            Simulator command string containing degrees
         """
         parts = action.split()
         head = " ".join(parts[:convert_index])
         tail = " ".join(parts[convert_index + 1:])
 
-        rad_per_sec = float(parts[convert_index])
-        degrees_per_sec = math.degrees(rad_per_sec)
-        degrees =  degrees_per_sec * SIM_TIMESTEP
+        rad_part = float(parts[convert_index])
+        if head.startswith("turn"):
+            rad_part *= SIM_TIMESTEP    # turn commands are in rad/s
+
+        degrees = math.degrees(rad_part)
         normalized_degrees = ((degrees + 180) % 360) - 180
 
         return f"{head} {normalized_degrees} {tail}".strip()
