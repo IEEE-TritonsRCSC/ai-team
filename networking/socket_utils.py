@@ -100,7 +100,8 @@ class Listener:
 
 class Client:
     """Represents a single robot client connection to the simulator."""
-    def __init__(self, teamname: str, side: str = "left", first: bool = False):
+    def __init__(self, teamname: str, side: str = "left", 
+                 first: bool = False, goalie: bool = False):
         """
         Initialize a client connection for a single robot.
         
@@ -108,21 +109,23 @@ class Client:
             teamname: Name of the team this robot belongs to
             side: Which side of field ("left" or "right")
             first: Whether this is the first robot
+            goalie: Whether this robot is a goalie
         """
         self.teamname = teamname
-        self.init_pose = self.get_init_pose(first, side)
+        self.init_pose = self.get_init_pose(side, first, goalie)
 
         self.addr = SIM_CLIENT_ADDR
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.connect_to_sim()
+        self.connect_to_sim(goalie)
 
-    def get_init_pose(self, first: bool, side: str):
+    def get_init_pose(self, side: str, first: bool, goalie: bool):
         """
         Calculate initial pose for the robot.
         
         Args:
-            first: Whether this is the first robot
             side: Which side of field ("left" or "right")
+            first: Whether this is the first robot
+            goalie: Whether this robot is a goalie
             
         Returns:
             Tuple of (x, y, theta) initial pose
@@ -136,6 +139,10 @@ class Client:
         if side == "right" and first:
             y = 5
             theta = 180.0
+
+        if goalie:
+            x = -38.0
+            theta = 0.0 if side == "left" else 180.0
         
         return (x, y, theta)
 
@@ -143,9 +150,13 @@ class Client:
         """Send a command to the simulator for this robot."""
         self.sock.sendto(command, self.addr)
 
-    def connect_to_sim(self):
-        """Connect to simulator and initialize robot pose."""
+    def connect_to_sim(self, goalie: bool):
+        """Connect to simulator and initialize robot pose.
+        Args:
+            goalie: Whether this robot is a goalie
+        """
         init_args = f"{self.teamname} (version 19)".encode()
+        init_args += b" (goalie)" if goalie else b""
         move_args = f"{self.init_pose[0]} {self.init_pose[1]}".encode()
         turn_args = f"{self.init_pose[2]}".encode()
 
@@ -189,6 +200,7 @@ class Commander:
 
         if environment in ["sim-only", "sim-mixed"]:
             self.create_sim_clients()
+            time.sleep(0.1)    # Allow time for simulator to set up
 
         self.socks, self.addrs = {}, {}
         if environment != "sim-only":
@@ -204,8 +216,9 @@ class Commander:
         for team_info, side in zip(self.team_infos, ["left", "right"]):
             self.sim_clients[team_info.name] = [None] * team_info.n_players
             # Populate clients for each team
+            goalie_0idx = team_info.goalie_id - 1    # Convert goalie_id to 0-based index
             for i in range(team_info.n_players):
-                client = Client(team_info.name, side, i == 0)
+                client = Client(team_info.name, side, i == 0, i == goalie_0idx)
                 self.sim_clients[team_info.name][i] = client
 
     def send_to_sim(self, teamname: str, commands: list[bytes]):

@@ -5,6 +5,7 @@ This module provides the main program for controlling RoboCup soccer teams
 in various environments including simulation and physical robot scenarios.
 """
 
+import json
 import argparse
 import threading
 from networking.networker import TeamInfo, GameState, Networker
@@ -13,7 +14,11 @@ from ai_interface.naive import SoccerAI
 UCSD_ROBOCUP_TEAM_NAME = "TritonBots"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--teamname", type=str, default=UCSD_ROBOCUP_TEAM_NAME)
+
+parser.add_argument("--team_config", type=str, default="team_config.json",
+    help="Path to team configuration JSON file"
+)
+
 parser.add_argument("--env", choices=[
     "sim-only",        # one or both teams in simulator
     "sim-mixed",       # one or both teams - simulator + physical robots  
@@ -30,9 +35,8 @@ def main():
     and runs the main game loop that processes game states and executes AI decisions.
     """
     args = parser.parse_args()
-    team_infos = [TeamInfo(args.teamname, 6), TeamInfo("TeamB", 6)]
-    soccer_ai = SoccerAI()
-
+    team_infos = load_team_config(args.team_config)
+    soccer_ai = SoccerAI(team_infos)
     networker = Networker(team_infos, args.env)
 
     try:
@@ -44,7 +48,7 @@ def main():
 
             if args.env == "field-tournament":
                 # In tournament mode, we only control our own team
-                process_team(soccer_ai, networker, game_state, args.teamname)
+                process_team(soccer_ai, networker, game_state, UCSD_ROBOCUP_TEAM_NAME)
             else:
                 # Process both teams with threading
                 threads = []
@@ -62,6 +66,31 @@ def main():
         print("\nShutting down...please patiently wait for a few seconds.")
         if args.env in ["sim-only", "sim-mixed"]:
             networker.disconnect_from_sim()
+
+
+def load_team_config(file_path: str) -> list[TeamInfo]:
+    """
+    Load team configuration from a JSON file.
+    
+    Args:
+        file_path: Path to the JSON configuration file
+    Returns:
+        List of TeamInfo objects representing team configurations
+    Raises:
+        ValueError: If the configuration file is malformed
+    """
+    with open(file_path, 'r') as f:
+        config = json.load(f)["teams"]
+    
+    if len(config) != 2:
+        raise ValueError("Team configuration must contain exactly two teams.")
+    
+    team1_info, team2_info = config
+    if len(team1_info) != 3 or len(team2_info) != 3:
+        raise ValueError("Each team configuration must have " + \
+                         "name, n_players, and goalie_id.")
+    
+    return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
 
 
 def process_team(soccer_ai: SoccerAI, networker: Networker,

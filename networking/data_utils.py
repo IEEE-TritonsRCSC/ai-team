@@ -17,15 +17,15 @@ SIM_COUNT_REGEX = r"\(see_global (\d+) (.*?)(?=\s\(\(b)"
 # Matches " ((b) <data>)" and captures ball position data between 
 # ((b) and  " ((p" markers
 SIM_BALL_POS_REGEX = r"\s\(\(b\) (.*?)(?=\s\(\(p)"
-# Matches " ((p "<team>" <uniform_num>) <pose_data>)" capturing team name, 
-# uniform number (1-11), and pose coordinates
-SIM_ROBOT_POSE_REGEX = r"\s\(\(p \"(\w*)\" (1[0-1]|[1-9])\) ([^\)]+)\)"
+# Matches " ((p "<team>" <uniform_num> [role]) <pose_data>)" capturing team name,
+# uniform number (1-11), and pose coordinates (role like 'goalie' is optional)
+SIM_ROBOT_POSE_REGEX = r"\s\(\(p \"(\w*)\" (1[0-1]|[1-9])(?: \w+)?\) ([^\)]+)\)"
 
 GameState = namedtuple(
     "GameState", ["count", "timestamp", "ball_pos", "robot_poses"]
 )
 
-TeamInfo = namedtuple("TeamInfo", ["name", "n_players"])
+TeamInfo = namedtuple("TeamInfo", ["name", "n_players", "goalie_id"])
 
 class Deserializer:
     """Deserializes game data from various sources into GameState objects."""
