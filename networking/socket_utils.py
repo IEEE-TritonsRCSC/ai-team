@@ -130,18 +130,16 @@ class Client:
         Returns:
             Tuple of (x, y, theta) initial pose
         """
-        if first:
-            x, y, theta = (-9.5, 0.0, 0.0)
+        if side == "left" and first:
+            x, y, theta = (-10, 0.0, 0.0)
+        elif side == "right" and first:
+            x, y, theta = (-20, 10, 180.0)
         else:
-            x, y = random.uniform(-30, -15), random.uniform(-10, 10)
+            x, y = random.uniform(-30, -15), random.uniform(-25, 25)
             theta = random.uniform(-180, 180)
-        
-        if side == "right" and first:
-            y = 5
-            theta = 180.0
 
         if goalie:
-            x = -38.0
+            x = -41.4
             theta = 0.0 if side == "left" else 180.0
         
         return (x, y, theta)
