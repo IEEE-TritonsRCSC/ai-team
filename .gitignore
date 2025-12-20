@@ -4,3 +4,4 @@ Downloads/
 game_logs/
 text_logs/
 .DS_Store
+**/*.Identifier

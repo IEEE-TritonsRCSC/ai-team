@@ -1,0 +1,155 @@
+diff -u src/ball_painter.cpp rcssmonitor-19.0.1/src/ball_painter.cpp
+--- src/ball_painter.cpp	2024-03-19 03:05:49
++++ rcssmonitor-19.0.1/src/ball_painter.cpp	2025-12-19 20:26:11
+@@ -114,14 +114,6 @@
+                          ball_radius * 2,
+                          ball_radius * 2 );
+ 
+-    // draw kickable margin
+-    painter.setPen( opt.ballPen() );
+-    painter.setBrush( Qt::NoBrush );
+-    painter.drawEllipse( ix - kickable_radius,
+-                         iy - kickable_radius,
+-                         kickable_radius * 2,
+-                         kickable_radius * 2 );
+-
+     // draw future status
+     if ( opt.ballVelCycle() > 0
+          && disp->show_.ball_.hasVelocity() )
+diff -u src/options.cpp rcssmonitor-19.0.1/src/options.cpp
+--- src/options.cpp	2024-03-19 03:05:49
++++ rcssmonitor-19.0.1/src/options.cpp	2025-12-19 16:30:28
+@@ -69,23 +69,23 @@
+ const QString Options::CONF_FILE = QDir::homePath() + QDir::separator() + QString( ".rcssmonitor.conf" );
+ #endif
+ 
+-const double Options::PITCH_LENGTH = 105.0;
+-const double Options::PITCH_WIDTH = 68.0;
++const double Options::PITCH_LENGTH = 90.0;
++const double Options::PITCH_WIDTH = 60.0;
+ const double Options::PITCH_HALF_LENGTH = Options::PITCH_LENGTH * 0.5;
+ const double Options::PITCH_HALF_WIDTH = Options::PITCH_WIDTH * 0.5;
+-const double Options::PITCH_MARGIN = 5.0;
+-const double Options::CENTER_CIRCLE_R = 9.15;
+-const double Options::PENALTY_AREA_LENGTH = 16.5;
+-const double Options::PENALTY_AREA_WIDTH = 40.32;
+-const double Options::PENALTY_CIRCLE_R = 9.15;
++const double Options::PITCH_MARGIN = 3.0;
++const double Options::CENTER_CIRCLE_R = 5.0;
++const double Options::PENALTY_AREA_LENGTH = 10.0;
++const double Options::PENALTY_AREA_WIDTH = 20.0;
++const double Options::PENALTY_CIRCLE_R = 0.0;
+ const double Options::PENALTY_SPOT_DIST = 11.0;
+-const double Options::GOAL_WIDTH = 14.02;
++const double Options::GOAL_WIDTH = 10.0;
+ const double Options::GOAL_HALF_WIDTH = Options::GOAL_WIDTH * 0.5;
+-const double Options::GOAL_AREA_LENGTH = 5.5;
+-const double Options::GOAL_AREA_WIDTH = 18.32;
+-const double Options::GOAL_DEPTH = 2.44;
+-const double Options::CORNER_ARC_R = 1.0;
+-const double Options::GOAL_POST_RADIUS = 0.06;
++const double Options::GOAL_AREA_LENGTH = 3.6;
++const double Options::GOAL_AREA_WIDTH = 12.5;
++const double Options::GOAL_DEPTH = 1.8;
++const double Options::CORNER_ARC_R = 0.0;
++const double Options::GOAL_POST_RADIUS = 0.0;
+ 
+ const double Options::MIN_FIELD_SCALE = 1.0;
+ const double Options::MAX_FIELD_SCALE = 400.0;
+@@ -250,8 +250,8 @@
+     M_show_card( true ),
+     M_show_offside_line( false ),
+     M_show_draw_info( true ),
+-    M_ball_size( 0.35 ),
+-    M_player_size( 0.0 ),
++    M_ball_size( 0.215 ),
++    M_player_size( 0.9 ),
+     M_focus_point_size( 2.0 ),
+     M_grid_step( 0.0 ),
+     M_show_grid_coord( false ),
+diff -u src/player_painter.cpp rcssmonitor-19.0.1/src/player_painter.cpp
+--- src/player_painter.cpp	2024-03-25 20:14:24
++++ rcssmonitor-19.0.1/src/player_painter.cpp	2025-12-19 02:53:01
+@@ -377,9 +377,7 @@
+ 
+     // body direction line
+     double real_r
+-        = param.player_type_.player_size_
+-        + param.player_type_.kickable_margin_
+-        + M_disp_holder.serverParam().ball_size_;
++        = param.player_type_.player_size_;
+     double body = param.player_.body_ * DEG2RAD;
+ 
+     int bx = opt.screenX( param.player_.x_ + real_r * std::cos( body ) );
+diff -u rcss/rcg/types.cpp rcssmonitor-19.0.1/rcss/rcg/types.cpp
+--- rcss/rcg/types.cpp	2024-03-25 20:14:24
++++ rcssmonitor-19.0.1/rcss/rcg/types.cpp	2025-12-19 16:35:15
+@@ -545,11 +545,11 @@
+ 
+ /*-------------------------------------------------------------------*/
+ ServerParamT::ServerParamT()
+-    : goal_width_( 14.02 ),
++    : goal_width_( 10.0 ),
+       inertia_moment_( 5.0 ),
+-      player_size_( 0.3 ),
++      player_size_( 0.9 ),
+       player_decay_( 0.4 ),
+-      player_rand_( 0.1 ),
++      player_rand_( 0.05 ),
+       player_weight_( 60.0 ),
+       player_speed_max_( 1.2 ),
+       player_accel_max_( 1.0 ),
+@@ -565,15 +565,15 @@
+       effort_dec_( 0.005 ),
+       effort_inc_thr_( 0.6 ),
+       effort_inc_( 0.01 ),
+-      kick_rand_( 0.1 ),
++      kick_rand_( 0.01 ),
+       team_actuator_noise_( false ),
+       player_rand_factor_l_( 1.0 ),
+       player_rand_factor_r_( 1.0 ),
+       kick_rand_factor_l_( 1.0 ),
+       kick_rand_factor_r_( 1.0 ),
+-      ball_size_( 0.085 ),
++      ball_size_( 0.215 ),
+       ball_decay_( 0.94 ),
+-      ball_rand_( 0.05 ),
++      ball_rand_( 0.01 ),
+       ball_weight_( 0.2 ),
+       ball_speed_max_( 3.0 ),
+       ball_accel_max_( 2.7 ),
+@@ -632,10 +632,10 @@
+       player_hear_decay_( 1 ),
+       catch_ban_cycle_( 5 ),
+       coach_mode_( false ),
+-      coach_with_referee_mode_( false ),
++      coach_with_referee_mode_( true ),
+       use_old_coach_hear_( false ),
+       online_coach_look_step_( 100 ),
+-      use_offside_( true ),
++      use_offside_( false ),
+       offside_active_area_size_( 2.5 ),
+       kickoff_offside_( true ),
+       verbose_( false ),
+@@ -655,8 +655,8 @@
+       text_logging_( true ),
+       game_logging_( true ),
+       game_log_version_( 4 ),
+-      text_log_dir_( "." ),
+-      game_log_dir_( "." ),
++      text_log_dir_( "./text_logs/" ),
++      game_log_dir_( "./game_logs/" ),
+       text_log_fixed_name_( "rcssserver" ),
+       game_log_fixed_name_( "rcssserver" ),
+       text_log_fixed_( false ),
+@@ -726,8 +726,8 @@
+       max_dash_angle_( 0.0 ),
+       min_dash_angle_( 0.0 ),
+       dash_angle_step_( 90.0 ),
+-      side_dash_rate_( 0.25 ),
+-      back_dash_rate_( 0.5 ),
++      side_dash_rate_( 1.0 ),
++      back_dash_rate_( 1.0 ),
+       max_dash_power_( 100.0 ),
+       min_dash_power_( -100.0 ),
+       tackle_rand_factor_( 1.0 ),
