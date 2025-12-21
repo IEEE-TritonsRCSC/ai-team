@@ -113,7 +113,7 @@ class SoccerAI:
             elif side == "right" and robot_pos[0] < -32:    # Near opponent's goal
                 return "kick 100 0"
             elif skick:    # Kick every 10 cycles to avoid dribbling excessively
-                return "kick 10 0"
+                return "skick 10 0"
             else:    # Dash towards opponent's goal
                 direction = -math.radians(robot_pose[2])
                 direction += 0 if side == "left" else math.pi

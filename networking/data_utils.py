@@ -222,11 +222,12 @@ class Serializer:
             if action is None:
                 continue
 
-            # Convert rad/s to degrees for simulator
-            if action.startswith("turn "):
+            if action.startswith("turn "):    # Convert rad/s to degrees/s for simulator
                 action = self._convert_command_for_simulator(action, 1)
-            elif action.startswith("dash "):
+            elif action.startswith("dash "):    # Convert rad to degrees for simulator
                 action = self._convert_command_for_simulator(action, 2)
+            elif action.startswith("skick "):    # Remove the s prefix for simulator
+                action = action[1::]
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages
