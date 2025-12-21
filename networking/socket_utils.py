@@ -26,13 +26,14 @@ COMMAND_PORT = 10000
 
 class Listener:
     """Listens for game state updates from simulators or cameras."""
-    def __init__(self, team_infos: list[TeamInfo], environment: str):
+    def __init__(self, team_infos: list[TeamInfo], environment: str, desired_init_poses: list):
         """
         Initialize listener for the specified environment.
         
         Args:
             team_infos: List of team information including names and player counts
             environment: Type of environment to listen to
+            desired_init_poses: List of desired initial poses for simulated robots
         """
         self.parser = Deserializer(team_infos)
 
@@ -41,7 +42,7 @@ class Listener:
             self.addr = SIM_TRAINER_ADDR
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(0.2)    # Non-blocking with timeout
-            self.connect_to_sim()
+            self.connect_to_sim(desired_init_poses)
         else:
             self.source = "camera"
             self.vision_client = sslclient.client()
@@ -69,8 +70,12 @@ class Listener:
             else:
                 return None
 
-    def connect_to_sim(self):
-        """Establish connection to simulator and initialize monitoring."""
+    def connect_to_sim(self, desired_init_poses: list):
+        """
+        Establish connection to simulator and initialize monitoring.
+        Args:
+            desired_init_poses: List of desired initial poses for simulated robots
+        """
         self.sock.bind((LOCALHOST_IP, 0))
         self.sock.sendto(b"(init (version 19))\0", self.addr)
         (data, address) = self.sock.recvfrom(16)
@@ -78,18 +83,34 @@ class Listener:
             raise Exception(f"Unexpected response: {data} from {address}")
         else:
             self.addr = address    # Save address for subsequent communication
-            self.sock.sendto(b"(eye on)\0", self.addr)
-            self.sock.sendto(b"(change_mode play_on)\0", self.addr)
 
-        # skip initialization messages
-        eye_on = False
-        play_on = False
-        while not (eye_on and play_on):
+        # Skip initialization messages
+        try:
+            while True:
+                (data, address) = self.sock.recvfrom(16)
+        except TimeoutError:
+            pass
+
+        # Set desired initial poses
+        for (obj_name, pose) in desired_init_poses:
+            init_command = f"(move {obj_name} {pose[0]} {pose[1]} {pose[2]})\0".encode()
+            self.sock.sendto(init_command, self.addr)
             (data, address) = self.sock.recvfrom(16)
-            if address == self.addr and data == b"(ok eye on)\0":
-                eye_on = True
-            if address == self.addr and data == b"(ok change_mode)":
-                play_on = True
+            if (self.addr != address or data != b"(ok move)\0"):
+                raise Exception(f"Unexpected response: {data} from {address}")
+            time.sleep(0.1)   # Allow time for simulator to process
+        
+        # Enable "eye on" to start receiving data about the game state
+        self.sock.sendto(b"(eye on)\0", self.addr)
+        (data, address) = self.sock.recvfrom(16)
+        if (self.addr != address or data != b"(ok eye on)\0"):
+            raise Exception(f"Unexpected response: {data} from {address}")
+
+        # Start the game
+        self.sock.sendto(b"(change_mode play_on)\0", self.addr)
+        (data, address) = self.sock.recvfrom(16)
+        if (self.addr != address or data != b"(ok change_mode)"):
+            raise Exception(f"Unexpected response: {data} from {address}")
 
     def disconnect_from_sim(self):
         """Disconnect from simulator and close socket."""
@@ -133,16 +154,16 @@ class Client:
         if side == "left" and first:
             x, y, theta = (-10, 0.0, 0.0)
         elif side == "right" and first:
-            x, y, theta = (-20, 10, 180.0)
+            x, y, theta = (-20, 10, 0.0)
         else:
             x, y = random.uniform(-30, -15), random.uniform(-25, 25)
             theta = random.uniform(-180, 180)
 
         if goalie:
             x = -41.4
-            theta = 0.0 if side == "left" else 180.0
+            theta = 0.0
         
-        return (x, y, theta)
+        return (x, y, theta) if side == "left" else (-x, -y, 180.0 + theta)
 
     def send_command(self, command: bytes):
         """Send a command to the simulator for this robot."""
@@ -155,8 +176,6 @@ class Client:
         """
         init_args = f"{self.teamname} (version 19)".encode()
         init_args += b" (goalie)" if goalie else b""
-        move_args = f"{self.init_pose[0]} {self.init_pose[1]}".encode()
-        turn_args = f"{self.init_pose[2]}".encode()
 
         # Initialize the connection
         time.sleep(0.1)
@@ -168,14 +187,6 @@ class Client:
             self.addr = address    # Save the address for later use
         else:
             raise Exception(f"Unexpected response: {data} from {address}")
-
-        # Send initial position
-        time.sleep(0.1)
-        self.send_command(b"(move %b)\0" % move_args)
-
-        # Send initial rotation
-        time.sleep(0.1)
-        self.send_command(b"(turn %b)\0" % turn_args)
 
     def disconnect_from_sim(self):
         """Disconnect from simulator and close socket."""
@@ -195,6 +206,7 @@ class Commander:
         """
         self.team_infos = team_infos
         self.environment = environment
+        self.desired_init_poses = []
 
         if environment in ["sim-only", "sim-mixed"]:
             self.create_sim_clients()
@@ -216,8 +228,15 @@ class Commander:
             # Populate clients for each team
             goalie_0idx = team_info.goalie_id - 1    # Convert goalie_id to 0-based index
             for i in range(team_info.n_players):
-                client = Client(team_info.name, side, i == 0, i == goalie_0idx)
-                self.sim_clients[team_info.name][i] = client
+                teamname = team_info.name
+                goalie = (i == goalie_0idx)
+
+                client = Client(teamname, side, i == 0, goalie)
+                self.sim_clients[teamname][i] = client
+
+                # Store desired initial poses by tuple (ObjName, (x, y, theta))
+                obj_name = f"(player {teamname} {i+1}{' goalie' if goalie else ''})"
+                self.desired_init_poses.append((obj_name, client.init_pose))
 
     def send_to_sim(self, teamname: str, commands: list[bytes]):
         """

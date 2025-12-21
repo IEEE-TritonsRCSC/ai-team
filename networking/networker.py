@@ -27,7 +27,7 @@ class Networker:
         self.environment = environment
         self.serializer = Serializer()
         self.commander = Commander(team_infos, environment)
-        self.game_watcher = Listener(team_infos, environment)
+        self.game_watcher = Listener(team_infos, environment, self.commander.desired_init_poses)
 
     def get_game_state(self) -> GameState:
         """
