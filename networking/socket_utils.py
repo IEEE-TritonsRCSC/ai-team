@@ -128,7 +128,7 @@ class Client:
             Tuple of (x, y, theta) initial pose
         """
         if first:
-            x, y, theta = (-9.5, 0.0, 0.0)
+            x, y, theta = (-48.5, 0.0, 0.0)
         else:
             x, y = random.uniform(-30, -15), random.uniform(-10, 10)
             theta = random.uniform(-180, 180)
