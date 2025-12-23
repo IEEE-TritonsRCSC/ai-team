@@ -54,7 +54,12 @@ class Networker:
             messages = self.serializer.robot_serialize(output)
             self.commander.send_to_robots(team_name, messages)
 
-    def disconnect_from_sim(self):
-        """Cleanly disconnect from simulator connections."""
-        self.commander.disconnect_from_sim()
-        self.game_watcher.disconnect_from_sim()
+    def shutdown(self):
+        """Cleanly shutdown all networking connections."""
+        if self.environment in ["sim-only", "sim-mixed"]:
+            self.commander.disconnect_from_sim()
+            self.game_watcher.disconnect_from_sim()
+        else:
+            self.game_watcher.disconnect_from_camera()
+        if self.environment != "sim-only":
+            self.commander.stop_robots()

@@ -84,10 +84,10 @@ class Listener:
         else:
             self.addr = address    # Save address for subsequent communication
 
-        # Skip initialization messages
+        # Drain any pending initialization messages from the socket buffer
         try:
             while True:
-                (data, address) = self.sock.recvfrom(16)
+                self.sock.recvfrom(16)
         except TimeoutError:
             pass
 
@@ -100,14 +100,14 @@ class Listener:
                 raise Exception(f"Unexpected response: {data} from {address}")
             time.sleep(0.1)   # Allow time for simulator to process
         
-        # Enable "eye on" to start receiving data about the game state
+        # Enable "eye on" to start receiving data about the game state and start the game
         self.sock.sendto(b"(eye on)\0", self.addr)
+        self.sock.sendto(b"(change_mode play_on)\0", self.addr)
+
         (data, address) = self.sock.recvfrom(16)
         if (self.addr != address or data != b"(ok eye on)\0"):
             raise Exception(f"Unexpected response: {data} from {address}")
 
-        # Start the game
-        self.sock.sendto(b"(change_mode play_on)\0", self.addr)
         (data, address) = self.sock.recvfrom(16)
         if (self.addr != address or data != b"(ok change_mode)"):
             raise Exception(f"Unexpected response: {data} from {address}")
@@ -117,6 +117,10 @@ class Listener:
         self.sock.sendto(b"(bye)\0", self.addr)
         time.sleep(0.1)
         self.sock.close()
+
+    def disconnect_from_camera(self):
+        """Disconnect from camera vision client."""
+        self.vision_client.sock.close()
 
 
 class Client:
@@ -151,19 +155,22 @@ class Client:
         Returns:
             Tuple of (x, y, theta) initial pose
         """
-        if side == "left" and first:
-            x, y, theta = (-10, 0.0, 0.0)
-        elif side == "right" and first:
-            x, y, theta = (-20, 10, 0.0)
-        else:
-            x, y = random.uniform(-30, -15), random.uniform(-25, 25)
-            theta = random.uniform(-180, 180)
+        x, y = random.uniform(15, 30), random.uniform(-25, 25)
+        theta = random.uniform(-180, 180)
 
-        if goalie:
-            x = -41.4
-            theta = 0.0
-        
-        return (x, y, theta) if side == "left" else (-x, -y, 180.0 + theta)
+        if side == "left":
+            x = -x
+            if first:
+                x, y, theta = (-10, 0, 0.0)
+            if goalie:
+                x, y, theta = -41.4, 0.0, 0.0
+        else:
+            if first:
+                x, y, theta = (20, 10, 180.0)
+            if goalie:
+                x, y, theta = (41.4, 0.0, 180.0)
+
+        return (x, y, theta)
 
     def send_command(self, command: bytes):
         """Send a command to the simulator for this robot."""
@@ -275,3 +282,12 @@ class Commander:
             for client in team_clients:
                 time.sleep(0.1)
                 client.disconnect_from_sim()
+
+    def stop_robots(self):
+        """Send stop commands to all robots."""
+        stop_command = b"stop\0"
+        for teamname in self.socks.keys():
+            # Send stop command twice because OS-level buffering may drop the last packet
+            self.send_to_robots(teamname, stop_command)
+            self.send_to_robots(teamname, stop_command)
+            time.sleep(0.1)

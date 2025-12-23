@@ -184,8 +184,8 @@ class Serializer:
     """Serializes commands into formats suitable for different targets."""
     def _convert_command_for_simulator(self, action: str, convert_index: int) -> str:
         """
-        Convert robot angle commands consisting of radians to simulator commands
-        consisting of degrees.
+        Converts commands with different types of angle representations
+        consisting of radians to simulator commands consisting of degrees.
         
         Args:
             action: Robot command string
@@ -227,7 +227,7 @@ class Serializer:
             elif action.startswith("dash "):    # Convert rad to degrees for simulator
                 action = self._convert_command_for_simulator(action, 2)
             elif action.startswith("skick "):    # Remove the s prefix for simulator
-                action = action[1::]
+                action = action[1:]
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages
@@ -251,5 +251,6 @@ class Serializer:
                 message += f"{robot_id} {action}\n"
             robot_id += 1
         
+        message += "\0"    # Null terminator for robot communication
         return message.encode()
 

@@ -64,8 +64,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\nShutting down...please patiently wait for a few seconds.")
-        if args.env in ["sim-only", "sim-mixed"]:
-            networker.disconnect_from_sim()
+        networker.shutdown()
 
 
 def load_team_config(file_path: str) -> list[TeamInfo]:
@@ -87,8 +86,7 @@ def load_team_config(file_path: str) -> list[TeamInfo]:
     
     team1_info, team2_info = config
     if len(team1_info) != 3 or len(team2_info) != 3:
-        raise ValueError("Each team configuration must have " + \
-                         "name, n_players, and goalie_id.")
+        raise ValueError("Each team configuration must have name, n_players, and goalie_id.")
     
     return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
 
