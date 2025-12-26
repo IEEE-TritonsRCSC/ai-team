@@ -167,21 +167,24 @@ def earliest_intercept_control(self_p0, self_v0,
 def earliest_intercept_control_const_friction(self_p0: np.ndarray, target_p0: np.ndarray, target_v0: np.ndarray, 
                                  target_acc: float, vmax_self: float, rect_bounds=None):
     """
-    Calculate the interception position and required velocity for a player to intercept a moving target.
+    Find the earliest interception point when the target experiences constant, colinear acceleration
+    (e.g., friction-driven deceleration).
+
     Args:
-        self_p0 (np.ndarray): The player's current position [x, y] (theta ignored).
-        target_p0 (np.ndarray): The target's current position as [x, y].
-        target_v0 (np.ndarray): The target's current velocity as [vx, vy].
-        target_acc (float): The target's acceleration magnitude (colinear with velocity).
-        vmax_self (float): The player's maximum speed.
-        time_limit (float or 'stop'): Maximum time to intercept. If 'stop', intercept before target stops.
+        self_p0 (np.ndarray): Player start position [x, y].
+        target_p0 (np.ndarray): Target start position [x, y].
+        target_v0 (np.ndarray): Target start velocity [vx, vy].
+        target_acc (float): Acceleration magnitude applied along the target's velocity direction
+            (negative for deceleration).
+        vmax_self (float): Player speed cap; player is assumed to travel in a fixed heading at up to this speed.
+        rect_bounds (tuple[float, float, float, float] | None): Optional (xmin, xmax, ymin, ymax) bounding box
+            the interception point must lie within.
+
     Returns:
-        intercept_pos (np.ndarray): The position where interception occurs as [x, y].
-        required_velocity (np.ndarray): The required velocity vector for interception as [vx, vy].
-        interception_time (float): The time until interception occurs.
-        None, None, None if interception is not possible within constraints.
-    Raises:
-        ValueError: If time_limit is invalid.
+        intercept_pos (np.ndarray): Target position at interception [x, y].
+        required_velocity (np.ndarray): Player velocity vector (<= vmax_self) toward the intercept.
+        interception_time (float): Time until interception.
+        (None, None, None) if the target cannot be intercepted before it stops, leaves bounds, or optimization fails.
     """
     self_pos = np.array(self_p0, dtype=float)
     target_pos = np.array(target_p0, dtype=float)
@@ -238,7 +241,7 @@ def earliest_intercept_control_const_friction(self_p0: np.ndarray, target_p0: np
         if distance < 1e-6:
             time_to_impact = 0.0  # Already at interception point
         else:
-            roots = np.roots([0.5 * target_acc, np.linalg.norm(target_vel), -distance])
+            roots = np.roots([0.5 * target_acc, vel_magnitude, -distance])
             roots = roots[np.isreal(roots)].real  # Keep only real roots
             if len(roots) == 0 or np.all(roots <= 0):
                 return float('inf')  # No valid interception time as no positive real roots
