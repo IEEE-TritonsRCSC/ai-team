@@ -30,7 +30,7 @@ def integrate_dynamics(p0, v0, u, decay, vmax, T, dt, return_hist=False):
         speed = np.linalg.norm(v)
         if speed > vmax + EPS:
             v = v * (vmax / (speed + EPS))
-        p = p + v * dt
+        p = p + v
         if return_hist:
             pos_hist[i] = p
             vel_hist[i] = v
@@ -81,6 +81,7 @@ def earliest_intercept_control(self_p0, self_v0,
         target_p0, target_v0, np.zeros(2), ball_decay, vmax_self, T_hi, dt, return_hist=True
     )
     target_cache = {float(t): p for t, p in zip(times_target, pos_target)}
+    print(f"Last target pos: {pos_target[-1]}")
     t_precompute_end = time.time()
 
     # Restrict to times when target inside rectangle
@@ -92,13 +93,10 @@ def earliest_intercept_control(self_p0, self_v0,
             (pos_target[:, 0] >= xmin - EPS) & (pos_target[:, 0] <= xmax + EPS) &
             (pos_target[:, 1] >= ymin - EPS) & (pos_target[:, 1] <= ymax + EPS)
         )
-    # Reachability pre-filter: distance must be within a conservative bound
-    dist = np.linalg.norm(pos_target - self_p0, axis=1)
-    reach = vmax_self * times_target + np.linalg.norm(self_v0) * dt / max(EPS, 1 - player_decay)
-    mask_reach = dist <= reach + tol
 
-    Ts_inside = [float(t) for t, m_rect, m_reach in zip(times_target, mask_inside, mask_reach) if m_rect and m_reach and t <= T_hi]
+    Ts_inside = [float(t) for t, m_rect in zip(times_target, mask_inside) if m_rect and t <= T_hi]
     if not Ts_inside:
+        print('No feasible T found within boundary.')
         return None
 
     t_bracket_start = time.time()
@@ -125,6 +123,7 @@ def earliest_intercept_control(self_p0, self_v0,
             T_feas = T
             break
     else:
+        print('No feasible intercept found within tolerance.')
         return None
     t_bracket_end = time.time()
 
