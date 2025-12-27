@@ -7,9 +7,9 @@ from typing import Iterable, List, Tuple
 import numpy as np
 from constants.player_constants import KICKABLE_MARGIN
 from constants.field_constants import GOAL_L, GOAL_R
-from algo_utils import normalize_angle
+from .algo_utils import normalize_angle
 
-def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float = KICKABLE_MARGIN,
+def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float = 1.0,
          theta: float | None = None, speed: float = 100.0) -> str:
     """
     Create a `dash` or `turn` command to move toward a destination.
@@ -20,14 +20,14 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float
     """
     destination = np.array([x, y])
     distance = np.linalg.norm(destination - np.array(self_pose[:2]))
-    angle = np.degrees(np.arctan2(destination[1] - self_pose[1], destination[0] - self_pose[0])) - self_pose[2]
+    angle = np.arctan2(destination[1] - self_pose[1], destination[0] - self_pose[0]) - self_pose[2]
     if distance < margin:
         if theta is not None:
             angle_diff = normalize_angle(theta - self_pose[2])
             return f"turn {angle_diff}" if abs(angle_diff) > 1 else "done"
         else:
             return "done"
-    return f"dash {min(speed, distance * 10)} {angle}"
+    return f"dash {speed} {angle}"
 
 def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
           target: np.ndarray | Tuple | List, kick_power: float = 80.0, 
@@ -40,7 +40,7 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     agent and facing within angle_tolerance degrees; otherwise returns `"failed"`.
     """
     
-    if not np.isclose(self_pose[:2], ball_pose, atol=kickable_tolerance):
+    if not np.all(np.isclose(self_pose[:2], ball_pose, atol=kickable_tolerance)):
         return "failed"
     
     ball_dir = normalize_angle(np.degrees(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0])))
