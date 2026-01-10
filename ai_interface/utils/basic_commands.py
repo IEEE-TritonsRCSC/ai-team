@@ -85,4 +85,4 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     if not np.isclose(ball_dir, self_pose[2], atol=angle_tolerance):
         return "failed"
     
-    return f"dribble {angle}"
+    return f"catch 0"

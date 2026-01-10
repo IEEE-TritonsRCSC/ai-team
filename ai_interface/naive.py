@@ -7,7 +7,12 @@ like kicking and movement in a RoboCup soccer environment.
 
 import math
 import random
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+# We should ideally package the module instead of using sys.path.append
 from networking.data_utils import TeamInfo, GameState
+from ai_interface.utils.goalie import goalie_action
 
 class SoccerAI:
     """
@@ -46,7 +51,7 @@ class SoccerAI:
             unum = int(next(iter(robot.keys())))
             robot_pose = robot[unum]
             if unum == goalie_id:
-                action = self.get_goalie_action(ball_pos, robot_pose)
+                action = self.get_goalie_action(ball_pos, robot_pose, self.side[teamname])
             elif unum == 1:
                 action = self.get_robot1_action(i, ball_pos, robot_pose, self.side[teamname])
             else:
@@ -142,34 +147,26 @@ class SoccerAI:
             else:
                 return f"dash {'50' if robot_to_ball_dist > 5 else '20'} {direction}"
     
-    def get_goalie_action(self, ball_pos: tuple, goalie_pose: tuple) -> str:
+    def get_goalie_action(self, ball_pos: tuple, goalie_pose: tuple, side: str) -> str:
         """
-        Get action for the goalie robot.
+        Get action for the goalie robot using angle-bisector positioning.
         
         Args:
             ball_pos: Current position of the ball
-            goalie_pose: Current position of the goalie robot
+            goalie_pose: Current position of the goalie robot (x, y, theta_deg)
+            side: 'left' if our team starts on the left attacking right goal,
+                  'right' if our team starts on the right attacking left goal
         Returns:
             Action command for the goalie robot
         """
         goalie_pos = (goalie_pose[0], goalie_pose[1])
-        goalie_dir = math.radians(goalie_pose[2])
         goalie_to_ball_dist = self.get_dist(ball_pos, goalie_pos)
+        has_ball = self.hasBall(goalie_to_ball_dist)
         
-        if self.hasBall(goalie_to_ball_dist):
-            return "kick 100 0"
-        elif goalie_to_ball_dist < 1.2:
-            return "catch 0"
-
-        delta_y = ball_pos[1] - goalie_pos[1]
-        power = min(100, delta_y * (1e+3 / 32))
-
-        ninety_deg = math.pi / 2
-        rotation_back_to_zero = -goalie_dir
-        if power > 0:
-            direction = rotation_back_to_zero + ninety_deg
-        else:
-            direction = rotation_back_to_zero - ninety_deg
-        direction = (direction + math.pi) % (2 * math.pi) - math.pi
-
-        return f"dash {abs(power)} {direction}"
+        return goalie_action(
+            ball_pos=ball_pos,
+            goalie_pose=goalie_pose,
+            has_ball=has_ball,
+            goalie_to_ball_dist=goalie_to_ball_dist,
+            side=side
+        )
