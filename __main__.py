@@ -8,6 +8,8 @@ in various environments including simulation and physical robot scenarios.
 import json
 import argparse
 import threading
+import time
+from queue import Queue, Full, Empty
 from networking.networker import TeamInfo, GameState, Networker
 from ai_interface.naive import SoccerAI
 
@@ -38,13 +40,34 @@ def main():
     team_infos = load_team_config(args.team_config)
     soccer_ai = SoccerAI(team_infos)
     networker = Networker(team_infos, args.env)
+    game_state_queue: Queue[GameState] = Queue(maxsize=1)
+    stop_event = threading.Event()
+    client_thread = None
+    if args.env in ["sim-only", "sim-mixed"]:
+        sample_client = networker.commander.sample_client
+        if sample_client is not None:
+            client_thread = threading.Thread(
+                target=_client_watch_worker,
+                args=(networker, sample_client, stop_event),
+                daemon=True,
+            )
+            client_thread.start()
+    state_thread = threading.Thread(
+        target=_game_state_worker,
+        args=(networker, game_state_queue, stop_event),
+        daemon=True,
+    )
+    state_thread.start()
 
     try:
         while True:
-            game_state = networker.get_game_state()
-            if game_state is None:
+            if stop_event.is_set():
+                break
+            try:
+                game_state = game_state_queue.get(timeout=0.5)
+            except Empty:
                 continue
-            print("Current Game State:", game_state)
+            print('Game State:', game_state)
 
             if args.env == "field-tournament":
                 # In tournament mode, we only control our own team
@@ -64,7 +87,12 @@ def main():
 
     except KeyboardInterrupt:
         print("\nShutting down...please patiently wait for a few seconds.")
+    finally:
+        stop_event.set()
         networker.shutdown()
+        state_thread.join(timeout=1)
+        if client_thread is not None:
+            client_thread.join(timeout=1)
 
 
 def load_team_config(file_path: str) -> list[TeamInfo]:
@@ -90,6 +118,42 @@ def load_team_config(file_path: str) -> list[TeamInfo]:
     
     return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
 
+
+def _game_state_worker(networker: Networker, state_queue: Queue,
+                       stop_event: threading.Event) -> None:
+    """
+    Continuously fetch game states and keep only the most recent one.
+    """
+    while not stop_event.is_set():
+        try:
+            game_state = networker.get_game_state()
+        except TimeoutError:
+            stop_event.set()
+            break
+        if game_state is None:
+            continue
+        try:
+            state_queue.put(game_state, block=False)
+        except Full:
+            try:
+                state_queue.get(block=False)
+            except Empty:
+                pass
+            try:
+                state_queue.put(game_state, block=False)
+            except Full:
+                pass
+
+
+def _client_watch_worker(networker: Networker, client,
+                         stop_event: threading.Event) -> None:
+    """
+    Continuously receive simulator client updates in a dedicated thread.
+    """
+    while not stop_event.is_set():
+        client_data = client.watch_game()
+        if client_data is not None:
+            networker.update_client_data(client_data)
 
 def process_team(soccer_ai: SoccerAI, networker: Networker,
                  game_state: GameState, team_name: str):

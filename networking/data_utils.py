@@ -22,7 +22,7 @@ SIM_BALL_POS_REGEX = r"\s\(\(b\) (.*?)(?=\s\(\(p)"
 SIM_ROBOT_POSE_REGEX = r"\s\(\(p \"(\w*)\" (1[0-1]|[1-9])(?: \w+)?\) ([^\)]+)\)"
 
 GameState = namedtuple(
-    "GameState", ["count", "timestamp", "ball_pos", "robot_poses"]
+    "GameState", ["count", "timestamp", "ball_pos", "robot_poses", "playmode"]
 )
 
 TeamInfo = namedtuple("TeamInfo", ["name", "n_players", "goalie_id"])
@@ -71,7 +71,7 @@ class Deserializer:
         if robot_poses is None:
             return None
 
-        return GameState(count, timestamp, ball_pos, robot_poses)
+        return GameState(count, timestamp, ball_pos, robot_poses, None)
 
     def sim_get_ball_pos(self, message: str) -> tuple:
         """
@@ -196,7 +196,10 @@ class Serializer:
         """
         parts = action.split()
         head = " ".join(parts[:convert_index])
-        tail = " ".join(parts[convert_index + 1:])
+        tail = " ".join(parts[convert_index + 1:]) if len(parts) > convert_index + 1 else ""
+
+        if len(parts) <= convert_index:
+            return action
 
         rad_part = float(parts[convert_index])
         if head.startswith("turn"):
@@ -228,6 +231,9 @@ class Serializer:
                 action = self._convert_command_for_simulator(action, 2)
             elif action.startswith("skick "):    # Remove the s prefix for simulator
                 action = action[1:]
+                action = self._convert_command_for_simulator(action, 2)
+            elif action.startswith("kick "):    # Convert rad to degrees for simulator
+                action = self._convert_command_for_simulator(action, 2)
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages

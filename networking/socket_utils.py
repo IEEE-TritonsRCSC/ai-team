@@ -19,6 +19,7 @@ LOCALHOST_IP = "127.0.0.1"
 SIM_CLIENT_ADDR = (LOCALHOST_IP, 6000)
 SIM_TRAINER_ADDR = (LOCALHOST_IP, 6001)
 INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) before_kick_off\)"
+PLAYMODE_REGEX = r"\(hear \d+ referee (\w+)\)"
 
 # Multicast settings for real robots
 COMMAND_IP = "239.42.42.42"
@@ -176,6 +177,18 @@ class Client:
         """Send a command to the simulator for this robot."""
         self.sock.sendto(command, self.addr)
 
+    def watch_game(self) -> dict:
+        (data, address) = self.sock.recvfrom(BUFFER_SIZE)
+        if address == self.addr:
+            data = data.decode()
+            if m := re.search(PLAYMODE_REGEX, data):
+                playmode = m.group(1).strip()
+                return {"playmode": playmode}
+            else:
+                return {}
+        else:
+            return None
+
     def connect_to_sim(self, goalie: bool):
         """Connect to simulator and initialize robot pose.
         Args:
@@ -214,6 +227,7 @@ class Commander:
         self.team_infos = team_infos
         self.environment = environment
         self.desired_init_poses = []
+        self.sample_client = None
 
         if environment in ["sim-only", "sim-mixed"]:
             self.create_sim_clients()
@@ -240,6 +254,8 @@ class Commander:
 
                 client = Client(teamname, side, i == 0, goalie)
                 self.sim_clients[teamname][i] = client
+                if self.sample_client is None:
+                    self.sample_client = client    # Save one sample client for reference
 
                 # Store desired initial poses by tuple (ObjName, (x, y, theta))
                 obj_name = f"(player {teamname} {i+1}{' goalie' if goalie else ''})"
