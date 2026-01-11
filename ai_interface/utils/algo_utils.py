@@ -17,7 +17,7 @@ def calculate_shooting_pose(ball_pose: np.ndarray, target: np.ndarray) -> np.nda
     ball_pose, target = np.array(ball_pose), np.array(target)
     vec = np.array(ball_pose[:2]) - np.array(target)
     destination = np.array(target) + vec + (vec / np.linalg.norm(vec)) * KICKABLE_MARGIN / 2
-    destination_theta = normalize_angle(np.degrees(np.arctan2(vec[1], vec[0])))
+    destination_theta = normalize_angle(np.arctan2(vec[1], vec[0]))
     return np.array([destination[0], destination[1], destination_theta])
 
 def estimate_ball_velocity(positions, alpha):
