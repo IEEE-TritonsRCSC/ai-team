@@ -7,9 +7,57 @@ from typing import Iterable, List, Tuple
 import math
 import numpy as np
 from constants.player_constants import KICKABLE_MARGIN
-from constants.field_constants import GOAL_L, GOAL_R
+from constants.field_constants import GOAL_L, GOAL_R, FIELD_X, FIELD_Y
 from .algo_utils import normalize_angle
 
+FIELD_MARGIN = 0.8
+
+def _clamp_to_field_xy(p: np.ndarray, margin: float = FIELD_MARGIN) -> np.ndarray:
+    x = float(np.clip(p[0], FIELD_X[0] + margin, FIELD_X[1] - margin))
+    y = float(np.clip(p[1], FIELD_Y[0] + margin, FIELD_Y[1] - margin))
+    return np.array([x, y], dtype=float)
+
+
+def goto(self_pose: List, destination_x, destination_y,
+         margin: float = 0.5, speed: float = 100.0, theta=None,
+         avoid_points=None, rect_bounds=None):
+    """
+    Go to a destination with field safety:
+    - Clamp destination (and detours) into FIELD_X/FIELD_Y
+    - Normalize angle to [-pi, pi]
+    - Scale dash power with distance (prevents overshoot)
+    """
+    origin = np.array(self_pose[:2], dtype=float)
+
+    # clamp destination to field first
+    dest = _clamp_to_field_xy(np.array([destination_x, destination_y], dtype=float))
+
+    # optional: also clamp rect bounds if provided (keeps inside a tactical rectangle)
+    if rect_bounds is not None:
+        xlo, xhi, ylo, yhi = rect_bounds
+        dest[0] = float(np.clip(dest[0], xlo, xhi))
+        dest[1] = float(np.clip(dest[1], ylo, yhi))
+        dest = _clamp_to_field_xy(dest)
+
+    waypoint = dest.copy()
+    if avoid_points is not None:
+        waypoint = _select_detour(origin, dest, avoid_points)
+        waypoint = _clamp_to_field_xy(np.array(waypoint, dtype=float))
+
+    vec = waypoint - origin
+    distance = float(np.linalg.norm(vec))
+    if distance < margin:
+        if theta is not None:
+            angle_diff = normalize_angle(theta - float(self_pose[2]))
+            if abs(angle_diff) > 0.2:
+                return f"dash 0 {angle_diff}"
+        return "done"
+
+    angle = normalize_angle(float(np.arctan2(vec[1], vec[0])) - float(self_pose[2]))
+
+    # distance-based power (prevents overshoot & boundary runaway)
+    power = min(float(speed), max(20.0, min(100.0, distance * 35.0)))
+    return f"dash {power:.1f} {angle}"
 
 def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[float, float]:
     """Return distance from point to segment and normalized projection t."""
@@ -104,27 +152,28 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float
     return f"dash {speed} {angle}"
 
 
-def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
-          target: np.ndarray | Tuple | List, kick_power: float = 80.0,
+def shoot(self_pose: List, ball_pose: List, target: np.ndarray,
           kickable_tolerance: float = KICKABLE_MARGIN,
-          angle_tolerance: float = math.radians(5.0)) -> str:
+          angle_tolerance: float = 5.0, kick_power: float = 100.0):
     """
-    Create a `kick` command toward a target if the ball is kickable and aligned.
-
-    self_pose is [x, y, theta] in radians; ball_pose is [x, y]; target is [x, y].
-    Returns `kick power rel_angle` when the ball is within kickable_tolerance of the
-    agent and facing within angle_tolerance radians; otherwise returns `"failed"`.
+    Kick ball toward target if:
+    - ball within kickable distance
+    - ball roughly in front of robot heading
     """
+    origin = np.array(self_pose[:2], dtype=float)
+    ball = np.array(ball_pose[:2], dtype=float)
 
-    if not np.all(np.isclose(self_pose[:2], ball_pose, atol=kickable_tolerance)):
+    if float(np.linalg.norm(ball - origin)) > float(kickable_tolerance):
         return "failed"
 
-    ball_dir = normalize_angle(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0]))
-    if not np.isclose(ball_dir, self_pose[2], atol=angle_tolerance):
+    ball_dir = float(np.arctan2(ball[1] - origin[1], ball[0] - origin[0]))
+    ball_angle_diff = normalize_angle(ball_dir - float(self_pose[2]))
+    if abs(ball_angle_diff) > np.deg2rad(angle_tolerance):
         return "failed"
 
-    angle_to_target = np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0])
-    angle_diff = normalize_angle(angle_to_target - self_pose[2])
+    target = np.array(target[:2], dtype=float)
+    theta = float(np.arctan2(target[1] - origin[1], target[0] - origin[0]))
+    angle_diff = normalize_angle(theta - float(self_pose[2]))
     return f"kick {kick_power} {angle_diff}"
 
 

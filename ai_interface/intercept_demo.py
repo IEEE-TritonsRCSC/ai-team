@@ -181,7 +181,8 @@ class InterceptDemoAI(SoccerAI):
             dir_vec = np.array(GOAL_R, dtype=float) - ball
             theta = math.atan2(dir_vec[1], dir_vec[0]) + math.radians(random.uniform(-10, 10))
             self.shooter_turn = False
-            return f"kick 100 {theta}"
+            rel = normalize_angle(theta - heading)
+            return f"kick 100 {rel}"
 
         desired_theta = math.atan2(GOAL_R[1] - self_p0[1], GOAL_R[0] - self_p0[0])
         cmd, self.shooter_decision, self.shooter_decision_expiring = self.hybrid_capture(

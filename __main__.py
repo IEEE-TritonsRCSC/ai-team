@@ -29,7 +29,6 @@ parser.add_argument("--env", choices=[
     "field-tournament" # our team only - camera + physical robots
 ], default="sim-only")
 
-
 def main():
     """
     Main execution function for the soccer AI system.
@@ -39,8 +38,8 @@ def main():
     """
     args = parser.parse_args()
     team_infos = load_team_config(args.team_config)
-    # soccer_ai = SoccerAI(team_infos)
-    soccer_ai = InterceptDemoAI(team_infos)
+    soccer_ai = SoccerAI(team_infos)
+    # soccer_ai = InterceptDemoAI(team_infos)
     networker = Networker(team_infos, args.env)
     game_state_queue: Queue[GameState] = Queue(maxsize=1)
     stop_event = threading.Event()

@@ -5,38 +5,66 @@ from scipy.optimize import differential_evolution
 
 EPS = 1e-9
 
-def integrate_dynamics(p0, v0, u, decay, vmax, T, dt, return_hist=False):
+def integrate_dynamics(
+    p0: np.ndarray,
+    v0: np.ndarray,
+    u_fn: callable,
+    decay: float,
+    dt: float,
+    T: float,
+    u_max: float,
+    return_hist: bool = False,
+):
     """
-    Discrete-time integration using capped velocity and constant control u.
-    Matches: v <- decay * (v + u); p <- p + v * dt, with speed cap.
-    """
-    p = np.asarray(p0, dtype=float).copy()
-    v = np.asarray(v0, dtype=float).copy()
-    u = np.asarray(u, dtype=float)
+    Discrete-time dynamics with optional sub-stepping.
 
-    if T <= 0 or dt <= 0:
-        return (p, v) if not return_hist else (np.array([0.0]), np.stack([p]), np.stack([v]))
+    We interpret `decay` as the per-1.0-tick velocity decay (like BALL_DECAY/PLAYER_DECAY).
+    If dt < 1, we convert it to per-substep decay via decay_step = decay**dt.
+
+    v <- decay_step * (v + u*dt)
+    p <- p + v*dt
+    """
+    p = np.array(p0, dtype=float).copy()
+    v = np.array(v0, dtype=float).copy()
+
+    dt = float(dt)
+    T = float(T)
+    if dt <= 0:
+        raise ValueError("dt must be > 0")
+    if T <= 0:
+        # nothing happens
+        if return_hist:
+            return np.array([0.0]), p[None, :], v[None, :]
+        return p, v
 
     n_steps = int(np.ceil(T / dt))
-    if return_hist:
-        times = np.linspace(0.0, n_steps * dt, n_steps + 1)
-        pos_hist = np.empty((n_steps + 1, 2), dtype=float)
-        vel_hist = np.empty((n_steps + 1, 2), dtype=float)
-        pos_hist[0] = p
-        vel_hist[0] = v
+    decay_step = float(decay) ** dt
 
-    for i in range(1, n_steps + 1):
-        v = decay * (v + u)
-        speed = np.linalg.norm(v)
-        if speed > vmax + EPS:
-            v = v * (vmax / (speed + EPS))
-        p = p + v
+    if return_hist:
+        Ts = [0.0]
+        Ps = [p.copy()]
+        Vs = [v.copy()]
+
+    for i in range(n_steps):
+        t = i * dt
+        u = np.array(u_fn(t, p, v), dtype=float)
+
+        # clamp control magnitude
+        u_norm = float(np.linalg.norm(u))
+        if u_norm > u_max > 0:
+            u *= (u_max / (u_norm + 1e-12))
+
+        # advance
+        v = decay_step * (v + u * dt)
+        p = p + v * dt
+
         if return_hist:
-            pos_hist[i] = p
-            vel_hist[i] = v
+            Ts.append((i + 1) * dt)
+            Ps.append(p.copy())
+            Vs.append(v.copy())
 
     if return_hist:
-        return times, pos_hist, vel_hist
+        return np.array(Ts, dtype=float), np.stack(Ps, axis=0), np.stack(Vs, axis=0)
     return p, v
 
 def solve_u_for_time(T, self_p0, self_v0, pT_target, decay_self, vmax_self, u_max, dt):

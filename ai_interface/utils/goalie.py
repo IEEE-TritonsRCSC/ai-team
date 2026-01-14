@@ -16,7 +16,12 @@ from ai_interface.constants.field_constants import (
     GOAL_R,
     MAX_KEEPER_OUT,
 )
+from ai_interface.constants.field_constants import FIELD_Y, FIELD_X, GOAL_L, GOAL_R, MAX_KEEPER_OUT
+from ai_interface.utils.basic_commands import goto
 
+PENALTY_X = 18.0
+PENALTY_Y = 20.0
+KEEPER_MARGIN = 0.8
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     """Clamp a value between bounds."""
@@ -173,70 +178,62 @@ def compute_bisector_target(ball_pos: Tuple[float, float],
     return (kx, ky)
 
 
-def goalie_action(ball_pos: Tuple[float, float],
-                  goalie_pose: Tuple[float, float, float],
-                  has_ball: bool,
-                  goalie_to_ball_dist: float,
-                  side: str = None,
-                  charge_distance: float = 20) -> str:
-    """
-    Compute goalkeeper action command using angle-bisector positioning.
-    
-    Args:
-        ball_pos: (x, y) position of the ball
-        goalie_pose: (x, y, theta_deg) position and heading of the goalie
-        has_ball: Whether the goalie currently has the ball
-        goalie_to_ball_dist: Distance between goalie and ball
-        side: 'left' or 'right' - which goal we're defending. If None, inferred from goalie position.
-        charge_distance: Distance threshold for charging at the ball (default: 15.0)
-        
-    Returns:
-        Action command string (e.g., "dash 100 0", "catch 0", "kick 100 0", etc.)
-    """
-    goalie_pos = (goalie_pose[0], goalie_pose[1])
-    goalie_dir = math.radians(goalie_pose[2])
-    
-    if side is None:
-        side = infer_side_from_position(goalie_pos)
-    
-    # Immediate ball interaction logic
-    if has_ball:
-        return "kick 100 0"
-    elif goalie_to_ball_dist < 1.2:
+PENALTY_X = 18.0
+PENALTY_Y = 20.0
+KEEPER_MARGIN = 0.8
+
+def _clamp_keeper_xy(x: float, y: float, side: str):
+    # goalie x must stay within MAX_KEEPER_OUT of goal line
+    if side == "left":
+        x = _clamp(x, GOAL_L[0], GOAL_L[0] + MAX_KEEPER_OUT)
+    else:
+        x = _clamp(x, GOAL_R[0] - MAX_KEEPER_OUT, GOAL_R[0])
+
+    # always keep y inside field
+    y = _clamp(y, FIELD_Y[0] + KEEPER_MARGIN, FIELD_Y[1] - KEEPER_MARGIN)
+    return float(x), float(y)
+
+def _ball_in_penalty(ball_pos, side: str) -> bool:
+    bx, by = float(ball_pos[0]), float(ball_pos[1])
+    if abs(by) > PENALTY_Y:
+        return False
+    if side == "left":
+        return bx <= GOAL_L[0] + PENALTY_X
+    return bx >= GOAL_R[0] - PENALTY_X
+
+def goalie_action(ball_pos, goalie_pos, side, use_charge=True, charge_distance=20):
+    gx, gy, gdeg = goalie_pos
+    goalie_dir = math.radians(gdeg)
+    bx, by = float(ball_pos[0]), float(ball_pos[1])
+
+    # hard safety: if we are already too far out, retreat immediately
+    safe_x, safe_y = _clamp_keeper_xy(gx, gy, side)
+    if abs(gx - safe_x) > 0.5 or abs(gy - safe_y) > 0.5:
+        return goto([gx, gy, goalie_dir], safe_x, safe_y, margin=0.6, speed=100.0)
+
+    goalie_to_ball_dist = _dist(goalie_pos[:2], ball_pos)
+    if goalie_to_ball_dist < 1.2 and _ball_in_penalty(ball_pos, side):
         return "catch 0"
 
-    gx, gy = goalie_pos
+    # if we have ball -> clear to wing / upfield
+    if goalie_to_ball_dist <= (KICKABLE_MARGIN + 0.05):
+        target_x = 0.0
+        target_y = -20.0 if by > 0 else 20.0
+        theta = math.atan2(target_y - gy, target_x - gx)
+        rel = normalize_angle(theta - goalie_dir)
+        return f"kick 100 {rel}"
 
-    # If the ball is very close to the center of our goal, the keeper must charge
-    _, _, goal_center = _compute_goal_params(side)
-    ball_goal_center_dist = math.hypot(ball_pos[0] - goal_center[0], 
-                                       ball_pos[1] - goal_center[1])
-    if ball_goal_center_dist < charge_distance:
-        # Charge straight toward the ball with max power
-        charge_heading = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
-        charge_direction = charge_heading - goalie_dir
-        charge_direction = (charge_direction + math.pi) % (2 * math.pi) - math.pi
-        return f"dash 100 {charge_direction}"
+    # default: cover bisector point (then clamp into keeper zone)
+    tx, ty = compute_bisector_target(ball_pos, goalie_pos, side)
+    tx, ty = _clamp_keeper_xy(tx, ty, side)
 
-    # Compute desired target using angle-bisector positioning
-    target_pos = compute_bisector_target(ball_pos, goalie_pos, side)
-    tx, ty = target_pos
+    # controlled charge only if ball is inside penalty and we can reach WITHOUT leaving keeper zone
+    if use_charge and _ball_in_penalty(ball_pos, side):
+        ball_goal_center_dist = _dist(ball_pos, GOAL_L if side == "left" else GOAL_R)
+        if ball_goal_center_dist < charge_distance:
+            cx, cy = _clamp_keeper_xy(bx, by, side)
+            return goto([gx, gy, goalie_dir], cx, cy, margin=0.6, speed=100.0)
 
-    # Convert target position into a dash/turn command
-    dist_to_target = math.hypot(tx - gx, ty - gy)
-    desired_heading = math.atan2(ty - gy, tx - gx)
-    direction = desired_heading - goalie_dir
-    direction = (direction + math.pi) % (2 * math.pi) - math.pi
+    return goto([gx, gy, goalie_dir], tx, ty, margin=0.6, speed=90.0)
 
-    # If we're close to the target, just align to the ball or stay still
-    if dist_to_target < 0.5:
-        facing_ball = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
-        turn_to_ball = facing_ball - goalie_dir
-        turn_to_ball = (turn_to_ball + math.pi) % (2 * math.pi) - math.pi
-        if abs(turn_to_ball) > math.pi / 36:
-            return f"turn {turn_to_ball * 10}"
-        return "dash 0 0"
-
-    power = min(100, dist_to_target * 10.0)
-    return f"dash {power} {direction}"
 
