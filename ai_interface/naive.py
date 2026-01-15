@@ -160,11 +160,13 @@ class SoccerAI:
         p = min(100.0, max(35.0, power * min(1.0, dist / 6.0)))
         return f"dash {p:.1f} {ang:.4f}"
 
-    KICK_ALIGN_TOL = math.radians(8.0)
-    TURN_GAIN = 1.0
+
 
     def _kick_to(self, pose: tuple[float, float, float], tx: float, ty: float,
                  power: float = 100.0, kind: str = "kick") -> str:
+
+        KICK_ALIGN_TOL = math.radians(8.0)
+        TURN_GAIN = 2.0
 
         x, y, deg = float(pose[0]), float(pose[1]), float(pose[2])
         heading = math.radians(deg)
