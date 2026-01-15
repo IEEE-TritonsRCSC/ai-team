@@ -160,12 +160,26 @@ class SoccerAI:
         p = min(100.0, max(35.0, power * min(1.0, dist / 6.0)))
         return f"dash {p:.1f} {ang:.4f}"
 
-    def _kick_to(self, pose: tuple[float, float, float], tx: float, ty: float, power: float = 100.0) -> str:
+    KICK_ALIGN_TOL = math.radians(8.0)
+    TURN_GAIN = 1.0
+
+    def _kick_to(self, pose: tuple[float, float, float], tx: float, ty: float,
+                 power: float = 100.0, kind: str = "kick") -> str:
+
         x, y, deg = float(pose[0]), float(pose[1]), float(pose[2])
         heading = math.radians(deg)
+
         desired = math.atan2(ty - y, tx - x)
-        ang = norm_angle(desired - heading)
-        return f"kick {power:.1f} {ang:.4f}"
+        diff = norm_angle(desired - heading)
+
+        # 先对准方向
+        if abs(diff) > KICK_ALIGN_TOL:
+            return f"turn {(diff * TURN_GAIN):.4f}"
+
+        # 对准后，只能正前方踢（角度=0）
+        if kind == "skick":
+            return f"skick {power:.1f} 0"
+        return f"kick {power:.1f} 0"
 
     # ---------- roles ----------
     def _goalie_action(self, tick: int, ball: tuple[float, float], v_next: tuple[float, float],
