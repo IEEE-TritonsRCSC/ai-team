@@ -77,15 +77,15 @@ class InterceptDemoAI(SoccerAI):
             unum = int(next(iter(robot.keys())))
             pose = robot[unum]
             self_p0 = np.array([pose[0], pose[1]], dtype=float)
-            avoid_points = self._build_avoid_points(game_state, teamname, unum)
             heading = math.radians(pose[2])
 
             if teamname == self.shooter_id[0] and unum == self.shooter_id[1]:
                 actions.append(self._action_shooter(self_p0, heading, ball_vel_est, game_state.ball_pos,
-                                                   receiver_pos, avoid_points=avoid_points))
+                                                   receiver_pos, game_state=game_state))
                 print(f"Shooter cmd for robot {unum}: {actions[-1]}")
             elif teamname == self.receiver_id[0] and unum == self.receiver_id[1]:
-                actions.append(self._action_receiver(self_p0, heading, ball_vel_est, game_state.ball_pos, avoid_points=avoid_points))
+                actions.append(self._action_receiver(self_p0, heading, ball_vel_est, game_state.ball_pos,
+                                                     game_state=game_state))
                 print(f"Receiver cmd for robot {unum}: {actions[-1]}")
             else:
                 # simple chase
@@ -105,19 +105,6 @@ class InterceptDemoAI(SoccerAI):
         self.receiver_decision_expiring = 0
         self.decision_count = 0
 
-    def _build_avoid_points(self, game_state, teamname: str, unum: int):
-        avoid_points = []
-        if game_state.ball_pos is not None:
-            avoid_points.append((game_state.ball_pos[0], game_state.ball_pos[1], KICKABLE_MARGIN))
-        for other_team, team_robots in game_state.robot_poses.items():
-            for robot in team_robots:
-                other_unum = int(next(iter(robot.keys())))
-                if other_team == teamname and other_unum == unum:
-                    continue
-                pose = robot[other_unum]
-                avoid_points.append((pose[0], pose[1], 1.0))
-        return avoid_points
-
     def _receiver_region(self):
         return (FIELD_X[1] - 30, FIELD_X[1], -20, 20)
 
@@ -127,7 +114,8 @@ class InterceptDemoAI(SoccerAI):
         return xmin <= x <= xmax and ymin <= y <= ymax
 
     def hybrid_capture(self, self_p0, heading, ball_vel_est, ball_pos, decision, decision_expiring,
-                       theta, avoid_points=None, rect_bounds=None):
+                       theta, rect_bounds=None, game_state=None, teamname: str | None = None,
+                       unum: int | None = None):
         ball = np.array(ball_pos[:2], dtype=float)
         to_ball = ball - self_p0
         dist = np.linalg.norm(to_ball)
@@ -155,7 +143,8 @@ class InterceptDemoAI(SoccerAI):
                 )
                 if res is None:
                     goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float),
-                                    target_pos[0], target_pos[1], theta=theta, avoid_points=avoid_points)
+                                    target_pos[0], target_pos[1], theta=theta,
+                                    game_state=game_state)
                     return goto_cmd, None, 0
 
                 u = res["u"]
@@ -169,10 +158,12 @@ class InterceptDemoAI(SoccerAI):
             decision_expiring -= 1
             return f"dash {power:.1f} {ang}", decision, decision_expiring
         goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float),
-                        target_pos[0], target_pos[1], theta=theta, avoid_points=avoid_points, margin=0.05)
+                        target_pos[0], target_pos[1], theta=theta, margin=0.05,
+                        game_state=game_state)
         return goto_cmd, None, 0
     
-    def _action_shooter(self, self_p0, heading, ball_vel_est, ball_pos, receiver_pos=None, avoid_points=None):
+    def _action_shooter(self, self_p0, heading, ball_vel_est, ball_pos, receiver_pos=None,
+                        game_state=None):
         if not self.shooter_turn:
             print('Waiting for receiver to catch')
             return "dash 0 0"
@@ -201,11 +192,12 @@ class InterceptDemoAI(SoccerAI):
             self_p0, heading, ball_vel_est, ball_pos,
             self.shooter_decision, self.shooter_decision_expiring,
             desired_theta,
-            avoid_points=avoid_points,
+            game_state=game_state,
         )
         return "dash 0 0" if cmd == "done" else cmd
 
-    def _action_receiver(self, self_p0, heading, ball_vel_est, ball_pos, avoid_points=None):
+    def _action_receiver(self, self_p0, heading, ball_vel_est, ball_pos,
+                         game_state=None,):
         ball = np.array(ball_pos[:2], dtype=float)
         to_ball = ball - self_p0
         dist = np.linalg.norm(to_ball)
@@ -221,7 +213,8 @@ class InterceptDemoAI(SoccerAI):
         if self.shooter_turn:
             ang = math.atan2(to_ball[1], to_ball[0])
             goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float), 
-                        GOAL_R[0] - 10, GOAL_R[1], theta=ang, avoid_points=avoid_points, margin=0.5)
+                        GOAL_R[0] - 10, GOAL_R[1], theta=ang, margin=0.5,
+                        game_state=game_state)
             return goto_cmd if goto_cmd != "done" else "dash 0 0"
         
         if dist <= close_threshold and ball_speed <= slow_threshold:
@@ -229,7 +222,7 @@ class InterceptDemoAI(SoccerAI):
             kick_angle = math.atan2(ball[1] - kick_pos[1], ball[0] - kick_pos[0])
             goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float),
                             kick_pos[0], kick_pos[1], theta=kick_angle, speed=50.0,
-                            avoid_points=avoid_points)
+                            game_state=game_state)
             if goto_cmd != "done":
                 return goto_cmd
         
@@ -257,8 +250,8 @@ class InterceptDemoAI(SoccerAI):
             self_p0, heading, ball_vel_est, ball_pos,
             self.receiver_decision, self.receiver_decision_expiring,
             math.pi,
-            avoid_points=avoid_points,
-            rect_bounds=(FIELD_X[1] - 30, FIELD_X[1], -20 , 20)
+            rect_bounds=(FIELD_X[1] - 30, FIELD_X[1], -20 , 20),
+            game_state=game_state,
         )
         return "dash 0 0" if cmd == "done" else cmd
 

@@ -60,9 +60,28 @@ def _select_detour(origin: np.ndarray, destination: np.ndarray,
     return best
 
 
-def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float = 0.1,
-         theta: float | None = None, speed: float = 100.0,
-         avoid_points: Iterable[Tuple] | None = None,
+def build_avoid_points(game_state, self_pose,
+                       ball_radius: float = KICKABLE_MARGIN,
+                       player_radius: float = 1.0) -> list[tuple[float, float, float]]:
+    """
+    Build avoid points for a player, skipping itself.
+    """
+    avoid_points = []
+    ball_pos = getattr(game_state, "ball_pos", None)
+    if ball_pos is not None:
+        avoid_points.append((ball_pos[0], ball_pos[1], ball_radius))
+    for other_team, team_robots in game_state.robot_poses.items():
+        for robot in team_robots:
+            other_unum = int(next(iter(robot.keys())))
+            pose = robot[other_unum]
+            if np.isclose(pose, self_pose).all():
+                continue
+            avoid_points.append((pose[0], pose[1], player_radius))
+    return avoid_points
+
+
+def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
+         margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
          avoid_radius: float = 1.0, detour_margin: float = 1.0) -> str:
     """
     Create a `dash` or `turn` command to move toward a destination.
@@ -70,10 +89,13 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float
     self_pose is [x, y, theta] in radians. If the agent is within `margin` of (x, y),
     it optionally turns to heading `theta`; otherwise it dashes toward (x, y) with a
     speed capped by `speed` and scaled by remaining distance. If `avoid_points` are
-    provided, the path will detour around obstacles using a single waypoint.
+    provided (or can be built from game_state), the path will detour
+    around obstacles using a single waypoint.
     """
     origin = np.array(self_pose[:2], dtype=float)
     destination = np.array([x, y], dtype=float)
+    avoid_points = build_avoid_points(game_state, self_pose, ball_radius=KICKABLE_MARGIN, player_radius=avoid_radius)
+
     if avoid_points:
         obstacles = []
         for item in avoid_points:
