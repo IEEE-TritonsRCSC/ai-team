@@ -6,7 +6,7 @@ sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 from typing import Iterable, List, Tuple
 import math
 import numpy as np
-from constants.player_constants import KICKABLE_MARGIN
+from constants.player_constants import KICKABLE_MARGIN, PLAYER_SIZE, BALL_SIZE
 from constants.field_constants import GOAL_L, GOAL_R
 from .algo_utils import normalize_angle
 
@@ -98,15 +98,15 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float
     if distance < margin:
         if theta is not None:
             angle_diff = normalize_angle(theta - self_pose[2])
-            return f"turn {angle_diff}" if abs(angle_diff) > math.radians(1.0) else "done"
+            return f"turn {angle_diff}" if abs(angle_diff) > math.radians(5.0) else "done"
         else:
             return "done"
     return f"dash {speed} {angle}"
 
 
-def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+def shoot(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
           target: np.ndarray | Tuple | List, kick_power: float = 80.0,
-          kickable_tolerance: float = KICKABLE_MARGIN,
+          kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
           angle_tolerance: float = math.radians(5.0)) -> str:
     """
     Create a `kick` command toward a target if the ball is kickable and aligned.
@@ -115,38 +115,67 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     Returns `kick power rel_angle` when the ball is within kickable_tolerance of the
     agent and facing within angle_tolerance radians; otherwise returns `"failed"`.
     """
-
-    if not np.all(np.isclose(self_pose[:2], ball_pose, atol=kickable_tolerance)):
+    if np.linalg.norm(ball_pose - self_pose[:2]) > kickable_tolerance:
         return "failed"
 
-    ball_dir = normalize_angle(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0]))
-    if not np.isclose(ball_dir, self_pose[2], atol=angle_tolerance):
-        return "failed"
 
     angle_to_target = np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0])
-    angle_diff = normalize_angle(angle_to_target - self_pose[2])
-    return f"kick {kick_power} {angle_diff}"
+    return kick(AI, self_pose, ball_pose, angle_to_target, kick_power)
+
+def kick(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
+         target_angle: float, kick_power: float = 80.0):
+    """
+    Creates 'kick' or 'turn' commands to aim and kick the ball towards a specific global angle
+    
+    self_pose is [x, y, theta] in radians; target_angle is in radians;
+    
+    Returns 'kick {kick_power} 0'
+    """
+    
+    angle_diff = normalize_angle(target_angle - self_pose[2])
+    
+    if AI.dribble_state_shooter and AI.shooter_turn:
+        if np.abs(angle_diff) > math.radians(5.0):
+            return f"turn {angle_diff}"
+        if AI.shooter_turn == True:
+            AI.dribble_state_shooter = False
+            AI.shooter_turn = False
+        else:
+            AI.dribble_state_reciever = False
+        return f"kick {kick_power} {0}"
+    elif AI.dribble_state_reciever and not AI.shooter_turn:
+        if np.abs(angle_diff) > math.radians(5.0):
+            return f"turn {angle_diff}"
+        if AI.shooter_turn == True:
+            AI.dribble_state_shooter = False
+            AI.shooter_turn = False
+        else:
+            AI.dribble_state_reciever = False
+        return f"kick {kick_power} {0}"
+    else:
+        return dribble(AI, self_pose, ball_pose)
+        
 
 
-def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+def shoot_at_goal(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
                   goal: np.ndarray | Tuple | List, kick_power: float = 80.0) -> str:
     """
     Convenience wrapper around `shoot` that aims at the provided goal position.
     """
-    return shoot(self_pose, ball_pose, goal, kick_power)
+    return shoot(AI, self_pose, ball_pose, goal, kick_power)
 
 
-def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+def pass_to_teammate(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
                      teammate_pose: np.ndarray | Tuple | List, kick_power: float = 60.0) -> str:
     """
     Convenience wrapper around `shoot` that aims at a teammate's position.
 
     teammate_pose is [x, y, theta]; only the [x, y] components are used.
     """
-    return shoot(self_pose, ball_pose, teammate_pose[:2], kick_power)
+    return shoot(AI, self_pose, ball_pose, teammate_pose[:2], kick_power)
 
-def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
-            kickable_tolerance: float = KICKABLE_MARGIN,
+def dribble(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+            kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
             angle_tolerance: float = math.radians(5.0),
             angle: float = 0.0) -> str:
     """
@@ -156,11 +185,16 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     when the ball is within kickable_tolerance and aligned within angle_tolerance radians;
     otherwise returns `"failed"`.
     """
-    if not np.isclose(self_pose[:2], ball_pose, atol=kickable_tolerance):
+    if np.linalg.norm(ball_pose-self_pose[:2]) > kickable_tolerance:
         return "failed"
 
     ball_dir = normalize_angle(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0]))
-    if not np.isclose(ball_dir, self_pose[2], atol=angle_tolerance):
-        return "failed"
-    
+    angle_diff = normalize_angle(ball_dir - self_pose[2])
+    if abs(angle_diff) > angle_tolerance:
+        return f"turn {angle_diff}"
+
+    if AI.shooter_turn:
+        AI.dribble_state_shooter = True
+    else:
+        AI.dribble_state_reciever = True
     return f"catch 0"

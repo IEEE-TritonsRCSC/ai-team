@@ -12,7 +12,7 @@ import time
 from ai_interface.naive import SoccerAI
 from ai_interface.utils.intercept import earliest_intercept_control
 from ai_interface.utils.algo_utils import estimate_ball_velocity
-from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot
+from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, kick, dribble
 from constants.player_constants import *
 from constants.field_constants import *
 
@@ -27,11 +27,16 @@ class InterceptDemoAI(SoccerAI):
         self.shooter_id = None
         self.receiver_id = None
         self.shooter_turn = True
+        self.dribble_state_shooter = False
+        self.dribble_state_reciever = False
         self.shooter_decision = None
         self.shooter_decision_expiring = 0
         self.receiver_decision = None
         self.receiver_decision_expiring = 0
+        self.reciever_shoot_angle = 0
         self.decision_count = 0
+        self.KICKABLE_RANGE = PLAYER_SIZE + KICKABLE_MARGIN + BALL_SIZE
+        
 
     def decide_action(self, game_state, teamname: str):
         actions = []
@@ -162,9 +167,8 @@ class InterceptDemoAI(SoccerAI):
             power, ang = decision
             decision_expiring -= 1
             return f"dash {power:.1f} {ang}", decision, decision_expiring
-
         goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float),
-                        target_pos[0], target_pos[1], theta=theta, avoid_points=avoid_points, margin=0.01)
+                        target_pos[0], target_pos[1], theta=theta, avoid_points=avoid_points, margin=0.05)
         return goto_cmd, None, 0
     
     def _action_shooter(self, self_p0, heading, ball_vel_est, ball_pos, receiver_pos=None, avoid_points=None):
@@ -174,14 +178,20 @@ class InterceptDemoAI(SoccerAI):
         to_ball = ball - self_p0
         dist = np.linalg.norm(to_ball)
         if self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0]))):
-            cmd = shoot_at_goal([*self_p0, heading], ball, GOAL_R, kick_power=100.0)
+            cmd = shoot_at_goal(self, [*self_p0, heading], ball, GOAL_R, kick_power=80.0)
             if cmd != "failed":
                 return cmd
             # Fallback: small angle deviation toward GOAL_R
-            dir_vec = np.array(GOAL_R, dtype=float) - ball
-            theta = math.atan2(dir_vec[1], dir_vec[0]) + math.radians(random.uniform(-10, 10))
-            self.shooter_turn = False
-            return f"kick 100 {theta}"
+            # dir_vec = np.array(GOAL_R, dtype=float) - ball
+            # theta = math.atan2(dir_vec[1], dir_vec[0]) + math.radians(random.uniform(-10, 10))
+            # if self.dribble_state_shooter and dist <= self.KICKABLE_RANGE:
+            #     self.shooter_turn = False
+            #     self.dribble_state_shooter = False
+            #     return f"kick 100 {theta}"
+            # cmd = dribble(self, [*self_p0, heading], ball_pos)
+            # if cmd != "failed":
+            #     return cmd
+            return "dash 0 0"
 
         desired_theta = math.atan2(GOAL_R[1] - self_p0[1], GOAL_R[0] - self_p0[0])
         cmd, self.shooter_decision, self.shooter_decision_expiring = self.hybrid_capture(
@@ -200,7 +210,8 @@ class InterceptDemoAI(SoccerAI):
         close_threshold = 2.0 * (PLAYER_SIZE + BALL_SIZE)
         slow_threshold = 0.2
         region = self._receiver_region()
-
+        if self.reciever_shoot_angle == 0:
+                self.reciever_shoot_angle = math.radians(random.uniform(-30, 30))
         if not self._inside_region(ball, region):
             return "dash 0 0"
 
@@ -211,7 +222,7 @@ class InterceptDemoAI(SoccerAI):
             return goto_cmd if goto_cmd != "done" else "dash 0 0"
         
         if dist <= close_threshold and ball_speed <= slow_threshold:
-            kick_pos = ball + np.array([1.0, 0.0]) * (PLAYER_SIZE + BALL_SIZE)
+            kick_pos = ball + np.array([np.cos(self.reciever_shoot_angle), np.sin(self.reciever_shoot_angle)]) * (PLAYER_SIZE + BALL_SIZE)
             kick_angle = math.atan2(ball[1] - kick_pos[1], ball[0] - kick_pos[0])
             goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float),
                             kick_pos[0], kick_pos[1], theta=kick_angle, speed=50.0,
@@ -220,11 +231,16 @@ class InterceptDemoAI(SoccerAI):
                 return goto_cmd
         
         if self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0]))):
-            random_angle = math.radians(random.uniform(-30, 30))
-            self.shooter_turn = True
-            self.receiver_decision = None
-            self.receiver_decision_expiring = 0
-            return f"kick 100 {random_angle:.1f}"
+            reciever_cmd = kick(self, [*self_p0, heading], ball, kick_angle)
+            # reciever_cmd = f"kick {100} {self.reciever_shoot_angle}"
+            if "kick" in reciever_cmd:
+                self.shooter_turn = True
+                self.receiver_decision = None
+                self.receiver_decision_expiring = 0
+                self.reciever_shoot_angle = 0
+                return reciever_cmd
+            else:
+                return reciever_cmd
         else:
             print('Ball distance:', dist, 'Ball angle:', math.degrees(math.atan2(to_ball[1], to_ball[0])), 'Heading:', math.degrees(heading))
         cmd, self.receiver_decision, self.receiver_decision_expiring = self.hybrid_capture(
