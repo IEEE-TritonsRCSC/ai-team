@@ -104,10 +104,10 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, margin: float
     return f"dash {speed} {angle}"
 
 
-def shoot(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
           target: np.ndarray | Tuple | List, kick_power: float = 80.0,
           kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
-          angle_tolerance: float = math.radians(5.0)) -> str:
+          angle_tolerance: float = math.radians(5.0), dribbling=False) -> str:
     """
     Create a `kick` command toward a target if the ball is kickable and aligned.
 
@@ -118,12 +118,11 @@ def shoot(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tupl
     if np.linalg.norm(ball_pose - self_pose[:2]) > kickable_tolerance:
         return "failed"
 
-
     angle_to_target = np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0])
-    return kick(AI, self_pose, ball_pose, angle_to_target, kick_power)
-
-def kick(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
-         target_angle: float, kick_power: float = 80.0):
+    return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling)
+    
+def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
+         target_angle: float, kick_power: float = 80.0, dribbling=False, ) -> str:
     """
     Creates 'kick' or 'turn' commands to aim and kick the ball towards a specific global angle
     
@@ -133,51 +132,35 @@ def kick(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple
     """
     
     angle_diff = normalize_angle(target_angle - self_pose[2])
-    
-    if AI.dribble_state_shooter and AI.shooter_turn:
-        if np.abs(angle_diff) > math.radians(5.0):
+    if np.abs(angle_diff) > math.radians(5.0):
+        if dribbling:
             return f"turn {angle_diff}"
-        if AI.shooter_turn == True:
-            AI.dribble_state_shooter = False
-            AI.shooter_turn = False
         else:
-            AI.dribble_state_reciever = False
-        return f"kick {kick_power} {0}"
-    elif AI.dribble_state_reciever and not AI.shooter_turn:
-        if np.abs(angle_diff) > math.radians(5.0):
-            return f"turn {angle_diff}"
-        if AI.shooter_turn == True:
-            AI.dribble_state_shooter = False
-            AI.shooter_turn = False
-        else:
-            AI.dribble_state_reciever = False
-        return f"kick {kick_power} {0}"
+            return dribble(self_pose, ball_pose) # "failed", "turn {angle_diff}" or "catch 0"
     else:
-        return dribble(AI, self_pose, ball_pose)
+        return f"kick {kick_power} {0}"
         
 
 
-def shoot_at_goal(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
-                  goal: np.ndarray | Tuple | List, kick_power: float = 80.0) -> str:
+def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+                  goal: np.ndarray | Tuple | List, kick_power: float = 80.0, dribbling=False) -> str:
     """
     Convenience wrapper around `shoot` that aims at the provided goal position.
     """
-    return shoot(AI, self_pose, ball_pose, goal, kick_power)
+    return shoot(self_pose, ball_pose, goal, kick_power, dribbling=dribbling)
 
-
-def pass_to_teammate(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
-                     teammate_pose: np.ndarray | Tuple | List, kick_power: float = 60.0) -> str:
+def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+                     teammate_pose: np.ndarray | Tuple | List, kick_power: float = 60.0, dribbling=False) -> str:
     """
     Convenience wrapper around `shoot` that aims at a teammate's position.
 
     teammate_pose is [x, y, theta]; only the [x, y] components are used.
     """
-    return shoot(AI, self_pose, ball_pose, teammate_pose[:2], kick_power)
+    return shoot(self_pose, ball_pose, teammate_pose[:2], kick_power, dribbling=dribbling)
 
-def dribble(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
             kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
-            angle_tolerance: float = math.radians(5.0),
-            angle: float = 0.0) -> str:
+            angle_tolerance: float = math.radians(5.0)) -> str:
     """
     Create a `dribble` command in the given relative angle when the ball is controllable.
 
@@ -193,8 +176,4 @@ def dribble(AI, self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tu
     if abs(angle_diff) > angle_tolerance:
         return f"turn {angle_diff}"
 
-    if AI.shooter_turn:
-        AI.dribble_state_shooter = True
-    else:
-        AI.dribble_state_reciever = True
     return f"catch 0"
