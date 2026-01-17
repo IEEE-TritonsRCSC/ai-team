@@ -28,6 +28,7 @@ parser.add_argument("--env", choices=[
     "field-practice",  # one or both teams - camera + physical robots
     "field-tournament" # our team only - camera + physical robots
 ], default="sim-only")
+parser.add_argument("--estimate", choices=["ball", "player"], dest="estimate_params", default=None,)
 
 
 def main():
@@ -38,9 +39,15 @@ def main():
     and runs the main game loop that processes game states and executes AI decisions.
     """
     args = parser.parse_args()
-    team_infos = load_team_config(args.team_config)
-    # soccer_ai = SoccerAI(team_infos)
-    soccer_ai = InterceptDemoAI(team_infos)
+    
+    if args.estimate_params is not None:
+        from ai_interface.utils.param_estimator import ParamEstimatorAI
+        team_infos = load_team_config("ai_interface/utils/estimator_config.json")
+        soccer_ai = ParamEstimatorAI(team_infos, mode=args.estimate_params)
+    else:
+        team_infos = load_team_config(args.team_config)
+        # soccer_ai = SoccerAI(team_infos)
+        soccer_ai = InterceptDemoAI(team_infos)
     networker = Networker(team_infos, args.env)
     game_state_queue: Queue[GameState] = Queue(maxsize=1)
     stop_event = threading.Event()
@@ -93,6 +100,8 @@ def main():
         stop_event.set()
         networker.shutdown()
         state_thread.join(timeout=1)
+        if args.estimate_params is not None:
+            soccer_ai.estimate()
         if client_thread is not None:
             client_thread.join(timeout=1)
 

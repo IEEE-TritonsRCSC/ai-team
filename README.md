@@ -112,6 +112,21 @@ python .
   - `field-practice`: Physical robots with camera
   - `field-tournament`: Tournament mode (own team only)
 
+### Parameter Estimation
+
+`ai_interface/utils/param_estimator.py` contains utility that estimates `dash_power_rate`, `player_decay`, `ball_decay`, and `player_speed_max` (server configs used in calculation) by doing real-life experiments.
+
+To call it, run commands in root:
+```bash
+python . --env sim-mixed --estimate player
+```
+```bash
+python . --env sim-mixed --estimate ball
+```
+After getting estimates, update numbers in `ai_interface/constants`.
+
+The goodness of fit can be read off from the $r^2$ score printed out. Note that the usefulness of the estimates depends on how realistic the simulator [movement model](https://rcsoccersim.readthedocs.io/en/latest/soccerserver.html#movement-models) is.
+
 ## Development
 
 ### Implementing Custom AI
