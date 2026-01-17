@@ -13,6 +13,7 @@ from ai_interface.naive import SoccerAI
 from ai_interface.utils.intercept import earliest_intercept_control
 from ai_interface.utils.algo_utils import estimate_ball_velocity
 from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, kick, dribble
+from ai_interface.utils.goalie import goalie_action, infer_side_from_position
 from constants.player_constants import *
 from constants.field_constants import *
 
@@ -192,7 +193,7 @@ class InterceptDemoAI(SoccerAI):
             self_p0, heading, ball_vel_est, ball_pos,
             self.shooter_decision, self.shooter_decision_expiring,
             desired_theta,
-            game_state=game_state,
+            game_state=game_state, teamname=self.shooter_id[0]
         )
         return "dash 0 0" if cmd == "done" else cmd
 
@@ -211,11 +212,21 @@ class InterceptDemoAI(SoccerAI):
             return "dash 0 0"
 
         if self.shooter_turn:
-            ang = math.atan2(to_ball[1], to_ball[0])
-            goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float), 
-                        GOAL_R[0] - 10, GOAL_R[1], theta=ang, margin=0.5,
-                        game_state=game_state)
-            return goto_cmd if goto_cmd != "done" else "dash 0 0"
+            goalie_pos = (float(self_p0[0]), float(self_p0[1]))
+            goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
+            has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
+            side = infer_side_from_position(goalie_pos)
+            print('-----------------------------GOALIE ACTION-----------------------------')
+            goalie_cmd = goalie_action(
+                ball_pos=(float(ball[0]), float(ball[1])),
+                goalie_pose=goalie_pose,
+                has_ball=has_ball,
+                goalie_to_ball_dist=dist,
+                side=side,
+                charge_distance=10,
+                game_state=game_state
+            )
+            return goalie_cmd
         
         if dist <= close_threshold and ball_speed <= slow_threshold:
             kick_pos = ball + np.array([np.cos(self.receiver_shoot_angle), np.sin(self.receiver_shoot_angle)]) * (PLAYER_SIZE + BALL_SIZE)
@@ -251,7 +262,7 @@ class InterceptDemoAI(SoccerAI):
             self.receiver_decision, self.receiver_decision_expiring,
             math.pi,
             rect_bounds=(FIELD_X[1] - 30, FIELD_X[1], -20 , 20),
-            game_state=game_state,
+            game_state=game_state, teamname=self.receiver_id[0]
         )
         return "dash 0 0" if cmd == "done" else cmd
 

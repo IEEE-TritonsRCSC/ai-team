@@ -16,6 +16,7 @@ from ai_interface.constants.field_constants import (
     GOAL_R,
     MAX_KEEPER_OUT,
 )
+from ai_interface.utils.basic_commands import goto
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -178,7 +179,8 @@ def goalie_action(ball_pos: Tuple[float, float],
                   has_ball: bool,
                   goalie_to_ball_dist: float,
                   side: str = None,
-                  charge_distance: float = 20) -> str:
+                  charge_distance: float = 15,
+                  game_state=None) -> str:
     """
     Compute goalkeeper action command using angle-bisector positioning.
     
@@ -195,6 +197,7 @@ def goalie_action(ball_pos: Tuple[float, float],
     """
     goalie_pos = (goalie_pose[0], goalie_pose[1])
     goalie_dir = math.radians(goalie_pose[2])
+    goalie_pose_rad = (goalie_pose[0], goalie_pose[1], goalie_dir)
     
     if side is None:
         side = infer_side_from_position(goalie_pos)
@@ -212,31 +215,48 @@ def goalie_action(ball_pos: Tuple[float, float],
     ball_goal_center_dist = math.hypot(ball_pos[0] - goal_center[0], 
                                        ball_pos[1] - goal_center[1])
     if ball_goal_center_dist < charge_distance:
-        # Charge straight toward the ball with max power
+        # Charge straight toward the ball using goto
         charge_heading = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
-        charge_direction = charge_heading - goalie_dir
-        charge_direction = (charge_direction + math.pi) % (2 * math.pi) - math.pi
-        return f"dash 100 {charge_direction}"
+        goto_cmd = goto(
+            goalie_pose_rad,
+            ball_pos[0],
+            ball_pos[1],
+            game_state,
+            margin=0.1,
+            theta=charge_heading,
+            speed=100.0
+        )
+        return goto_cmd if goto_cmd != "done" else "dash 0 0"
 
     # Compute desired target using angle-bisector positioning
     target_pos = compute_bisector_target(ball_pos, goalie_pos, side)
     tx, ty = target_pos
 
-    # Convert target position into a dash/turn command
+    # Use goto to move to target position, facing the ball when close
     dist_to_target = math.hypot(tx - gx, ty - gy)
-    desired_heading = math.atan2(ty - gy, tx - gx)
-    direction = desired_heading - goalie_dir
-    direction = (direction + math.pi) % (2 * math.pi) - math.pi
-
-    # If we're close to the target, just align to the ball or stay still
+    facing_ball = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
+    
+    # If we're close to the target, align to face the ball
     if dist_to_target < 0.5:
-        facing_ball = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
-        turn_to_ball = facing_ball - goalie_dir
-        turn_to_ball = (turn_to_ball + math.pi) % (2 * math.pi) - math.pi
-        if abs(turn_to_ball) > math.pi / 36:
-            return f"turn {turn_to_ball * 10}"
-        return "dash 0 0"
-
-    power = min(100, dist_to_target * 10.0)
-    return f"dash {power} {direction}"
+        goto_cmd = goto(
+            goalie_pose_rad,
+            tx,
+            ty,
+            game_state,
+            margin=0.5,
+            theta=facing_ball,
+            speed=0.0
+        )
+        return goto_cmd if goto_cmd != "done" else "dash 0 0"
+    
+    # Move to target position
+    goto_cmd = goto(
+        goalie_pose_rad,
+        tx,
+        ty,
+        game_state,
+        margin=0.1,
+        speed=100.0
+    )
+    return goto_cmd if goto_cmd != "done" else "dash 0 0"
 
