@@ -8,6 +8,7 @@ No dependency on intercept_demo / constants package.
 import math
 import random
 import sys
+import numpy as np
 from collections import deque
 from pathlib import Path
 
@@ -51,6 +52,9 @@ class SoccerAI:
         self.penalty_y = 20.0               # "danger zone" half height
         self.goalie_line_offset = 1.5       # stand a bit in front of goal line
         self.max_predict_steps = 60
+        # attacker dribble / touch control
+        self.attacker_touch_cd = 3  # ticks between touches
+        self._attacker_last_touch = -10
 
         self.possession_dist = PLAYER_SIZE + BALL_SIZE + 0.15  # a forgiving possession radius
 
@@ -109,6 +113,20 @@ class SoccerAI:
                 return y0 + t * (y1 - y0)
             prev = p
         return None
+
+    def _dist_point_to_segment(self, p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+        """
+        Compute the distance from point p to the line segment a->b.
+        Used to check if a defender blocks the shooting lane.
+        """
+        v = b - a
+        vv = float(np.dot(v, v))
+        if vv < 1e-9:
+            return float(np.linalg.norm(p - a))
+        t = float(np.dot(p - a, v) / vv)
+        t = float(np.clip(t, 0.0, 1.0))
+        proj = a + t * v
+        return float(np.linalg.norm(p - proj))
 
     # ---------- geometry helpers ----------
     def _goals_for_side(self, side: str):
@@ -174,14 +192,25 @@ class SoccerAI:
         desired = math.atan2(ty - y, tx - x)
         diff = norm_angle(desired - heading)
 
-        # 先对准方向
         if abs(diff) > KICK_ALIGN_TOL:
             return f"turn {(diff * TURN_GAIN):.4f}"
 
-        # 对准后，只能正前方踢（角度=0）
+        # Only allow straight kick (angle=0)
         if kind == "skick":
             return f"skick {power:.1f} 0"
         return f"kick {power:.1f} 0"
+
+    def _sideline_risk(self, x: float, y: float) -> float:
+        """
+        Returns a risk score in [0, 1], higher means closer to field boundary.
+        We treat closeness to top/bottom as the main danger for drifting to corners.
+        """
+        # FIELD_Y is [min_y, max_y]
+        top_gap = (FIELD_Y[1] - y)
+        bot_gap = (y - FIELD_Y[0])
+        gap = min(top_gap, bot_gap)
+        # within ~6m from sideline -> high risk
+        return float(clamp(1.0 - gap / 6.0, 0.0, 1.0))
 
     # ---------- roles ----------
     def _goalie_action(self, tick: int, ball: tuple[float, float], v_next: tuple[float, float],
@@ -253,13 +282,12 @@ class SoccerAI:
         (gx, gy), (ax, ay) = self._goals_for_side(side)
         rx, ry = float(pose[0]), float(pose[1])
 
-        # 如果拿到球：优先清出去（对方只有1人，直接大脚更稳）
+        # If you get the ball: Clear it out first.
         if self._has_ball(rx, ry, bx, by):
             return self._kick_to(pose, ax, random.choice([-8.0, 8.0]), power=100.0)
 
         ball_speed = math.hypot(v_next[0], v_next[1])
 
-        # ---- NEW: pressing trigger ----
         opp_close_to_ball = False
         if opp_attacker_pose is not None:
             ox, oy = float(opp_attacker_pose[0]), float(opp_attacker_pose[1])
@@ -272,10 +300,9 @@ class SoccerAI:
 
         threat = ball_in_our_half or toward_goal or close_to_goal or opp_close_to_ball
 
-        # ---- dead ball near center + opponent close -> step up and pressure ----
         if ball_speed < 0.02 and abs(bx) < 8.0 and abs(by) < 8.0 and opp_close_to_ball:
             tx, ty = self._clamp_to_field(bx, by)
-            # 不要冲到对方半场太深（2v1 还是要留后）
+            # Don't push too deep into the opponent's half.
             if side == "left":
                 tx = min(tx, 5.0)
             else:
@@ -286,7 +313,6 @@ class SoccerAI:
         if threat:
             preds = self._predict_positions((bx, by), v_next, 25)
             for k, (px, py) in enumerate(preds, start=1):
-                # 别追太深
                 if side == "left" and px > 12.0:
                     continue
                 if side == "right" and px < -12.0:
@@ -294,14 +320,13 @@ class SoccerAI:
 
                 px, py = self._clamp_to_field(px, py)
                 if math.hypot(px - rx, py - ry) <= 1.35 * k + 0.8:
-                    # 离门将太近就错开
                     if goalie_pose is not None:
                         gx2, gy2 = float(goalie_pose[0]), float(goalie_pose[1])
                         if math.hypot(px - gx2, py - gy2) < 3.0:
                             py = clamp(py + (3.0 if py < 0 else -3.0), FIELD_Y[0] + 1.0, FIELD_Y[1] - 1.0)
                     return self._move_to(pose, px, py, power=100.0, margin=0.7, face_xy=(bx, by))
 
-            # 预测失败就直接去压迫球
+            # If the prediction fails, just go and press the ball directly.
             tx, ty = self._clamp_to_field(bx, by)
             if side == "left":
                 tx = min(tx, 10.0)
@@ -319,7 +344,7 @@ class SoccerAI:
             block_dist = clamp(d * 0.35, 10.0, 20.0)
             tx, ty = gx + ux * block_dist, gy + uy * block_dist
 
-        # 后卫活动范围（别进门将通道）
+        # range
         if side == "left":
             tx = clamp(tx, gx + 7.0, 10.0)
         else:
@@ -333,61 +358,233 @@ class SoccerAI:
 
         return self._move_to(pose, tx, ty, power=80.0, margin=0.8, face_xy=(bx, by))
 
-    def _attacker_action(self, tick: int, ball: tuple[float, float], pose: tuple[float, float, float],
-                         side: str) -> str:
+    def _attacker_action(
+            self,
+            tick: int,
+            ball: tuple[float, float],
+            pose: tuple[float, float, float],
+            side: str,
+            opp_goalie_pose: tuple[float, float, float] | None,
+            opp_def_pose: tuple[float, float, float] | None,
+    ) -> str:
+        """
+        Smarter attacker:
+        - Fixes the "stuck at approach point" issue by forcing close-contact capture.
+        - Uses goalie/defender positions to select a better shooting corner.
+        - Dribbles to create an angle if the lane is blocked.
+        - Predictive chase when far from ball.
+        - STRICT kicking: must face target first, then kick angle=0 (handled by _kick_to()).
+        """
         bx, by = float(ball[0]), float(ball[1])
-        (dgx, dgy), (ax, ay) = self._goals_for_side(side)  # attacker attacks "ax,ay"
+        (_, _), (atk_gx, atk_gy) = self._goals_for_side(side)  # attacker attacks (atk_gx, atk_gy)
         rx, ry = float(pose[0]), float(pose[1])
 
-        # ---- NEW: kick-off / dead-ball forcing ----
         v_next = self._estimate_v_next()
         ball_speed = math.hypot(v_next[0], v_next[1])
         dist_to_ball = math.hypot(bx - rx, by - ry)
 
-        # 如果球几乎静止且在中圈附近：直接冲球并踢一下，让比赛动起来
+        ball_xy = np.array([bx, by], dtype=float)
+
+        def_xy = None
+        if opp_def_pose is not None:
+            def_xy = np.array([float(opp_def_pose[0]), float(opp_def_pose[1])], dtype=float)
+
+        gk_x, gk_y = (None, None)
+        if opp_goalie_pose is not None:
+            gk_x = float(opp_goalie_pose[0])
+            gk_y = float(opp_goalie_pose[1])
+
+        # If within ~2m but not yet in possession range, step directly onto the ball with a small margin.
+        if (dist_to_ball < 2.2) and (not self._has_ball(rx, ry, bx, by)):
+            return self._move_to(pose, bx, by, power=100.0, margin=0.20, face_xy=(bx, by))
+
+        # ------------------------------------------------------------
+        # (1) Kickoff / dead-ball forcing
+        # ------------------------------------------------------------
         if ball_speed < 0.02 and abs(bx) < 0.8 and abs(by) < 0.8:
             if self._has_ball(rx, ry, bx, by):
-                # 小力量先开球（别一脚飞太远）
-                return self._kick_to(pose, ax, 0.0, power=60.0)
+                return self._kick_to(pose, atk_gx, 0.0, power=60.0)
             return self._move_to(pose, bx, by, power=100.0, margin=0.25, face_xy=(bx, by))
 
-        # ---- have ball -> shoot ----
+        # ------------------------------------------------------------
+        # (2) If have ball: shoot vs dribble
+        # ------------------------------------------------------------
         if self._has_ball(rx, ry, bx, by):
-            corner_y = random.choice([-4.5, 4.5])
-            return self._kick_to(pose, ax, corner_y, power=100.0)
+            # Candidate shot targets (two corners slightly inside)
+            top = +min(self.goal_half_width, 5.5)
+            bot = -min(self.goal_half_width, 5.5)
+            targets = [
+                np.array([atk_gx, top], dtype=float),
+                np.array([atk_gx, bot], dtype=float),
+            ]
 
-        # ---- NEW: far away -> chase ball directly (DON'T stop at "behind-ball" point) ----
-        if dist_to_ball > 3.0:
-            tx, ty = self._clamp_to_field(bx, by)
-            return self._move_to(pose, tx, ty, power=100.0, margin=0.6, face_xy=(bx, by))
+            best_score = -1e18
+            best_target = targets[0]
+            best_blocked = False
 
-        # ---- close -> approach from behind ball (fine when near) ----
-        to_goal_x, to_goal_y = ax - bx, ay - by
-        gdist = math.hypot(to_goal_x, to_goal_y)
-        if gdist < 1e-6:
-            tx, ty = bx, by
+            for t in targets:
+                # 1) prefer corner far from goalie
+                goalie_gap = abs(float(t[1]) - (gk_y if gk_y is not None else 0.0))
+
+                # 2) penalize if defender blocks the shot lane
+                blocked = False
+                if def_xy is not None:
+                    dseg = self._dist_point_to_segment(def_xy, ball_xy, t)
+                    blocked = dseg < 2.6
+
+                # 3) slight distance penalty
+                shot_dist = float(np.linalg.norm(t - ball_xy))
+
+                score = 0.0
+                score += 3.0 * goalie_gap
+                score -= 2.2 * (1.0 if blocked else 0.0)
+                score -= 0.03 * shot_dist
+
+                # If goalie is advanced, corner matters more
+                if opp_goalie_pose is not None:
+                    gk_ball = float(np.linalg.norm(np.array([gk_x, gk_y]) - ball_xy))
+                    score += 0.05 * max(0.0, 18.0 - gk_ball)
+
+                if score > best_score:
+                    best_score = score
+                    best_target = t
+                    best_blocked = blocked
+
+            # Shoot when reasonably close to goal line
+            in_range = abs(rx - atk_gx) < 38.0
+
+            if in_range and (not best_blocked or best_score > 5.5):
+                # If ball is too close to sideline, prefer a quick centralizing touch before shooting
+                if self._sideline_risk(bx, by) > 0.55 and abs(by) > 14.0:
+                    # one touch toward center corridor
+                    self._attacker_last_touch = tick
+                    return self._kick_to(pose, bx + (2.8 if side == "left" else -2.8), 0.0, power=22.0, kind="skick")
+                return self._kick_to(pose, float(best_target[0]), float(best_target[1]), power=100.0)
+
+            # Otherwise dribble to create a lane
+            drib_sign = 1.0
+            if def_xy is not None:
+                drib_sign = -1.0 if (def_xy[1] > by) else 1.0
+            if gk_y is not None and abs(gk_y) > 1.0:
+                drib_sign = -1.0 if gk_y > 0 else 1.0
+
+            forward = 2.8
+            side_step = 2.6 * drib_sign
+
+            to_goal = np.array([atk_gx - bx, atk_gy - by], dtype=float)
+            n = float(np.linalg.norm(to_goal))
+            if n < 1e-6:
+                ux, uy = (1.0, 0.0) if side == "left" else (-1.0, 0.0)
+            else:
+                ux, uy = float(to_goal[0] / n), float(to_goal[1] / n)
+
+            # side vector perpendicular to attack direction
+            sx, sy = -uy, ux
+
+            drib_tx = bx + ux * forward + sx * side_step
+            drib_ty = by + uy * forward + sy * side_step
+            drib_tx, drib_ty = self._clamp_to_field(drib_tx, drib_ty)
+
+            # ---------------- DRIBBLE (create angle, but avoid pushing to boundary) ----------------
+            # Touch cooldown: do NOT small-kick every tick, otherwise the ball slowly walks to corners.
+            if tick - self._attacker_last_touch < self.attacker_touch_cd:
+                # After a touch, just chase the ball (close-contact capture will handle the rest)
+                return self._move_to(pose, bx, by, power=100.0, margin=0.25, face_xy=(bx, by))
+
+            # Decide dribble direction:
+            # - If near sideline, bias strongly toward center (y -> 0)
+            risk = self._sideline_risk(bx, by)
+
+            # Base sign away from defender and away from goalie bias
+            drib_sign = 1.0
+            if def_xy is not None:
+                drib_sign = -1.0 if (def_xy[1] > by) else 1.0
+            if gk_y is not None and abs(gk_y) > 1.0:
+                drib_sign = -1.0 if gk_y > 0 else 1.0
+
+            # When near boundary, override sign to move toward centerline
+            if risk > 0.35:
+                drib_sign = -1.0 if by > 0 else 1.0  # bring y back toward 0
+
+            # Dribble target: more forward, and side-step depends on risk
+            forward = 3.6  # push forward more so we don't "walk" sideways
+            side_step = (1.0 - risk) * 2.2 * drib_sign + risk * (abs(by) * (-1.0 if by > 0 else 1.0)) * 0.25
+
+            to_goal = np.array([atk_gx - bx, atk_gy - by], dtype=float)
+            n = float(np.linalg.norm(to_goal))
+            if n < 1e-6:
+                ux, uy = (1.0, 0.0) if side == "left" else (-1.0, 0.0)
+            else:
+                ux, uy = float(to_goal[0] / n), float(to_goal[1] / n)
+
+            # side vector perpendicular to attack direction
+            sx, sy = -uy, ux
+
+            drib_tx = bx + ux * forward + sx * side_step
+            # Pull dribble target toward center if risky (prevents corner-hugging)
+            drib_ty = (by + uy * forward + sy * side_step) * (1.0 - 0.55 * risk)
+
+            # Clamp with bigger margin so we don't aim at boundary
+            drib_tx = clamp(drib_tx, FIELD_X[0] + 2.5, FIELD_X[1] - 2.5)
+            drib_ty = clamp(drib_ty, FIELD_Y[0] + 2.5, FIELD_Y[1] - 2.5)
+
+            # Use a firmer touch so we create separation (less "slow creep")
+            self._attacker_last_touch = tick
+            return self._kick_to(pose, drib_tx, drib_ty, power=22.0, kind="skick")
+
+        # ------------------------------------------------------------
+        # (3) If no ball: predictive chase + behind-ball approach
+        # ------------------------------------------------------------
+        # Far away -> chase predicted ball position
+        if dist_to_ball > 3.2:
+            H = 4.0
+            pred_x = bx + v_next[0] * H
+            pred_y = by + v_next[1] * H
+            pred_x, pred_y = self._clamp_to_field(pred_x, pred_y)
+            return self._move_to(pose, pred_x, pred_y, power=100.0, margin=0.7, face_xy=(bx, by))
+
+        # Close -> approach behind ball, but do NOT stop too early
+        to_goal = np.array([atk_gx - bx, atk_gy - by], dtype=float)
+        n = float(np.linalg.norm(to_goal))
+        if n < 1e-6:
+            ax2, ay2 = bx, by
         else:
-            ux, uy = to_goal_x / gdist, to_goal_y / gdist
-            back = self.possession_dist + 0.4
-            tx, ty = bx - ux * back, by - uy * back
+            back = self.possession_dist + 0.35
+            ax2 = bx - float(to_goal[0] / n) * back
+            ay2 = by - float(to_goal[1] / n) * back
 
-        tx, ty = self._clamp_to_field(tx, ty)
-        return self._move_to(pose, tx, ty, power=95.0, margin=0.5, face_xy=(bx, by))
+        # If defender is close, offset approach away from defender to avoid getting pinned
+        if def_xy is not None and float(np.linalg.norm(def_xy - ball_xy)) < 6.0:
+            away = ball_xy - def_xy
+            an = float(np.linalg.norm(away))
+            if an > 1e-6:
+                away = away / an
+                ax2 += float(away[0]) * 2.0
+                ay2 += float(away[1]) * 2.0
+
+        ax2, ay2 = self._clamp_to_field(ax2, ay2)
+
+        # Use a SMALL margin so we don't "freeze" near the approach point
+        return self._move_to(pose, ax2, ay2, power=95.0, margin=0.25, face_xy=(bx, by))
 
     # ---------- main entry ----------
     def decide_action(self, game_state: GameState, teamname: str):
-        opp_attacker_pose = None
-        for tname, plist in game_state.robot_poses.items():
-            if tname != teamname and len(plist) > 0:
-                d = plist[0]
-                u = int(next(iter(d.keys())))
-                opp_attacker_pose = d[u]
-                break
+        """
+        Decide actions for all robots in 'teamname' for the current tick.
 
-        actions = []
+        This implementation supports the 2v1 setup:
+        - Our team (self.our_team_name): goalie + defender
+        - Opponent team: a single attacker (but we still handle extra robots safely)
+
+        Also: for the opponent attacker, we pass our goalie/defender positions so it
+        can make smarter decisions (shooting angle selection, dribble lanes, etc).
+        """
+        actions: list[str] = []
+
         tick = int(game_state.count)
         bx, by = float(game_state.ball_pos[0]), float(game_state.ball_pos[1])
 
+        # Update ball history and estimate next velocity
         self._update_ball_hist(tick, (bx, by))
         v_next = self._estimate_v_next()
 
@@ -395,15 +592,34 @@ class SoccerAI:
         side = self.side[teamname]
         goalie_id = int(self.goalie_ids[teamname])
 
-        # build pose map for teammate reference
-        pose_map = {}
+        # Build pose map for this team (unum -> pose)
+        pose_map: dict[int, tuple[float, float, float]] = {}
         for r in robots:
             unum = int(next(iter(r.keys())))
             pose_map[unum] = r[unum]
 
+        # ------------------------------------------------------------
+        # Gather our team (TritonBots) goalie and defender poses
+        # so the opponent attacker can "see" them.
+        # ------------------------------------------------------------
+        our_goalie_pose = None
+        our_def_pose = None
+        if self.our_team_name in game_state.robot_poses:
+            our_goalie_id = int(self.goalie_ids[self.our_team_name])
+            for rob in game_state.robot_poses[self.our_team_name]:
+                u = int(next(iter(rob.keys())))
+                if u == our_goalie_id:
+                    our_goalie_pose = rob[u]
+                else:
+                    our_def_pose = rob[u]
+
+        # ------------------------------------------------------------
+        # OUR TEAM: goalie + defender logic
+        # ------------------------------------------------------------
         if teamname == self.our_team_name:
-            # goalie + defender
             goalie_pose = pose_map.get(goalie_id, None)
+
+            # Defender is "the other robot" (smallest unum != goalie_id)
             defender_id = None
             for u in sorted(pose_map.keys()):
                 if u != goalie_id:
@@ -413,20 +629,50 @@ class SoccerAI:
             for r in robots:
                 unum = int(next(iter(r.keys())))
                 pose = r[unum]
+
                 if unum == goalie_id:
                     actions.append(self._goalie_action(tick, (bx, by), v_next, pose, side))
                 else:
-                    actions.append(self._defender_action(tick, (bx, by), v_next, pose, side, goalie_pose, opp_attacker_pose))
+                    # Pass opponent attacker pose for pressing / threat detection
+                    opp_attacker_pose = None
+                    # For 2v1, opponent team has 1 robot, find it quickly:
+                    for tname, plist in game_state.robot_poses.items():
+                        if tname != teamname and len(plist) > 0:
+                            d = plist[0]
+                            u2 = int(next(iter(d.keys())))
+                            opp_attacker_pose = d[u2]
+                            break
+
+                    actions.append(
+                        self._defender_action(
+                            tick, (bx, by), v_next,
+                            pose, side,
+                            goalie_pose,
+                            opp_attacker_pose
+                        )
+                    )
 
             return actions
 
-        # opponent team: only one attacker (smallest unum); others (if any) stand still
+        # ------------------------------------------------------------
+        # OPPONENT TEAM: single attacker (smart)
+        # ------------------------------------------------------------
         attacker_unum = min(pose_map.keys()) if pose_map else None
+
         for r in robots:
             unum = int(next(iter(r.keys())))
             pose = r[unum]
+
             if attacker_unum is not None and unum == attacker_unum:
-                actions.append(self._attacker_action(tick, (bx, by), pose, side))
+                actions.append(
+                    self._attacker_action(
+                        tick, (bx, by), pose, side,
+                        our_goalie_pose, our_def_pose
+                    )
+                )
             else:
+                # Any extra robots do nothing
                 actions.append("dash 0 0")
+
         return actions
+
