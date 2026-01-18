@@ -23,11 +23,6 @@ def norm_angle(a: float) -> float:
 
 @dataclass
 class AttackerConfig:
-    # ---------- Ball interaction / possession ----------
-    # How close the robot must be to be considered "in possession".
-    # Increase if your sim needs closer contact; decrease if it feels too strict.
-    possession_radius: float = (PLAYER_SIZE + BALL_SIZE + 0.35)
-
     # When close to ball but not yet in possession, force a final step to touch the ball.
     force_contact_dist: float = 2.2
     force_contact_margin: float = 0.20
@@ -85,7 +80,7 @@ class AttackerConfig:
     turn_gain: float = 1.0
 
 
-class SmartAttacker:
+class SmartAttacker(Player):
     """
     - tick: current simulation tick
     - ball: (x, y)
@@ -98,8 +93,8 @@ class SmartAttacker:
     - command string (e.g., 'dash ...', 'turn ...', 'kick ... 0', 'skick ... 0')
     """
 
-    def __init__(self, player: Player, cfg: AttackerConfig | None = None):
-        self.player = player
+    def __init__(self, teamname, unum, cfg: AttackerConfig | None = None):
+        super().__init__(teamname=teamname, unum=unum)
         self.cfg = cfg or AttackerConfig()
 
         # memory
@@ -157,7 +152,7 @@ class SmartAttacker:
         dist_to_ball = math.hypot(bx - rx, by - ry)
 
         # 0) If we are close but not yet possessing, force a final step to touch the ball.
-        if dist_to_ball < self.cfg.force_contact_dist and not self.has_ball(self_pose, (bx, by)):
+        if dist_to_ball < self.cfg.force_contact_dist and not self.hasBall(self_pose, (bx, by)):
             return self._goto_point(bx, by, self_pose, game_state, margin=self.cfg.force_contact_margin, speed=100.0, face=(bx, by))
 
         # 1) Kickoff / dead-ball forcing at center
@@ -166,12 +161,12 @@ class SmartAttacker:
             and abs(bx) < self.cfg.kickoff_center_box
             and abs(by) < self.cfg.kickoff_center_box
         ):
-            if self.has_ball(self_pose, (bx, by)):
+            if self.hasBall(self_pose, (bx, by)):
                 return self.face_then_kick(self_pose, target=(gx, 0.0), power=self.cfg.kickoff_touch_power, kind="kick")
             return self._goto_point(bx, by, self_pose, game_state, margin=0.25, speed=100.0, face=(bx, by))
 
         # 2) If we have ball: shoot or dribble
-        if self.has_ball(self_pose, (bx, by)):
+        if self.hasBall(self_pose, (bx, by)):
             return self._with_ball(tick, (bx, by), self_pose, attack_goal, goalie_pose, defender_pose)
 
         # 3) If we do not have ball: chase
@@ -212,12 +207,6 @@ class SmartAttacker:
     # -------------------------------
     # Perception helpers
     # -------------------------------
-    def has_ball(self, self_pose: Tuple[float, float, float], ball_xy: Tuple[float, float]) -> bool:
-        """More forgiving possession check than Player.hasBall (configurable)."""
-        rx, ry = float(self_pose[0]), float(self_pose[1])
-        bx, by = float(ball_xy[0]), float(ball_xy[1])
-        return math.hypot(bx - rx, by - ry) <= self.cfg.possession_radius
-
     def sideline_risk(self, x: float, y: float) -> float:
         """Risk in [0,1] where 1 means close to top/bottom boundary."""
         top_gap = (FIELD_Y[1] - y)
@@ -250,7 +239,6 @@ class SmartAttacker:
         speed: float,
         face: Optional[Tuple[float, float]] = None,
     ) -> str:
-        """Use Player.goto() if possible; otherwise fall back to a simple dash/turn."""
 
         # If you have a real game_state and basic_commands.goto needs it,
         # passing it helps avoid obstacles.
@@ -259,7 +247,7 @@ class SmartAttacker:
             if face is not None:
                 fx, fy = face
                 theta = math.atan2(fy - self_pose[1], fx - self_pose[0])
-            return self.player.goto(tx, ty, self_pose, game_state, margin=margin, theta=theta, speed=speed)
+            return super().goto(tx, ty, self_pose, game_state, margin=margin, theta=theta, speed=speed)
 
         # Fallback (works even without game_state): turn-then-dash
         sx, sy, heading = float(self_pose[0]), float(self_pose[1]), float(self_pose[2])  # heading is radians now
@@ -406,7 +394,7 @@ class SmartAttacker:
         # (C) Otherwise dribble: one touch with cooldown, bias toward center near sideline
         if tick - self._last_touch_tick < self.cfg.touch_cooldown:
             # After a touch, just chase/control the ball
-            return self._goto_point(bx, by, self_pose, game_state=None, margin=0.25, speed=100.0, face=(bx, by))
+            return self._goto_point(bx, by, self_pose, game_state=None, margin=0.1, speed=100.0, face=(bx, by))
 
         risk = self.sideline_risk(bx, by)
 
@@ -483,7 +471,7 @@ class SmartAttacker:
         if n < 1e-6:
             ax, ay = bx, by
         else:
-            back = self.cfg.possession_radius + 0.35
+            back = KICKABLE_MARGIN + 0.35
             ax = bx - float(to_goal[0] / n) * back
             ay = by - float(to_goal[1] / n) * back
 
@@ -502,7 +490,7 @@ class SmartAttacker:
         ay = clamp(ay, FIELD_Y[0] + 0.8, FIELD_Y[1] - 0.8)
 
         # Small margin prevents "freezing" near approach point
-        return self._goto_point(ax, ay, self_pose, game_state, margin=0.25, speed=95.0, face=(bx, by))
+        return self._goto_point(ax, ay, self_pose, game_state, margin=0.1, speed=95.0, face=(bx, by))
 
     def _set_plan(self, tick: int, tx: float, ty: float, kind: str, power: float, ttl: int = 5) -> None:
         """Lock a plan for a few ticks to avoid changing targets every frame."""
