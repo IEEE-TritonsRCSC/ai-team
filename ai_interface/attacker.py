@@ -8,6 +8,7 @@ import numpy as np
 
 from ai_interface.constants.field_constants import FIELD_X, FIELD_Y, BALL_DECAY
 from ai_interface.constants.player_constants import PLAYER_SIZE, BALL_SIZE, KICKABLE_MARGIN
+from ai_interface.utils.algo_utils import normalize_angle
 from ai_interface.player import Player
 
 
@@ -37,8 +38,8 @@ class AttackerConfig:
     kickoff_touch_power: float = 60.0
 
     # ---------- Shooting ----------
-    goal_half_width: float = 6.0
-    corner_inset: float = 5.5
+    goal_half_width: float = 5.0
+    corner_inset: float = 4.5
     shoot_range_x: float = 38.0
 
     # Lane blocking: defender closer than this to the shot segment => lane is blocked.
@@ -55,10 +56,10 @@ class AttackerConfig:
 
     # ---------- Dribbling (one-touch) ----------
     # Prevent "slowly pushing to boundary" by not touching every tick.
-    touch_cooldown: int = 6
+    touch_cooldown: int = 5
 
     # Stronger forward bias reduces drifting to the sideline.
-    dribble_forward: float = 3.6
+    dribble_forward: float = 4.2
 
     # Side step base magnitude (will be reduced near sideline)
     dribble_side_base: float = 2.2
@@ -80,7 +81,7 @@ class AttackerConfig:
     predict_horizon: float = 4.0
 
     # ---------- Turning / alignment for the "no kick angle" rule ----------
-    kick_align_tol: float = math.radians(8.0)
+    kick_align_tol: float = math.radians(1.0)
     turn_gain: float = 1.0
 
 
@@ -108,6 +109,11 @@ class SmartAttacker:
 
         self._last_touch_tick: int = -10
 
+        self._plan_target = None
+        self._plan_kind = None
+        self._plan_power = None
+        self._plan_expire_tick = -1
+
     # -------------------------------
     # Core public API
     # -------------------------------
@@ -122,6 +128,23 @@ class SmartAttacker:
         game_state=None,
     ) -> str:
         """Return the attacker command for this tick."""
+
+        if self._plan_target is not None and tick <= self._plan_expire_tick:
+            tx, ty = self._plan_target
+            cmd = self._kick_to(self_pose, tx, ty, power=self._plan_power, kind=self._plan_kind)
+            # If we actually kicked (not just turned), clear the plan
+            if cmd.startswith("kick") or cmd.startswith("skick"):
+                self._plan_target = None
+                self._plan_kind = None
+                self._plan_power = None
+                self._plan_expire_tick = -1
+            return cmd
+        else:
+            # plan expired
+            self._plan_target = None
+            self._plan_kind = None
+            self._plan_power = None
+            self._plan_expire_tick = -1
 
         bx, by = float(ball[0]), float(ball[1])
         rx, ry = float(self_pose[0]), float(self_pose[1])
@@ -239,8 +262,7 @@ class SmartAttacker:
             return self.player.goto(tx, ty, self_pose, game_state, margin=margin, theta=theta, speed=speed)
 
         # Fallback (works even without game_state): turn-then-dash
-        sx, sy, deg = float(self_pose[0]), float(self_pose[1]), float(self_pose[2])
-        heading = math.radians(deg)
+        sx, sy, heading = float(self_pose[0]), float(self_pose[1]), float(self_pose[2])  # heading is radians now
         dx, dy = tx - sx, ty - sy
         dist = math.hypot(dx, dy)
         if dist < margin:
@@ -269,8 +291,7 @@ class SmartAttacker:
         kind: str = "kick",
     ) -> str:
         """Turn until facing target; then kick straight forward (angle=0)."""
-        sx, sy, deg = float(self_pose[0]), float(self_pose[1]), float(self_pose[2])
-        heading = math.radians(deg)
+        sx, sy, heading = float(self_pose[0]), float(self_pose[1]), float(self_pose[2])  # heading is radians
         tx, ty = float(target[0]), float(target[1])
 
         desired = math.atan2(ty - sy, tx - sx)
@@ -283,20 +304,43 @@ class SmartAttacker:
             return f"skick {power:.1f} 0"
         return f"kick {power:.1f} 0"
 
+    def _kick_to(self, pose: tuple[float, float, float], tx: float, ty: float,
+                 power: float = 100.0, kind: str = "kick") -> str:
+
+        KICK_ALIGN_TOL = math.radians(1.0)
+        TURN_GAIN = 2.0
+
+        x, y, heading = float(pose[0]), float(pose[1]), float(pose[2])  # heading is radians
+        desired = math.atan2(ty - y, tx - x)
+        diff = norm_angle(desired - heading)
+
+
+        if abs(diff) > KICK_ALIGN_TOL:
+            return f"turn {(diff * TURN_GAIN):.4f}"
+
+        # Only allow straight kick (angle=0)
+        if kind == "skick":
+            return f"skick {power:.1f} 0"
+        return f"kick {power:.1f} 0"
+
     # -------------------------------
     # Decision logic: with ball
     # -------------------------------
     def _with_ball(
-        self,
-        tick: int,
-        ball_xy: Tuple[float, float],
-        self_pose: Tuple[float, float, float],
-        attack_goal: Tuple[float, float],
-        goalie_pose: Optional[Tuple[float, float, float]],
-        defender_pose: Optional[Tuple[float, float, float]],
+            self,
+            tick: int,
+            ball_xy: Tuple[float, float],
+            self_pose: Tuple[float, float, float],
+            attack_goal: Tuple[float, float],
+            goalie_pose: Optional[Tuple[float, float, float]],
+            defender_pose: Optional[Tuple[float, float, float]],
     ) -> str:
         bx, by = float(ball_xy[0]), float(ball_xy[1])
         gx, gy = float(attack_goal[0]), float(attack_goal[1])
+
+        plan_cmd = self._run_plan(tick, self_pose)
+        if plan_cmd is not None:
+            return plan_cmd
 
         # (A) Decide the best shot corner
         corner = min(self.cfg.goal_half_width, self.cfg.corner_inset)
@@ -347,8 +391,17 @@ class SmartAttacker:
         rx = float(self_pose[0])
         in_range = abs(rx - gx) < self.cfg.shoot_range_x
 
-        if in_range and (not best_blocked or best_score > self.cfg.shot_score_threshold):
-            return self.face_then_kick(self_pose, (float(best_target[0]), float(best_target[1])), power=100.0, kind="kick")
+        # Extra: if we are very close to goal line, shoot even if slightly blocked (be decisive)
+        very_close = abs(rx - gx) < (self.cfg.shoot_range_x * 0.55)
+
+        if (in_range and (not best_blocked or best_score > self.cfg.shot_score_threshold)) or very_close:
+            tgt = (float(best_target[0]), float(best_target[1]))
+
+            # Lock the shot for a few ticks so we will turn-then-kick reliably
+            self._set_plan(tick, float(tgt[0]), float(tgt[1]), kind="kick", power=100.0, ttl=6)
+
+            # Execute immediately (will be turn or kick)
+            return self.face_then_kick(self_pose, tgt, power=100.0, kind="kick")
 
         # (C) Otherwise dribble: one touch with cooldown, bias toward center near sideline
         if tick - self._last_touch_tick < self.cfg.touch_cooldown:
@@ -391,8 +444,12 @@ class SmartAttacker:
         drib_tx = clamp(drib_tx, FIELD_X[0] + buf, FIELD_X[1] - buf)
         drib_ty = clamp(drib_ty, FIELD_Y[0] + buf, FIELD_Y[1] - buf)
 
+        # Mark touch time (cooldown) AND lock plan so we complete turn->skick reliably
         self._last_touch_tick = tick
-        return self.face_then_kick(self_pose, (drib_tx, drib_ty), power=self.cfg.dribble_touch_power, kind="skick")
+        tgt = (float(drib_tx), float(drib_ty))
+        self._set_plan(tick, float(tgt[0]), float(tgt[1]), kind="skick", power=self.cfg.dribble_touch_power, ttl=4)
+
+        return self.face_then_kick(self_pose, tgt, power=self.cfg.dribble_touch_power, kind="skick")
 
     # -------------------------------
     # Decision logic: without ball
@@ -446,3 +503,30 @@ class SmartAttacker:
 
         # Small margin prevents "freezing" near approach point
         return self._goto_point(ax, ay, self_pose, game_state, margin=0.25, speed=95.0, face=(bx, by))
+
+    def _set_plan(self, tick: int, tx: float, ty: float, kind: str, power: float, ttl: int = 5) -> None:
+        """Lock a plan for a few ticks to avoid changing targets every frame."""
+        self._plan_target = (float(tx), float(ty))
+        self._plan_kind = kind
+        self._plan_power = float(power)
+        self._plan_expire_tick = int(tick) + int(ttl)
+
+    def _run_plan(self, tick: int, self_pose: Tuple[float, float, float]) -> Optional[str]:
+        if self._plan_target is None or tick > self._plan_expire_tick:
+            self._plan_target = None
+            self._plan_kind = None
+            self._plan_power = 0.0
+            self._plan_expire_tick = -1
+            return None
+
+        cmd = self.face_then_kick(self_pose, self._plan_target, power=self._plan_power, kind=self._plan_kind or "kick")
+
+        # If we actually kicked, clear plan. If we are still turning, keep it.
+        if isinstance(cmd, str) and (cmd.startswith("kick") or cmd.startswith("skick")):
+            self._plan_target = None
+            self._plan_kind = None
+            self._plan_power = 0.0
+            self._plan_expire_tick = -1
+        return cmd
+
+

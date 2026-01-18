@@ -180,7 +180,7 @@ class InterceptDemoAI(SoccerAI):
                 u = int(next(iter(r.keys())))
                 if u == recv_unum:
                     p = r[u]
-                    goalie_pose = (float(p[0]), float(p[1]), float(p[2]))  # (x, y, heading_deg)
+                    goalie_pose = (float(p[0]), float(p[1]), math.radians(float(p[2])))   # (x, y, heading_deg)
                     break
         # Ensure attacker module is initialized once
         if self._attacker_player is None or self._smart_attacker is None:
@@ -192,7 +192,7 @@ class InterceptDemoAI(SoccerAI):
             self._smart_attacker = SmartAttacker(self._attacker_player, self._attacker_cfg)
 
         # Convert pose format for SmartAttacker: (x, y, heading_deg)
-        self_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
+        self_pose = (float(self_p0[0]), float(self_p0[1]), float(heading))
         ball_xy = (float(ball_pos[0]), float(ball_pos[1]))
 
         # Attacker is TritonBots -> attacks right goal (GOAL_R)
