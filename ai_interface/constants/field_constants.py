@@ -4,6 +4,7 @@ GOAL_R = [45, 0]
 GOAL_L = [-45, 0]
 PLAYER_DECAY = 0.4
 BALL_DECAY = 0.94
+dt = 0.1
 
 GOAL_R_Y_TOP = [45, -5]
 GOAL_R_Y_BOTTOM = [45, 5]

@@ -6,8 +6,8 @@ sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 from typing import Iterable, List, Tuple
 import math
 import numpy as np
-from constants.player_constants import KICKABLE_MARGIN, PLAYER_SIZE, BALL_SIZE
-from constants.field_constants import GOAL_L, GOAL_R
+from constants.player_constants import *
+from constants.field_constants import *
 from .algo_utils import normalize_angle
 
 
@@ -42,9 +42,9 @@ def _select_detour(origin: np.ndarray, destination: np.ndarray,
     best_cost = None
     for obs_pos, radius in obstacles:
         distance, t = _segment_distance(obs_pos, origin, destination)
-        if distance >= radius or t <= 0.0 or t >= 1.0:
-            continue
         clearance = radius + detour_margin
+        if distance >= clearance or t <= 0.0 or t >= 1.0:
+            continue
         candidates = [
             obs_pos + perp_unit * clearance,
             obs_pos - perp_unit * clearance,
@@ -82,7 +82,7 @@ def build_avoid_points(game_state, self_pose,
 
 def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
          margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
-         avoid_radius: float = 1.0, detour_margin: float = 2.0) -> str:
+         detour_margin: float = 1.5) -> str:
     """
     Create a `dash` or `turn` command to move toward a destination.
 
@@ -94,7 +94,7 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
     """
     origin = np.array(self_pose[:2], dtype=float)
     destination = np.array([x, y], dtype=float)
-    avoid_points = build_avoid_points(game_state, self_pose, ball_radius=KICKABLE_MARGIN, player_radius=avoid_radius)
+    avoid_points = build_avoid_points(game_state, self_pose, ball_radius=0.215, player_radius=0.9)
 
     if avoid_points:
         obstacles = []
@@ -103,16 +103,12 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
                 length = len(item)
             except TypeError:
                 continue
-            if length >= 3:
-                ox, oy, radius = item[0], item[1], item[2]
-            elif length == 2:
-                ox, oy = item[0], item[1]
-                radius = avoid_radius
-            else:
-                continue
+            assert length == 3, "Each avoid point must be a tuple of (x, y, radius)"
+            ox, oy, radius = item[0], item[1], item[2]
             obstacles.append((np.array([ox, oy], dtype=float), float(radius)))
         waypoint = _select_detour(origin, destination, obstacles, detour_margin)
         if waypoint is not None:
+            print('Going to', destination, 'Detouring via', waypoint)
             destination = waypoint
 
     distance = np.linalg.norm(destination - origin)
@@ -123,6 +119,7 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
             return f"turn {angle_diff}" if abs(angle_diff) > math.radians(5.0) else "done"
         else:
             return "done"
+    speed = min(speed, max(distance * (1 / PLAYER_DECAY - 1) / dt, 20))
     return f"dash {speed} {angle}"
 
 

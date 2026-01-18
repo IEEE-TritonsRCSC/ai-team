@@ -23,7 +23,6 @@ class Player:
     angle_tolerance = math.radians(5.0)
     goto_margin = 0.1
     goto_speed = 100
-    avoid_radius = 1.0
     detour_margin = 1.0
 
     def __init__(self,
@@ -42,7 +41,6 @@ class Player:
              margin: float | None = None,
              theta: float | None = None,
              speed: float | None = None,
-             avoid_radius: float | None = None,
              detour_margin: float | None = None) -> str:
         cmd = basic_commands.goto(
             self_pose,
@@ -52,7 +50,6 @@ class Player:
             margin=self.goto_margin if margin is None else margin,
             theta=theta,
             speed=self.goto_speed if speed is None else speed,
-            avoid_radius=self.avoid_radius if avoid_radius is None else avoid_radius,
             detour_margin=self.detour_margin if detour_margin is None else detour_margin,
         )
         return cmd
