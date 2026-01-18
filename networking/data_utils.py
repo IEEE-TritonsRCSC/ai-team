@@ -37,6 +37,7 @@ class Deserializer:
             team_infos: List of team information including names and player counts
         """
         self.team_names = [team_info.name for team_info in team_infos]
+        self.ball_last_pos = (0, 0)
 
     def sim_deserialize(self, data: bytes) -> GameState:
         """
@@ -134,12 +135,13 @@ class Deserializer:
     def cam_get_ball_pos(self, ball_data) -> tuple:
         """
         Extract ball position from camera detection data.
+        If ball is not detected, predict position based on history
         
         Args:
             ball_data: List of detected ball objects with confidence and position
             
         Returns:
-            Tuple of (x, y) position of highest confidence ball, or None if no balls
+            Tuple of (x, y) position of highest confidence ball, or predicted position if not detected
         """
         highest_confident_ball = None
         highest_confidence = 0.0
@@ -150,7 +152,14 @@ class Deserializer:
                 highest_confident_ball = ball
 
         if highest_confident_ball is not None:
-            return (highest_confident_ball.x, highest_confident_ball.y)
+            ball_pos = (highest_confident_ball.x, highest_confident_ball.y)
+            self.ball_last_pos = ball_pos
+            return ball_pos
+        
+        # Ball not detected, return last known position
+        if self.ball_last_pos is not None:
+            return self.ball_last_pos
+        
         return None
 
     def cam_get_robot_poses(self, robot_data) -> dict[str, list]:
