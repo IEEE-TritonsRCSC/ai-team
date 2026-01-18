@@ -1,4 +1,3 @@
-import csv
 import math
 import numpy as np
 from scipy.optimize import least_squares
@@ -38,89 +37,6 @@ def _simulate_discrete(p0, v0, u, decay, vmax, n_steps):
     return pos_hist, vel_hist
 
 
-def estimate_decay_vmax_joint(
-    positions,
-    velocities,
-    u,
-    decay_bounds=(0.0, 1.0),
-    vmax_bounds=(1e-6, None),
-    pos_weight=1.0,
-    vel_weight=1.0,
-    loss="soft_l1",
-    f_scale=1.0,
-):
-    """
-    Jointly estimate decay and vmax for the discrete dynamics:
-      v_{k+1} = decay * (v_k + u)
-      p_{k+1} = p_k + v_{k+1}
-    with velocity magnitude capped at vmax.
-
-    Args:
-        positions: array of shape (N, d)
-        velocities: array of shape (N, d)
-        u: constant control input, shape (d,)
-        decay_bounds: (lo, hi) bounds for decay
-        vmax_bounds: (lo, hi) bounds for vmax; hi can be None for +inf
-        pos_weight: weight applied to position residuals
-        vel_weight: weight applied to velocity residuals
-        loss: scipy least_squares loss name
-        f_scale: scipy least_squares f_scale
-
-    Returns:
-        dict with decay, vmax, and the raw scipy result.
-    """
-    positions = np.asarray(positions, dtype=float)
-    velocities = np.asarray(velocities, dtype=float)
-    u = np.asarray(u, dtype=float)
-
-    if positions.shape != velocities.shape:
-        raise ValueError("positions and velocities must have the same shape")
-    if positions.ndim != 2:
-        raise ValueError("positions and velocities must be 2D arrays")
-    if positions.shape[0] < 2:
-        raise ValueError("Need at least 2 samples")
-    if u.shape != (positions.shape[1],):
-        raise ValueError("u must have shape (d,), matching positions/velocities")
-
-    n_steps = positions.shape[0]
-
-    # Initial decay from a no-cap least squares estimate.
-    base = velocities[:-1] + u
-    denom = np.sum(base * base)
-    if denom > EPS:
-        init_decay = float(np.sum(velocities[1:] * base) / denom)
-    else:
-        init_decay = 0.9
-    decay_lo, decay_hi = decay_bounds
-    init_decay = np.clip(init_decay, decay_lo + EPS, decay_hi - EPS)
-
-    speed = np.linalg.norm(velocities, axis=1)
-    speed_max = float(speed.max()) if speed.size else 0.0
-    init_vmax = max(speed_max, vmax_bounds[0])
-    vmax_lo, vmax_hi = vmax_bounds
-    if vmax_hi is None:
-        vmax_hi = np.inf
-    init_vmax = np.clip(init_vmax, vmax_lo + EPS, vmax_hi)
-
-    def residual(params):
-        decay, vmax = params
-        pos_hat, vel_hat = _simulate_discrete(
-            positions[0], velocities[0], u, decay, vmax, n_steps
-        )
-        pos_res = (pos_hat - positions).reshape(-1) * pos_weight
-        vel_res = (vel_hat - velocities).reshape(-1) * vel_weight
-        return np.concatenate([pos_res, vel_res])
-
-    res = least_squares(
-        residual,
-        x0=np.array([init_decay, init_vmax], dtype=float),
-        bounds=(np.array([decay_lo, vmax_lo]), np.array([decay_hi, vmax_hi])),
-        loss=loss,
-        f_scale=f_scale,
-    )
-
-    decay_est, vmax_est = res.x
-    return {"decay": float(decay_est), "vmax": float(vmax_est), "result": res}
 
 
 def _init_fit_stats():
@@ -152,7 +68,7 @@ def _accumulate_variable_u_stats(stats, positions, powers, headings,
     targets = []
     for i in range(steps - 1):
         u_vec = dash_rate * power_steps[i] * heading_steps[i]
-        v_pred = decay * (vel[i] + u_vec)
+        v_pred = decay * vel[i] + u_vec
         speed = np.linalg.norm(v_pred)
         if speed > vmax + EPS:
             v_pred = v_pred * (vmax / (speed + EPS))
@@ -229,7 +145,6 @@ class ParamEstimatorAI(SoccerAI):
         self.player_traj_active = False
         self.player_still_steps = 0
         self.player_moved_since_start = False
-        self.player_decay_csv_path = "player_decay_data.csv"
 
     def _update_ball_stop_state(self, ball_pos: tuple[float, float]) -> None:
         if self.last_ball_pos is None:
@@ -346,7 +261,6 @@ class ParamEstimatorAI(SoccerAI):
             target_pos[1],
             theta=desired_theta,
             margin=0.05,
-            avoid_radius=0.3,
             detour_margin=0.9,
             game_state=game_state,
         )
@@ -488,36 +402,46 @@ class ParamEstimatorAI(SoccerAI):
             print("No trajectories available for estimation.")
             return None
         print(f"Estimating ball_decay from {len(trajectories)} trajectories.")
-        decay_sum = 0.0
-        vmax_sum = 0.0
-        weight_sum = 0
+        v_prev_list = []
+        v_next_list = []
+        step_count = 0
         for traj in trajectories:
             positions = np.asarray(traj, dtype=float)
             if positions.shape[0] < 3:
                 continue
-            pos_aligned = positions[1:]
-            vel_aligned = positions[1:] - positions[:-1]
-            if pos_aligned.shape[0] < 2:
+            velocities = positions[1:] - positions[:-1]
+            v_prev = velocities[:-1]
+            v_next = velocities[1:]
+            if v_prev.size == 0:
                 continue
-            res = estimate_decay_vmax_joint(
-                pos_aligned,
-                vel_aligned,
-                u=np.zeros(2),
-                decay_bounds=(0.0, 1.0),
-                vmax_bounds=(1e-6, None),
-            )
-            weight = pos_aligned.shape[0]
-            decay_sum += res["decay"] * weight
-            vmax_sum += res["vmax"] * weight
-            weight_sum += weight
+            v_prev_list.append(v_prev)
+            v_next_list.append(v_next)
+            step_count += v_prev.shape[0]
 
-        if weight_sum <= 0:
+        if not v_prev_list:
             print("Insufficient motion to estimate ball_decay.")
             return None
 
-        decay = decay_sum / weight_sum
-        vmax = vmax_sum / weight_sum
-        print(f"Estimated ball_decay: {decay:.6f}, vmax: {vmax:.6f} from {weight_sum} steps.")
+        v_prev = np.concatenate(v_prev_list, axis=0)
+        v_next = np.concatenate(v_next_list, axis=0)
+        denom = float(np.sum(v_prev * v_prev))
+        if denom > EPS:
+            init_decay = float(np.sum(v_next * v_prev) / denom)
+        else:
+            init_decay = 0.9
+        init_decay = float(np.clip(init_decay, EPS, 1.0 - EPS))
+
+        def residual(params):
+            decay = params[0]
+            return (v_next - decay * v_prev).reshape(-1)
+
+        res = least_squares(
+            residual,
+            x0=np.array([init_decay], dtype=float),
+            bounds=(np.array([0.0]), np.array([1.0])),
+        )
+        decay = float(res.x[0])
+        print(f"Estimated ball_decay: {decay:.3f} from {step_count} steps.")
         fit_stats = _init_fit_stats()
         for traj in trajectories:
             positions = np.asarray(traj, dtype=float)
@@ -533,7 +457,7 @@ class ParamEstimatorAI(SoccerAI):
                 vel_aligned,
                 u=np.zeros(2),
                 decay=decay,
-                vmax=vmax,
+                vmax=np.inf,
             )
         metrics = _finalize_fit_stats(fit_stats)
         if metrics is None:
@@ -541,8 +465,8 @@ class ParamEstimatorAI(SoccerAI):
         else:
             r2 = metrics["r2"]
             r2_str = "nan" if r2 is None else f"{r2:.4f}"
-            print(f"Ball fit: rmse={metrics['rmse']:.6f}, r2={r2_str}, n={metrics['n']}")
-        return {"decay": decay, "vmax": vmax}
+            print(f"Ball fit: rmse={metrics['rmse']:.3f}, r2={r2_str}, n={metrics['n']}")
+        return {"decay": decay}
 
     def _estimate_player_decay(self):
         trajectories = self.player_trajectories
@@ -550,9 +474,8 @@ class ParamEstimatorAI(SoccerAI):
             print("No player trajectories available for estimation.")
             return None
         print(f"Estimating player_decay from {len(trajectories)} trajectories.")
-        decay_sum = 0.0
-        vmax_sum = 0.0
-        weight_sum = 0
+        numer = 0.0
+        denom = 0.0
         coast_segments = []
         for traj in trajectories:
             positions = np.asarray(traj.get("positions", []), dtype=float)
@@ -581,27 +504,18 @@ class ParamEstimatorAI(SoccerAI):
                 if pos_aligned.shape[0] < 2:
                     continue
                 coast_segments.append((pos_aligned, vel_aligned))
-                res = estimate_decay_vmax_joint(
-                    pos_aligned,
-                    vel_aligned,
-                    u=np.zeros(2),
-                    decay_bounds=(0.0, 1.0),
-                    vmax_bounds=(1e-6, None),
-                )
-                weight = pos_aligned.shape[0]
-                decay_sum += res["decay"] * weight
-                vmax_sum += res["vmax"] * weight
-                weight_sum += weight
+                v_prev = vel_aligned[:-1]
+                v_next = vel_aligned[1:]
+                numer += float(np.sum(v_next * v_prev))
+                denom += float(np.sum(v_prev * v_prev))
 
-        if weight_sum <= 0:
+        if denom <= EPS:
             print("Insufficient coast motion to estimate player_decay.")
             return None
 
-        decay = decay_sum / weight_sum
-        vmax_coast = vmax_sum / weight_sum
+        decay = numer / denom
         print(
-            f"Estimated player_decay from coast: {decay:.6f}, vmax: {vmax_coast:.6f} "
-            f"from {weight_sum} steps."
+            f"Estimated player_decay from coast: {decay:.3f}"
         )
         coast_stats = _init_fit_stats()
         for pos_aligned, vel_aligned in coast_segments:
@@ -611,7 +525,7 @@ class ParamEstimatorAI(SoccerAI):
                 vel_aligned,
                 u=np.zeros(2),
                 decay=decay,
-                vmax=vmax_coast,
+                vmax=np.inf,
             )
         coast_metrics = _finalize_fit_stats(coast_stats)
         if coast_metrics is None:
@@ -621,12 +535,11 @@ class ParamEstimatorAI(SoccerAI):
             r2_str = "nan" if r2 is None else f"{r2:.4f}"
             print(
                 "Player coast fit: rmse="
-                f"{coast_metrics['rmse']:.6f}, r2={r2_str}, n={coast_metrics['n']}"
+                f"{coast_metrics['rmse']:.3f}, r2={r2_str}, n={coast_metrics['n']}"
             )
 
         dash_rate_init = None
         dash_rate_samples = []
-        vmax_init = 0.0
         for traj in trajectories:
             positions = np.asarray(traj.get("positions", []), dtype=float)
             powers = np.asarray(traj.get("powers", []), dtype=float)
@@ -638,8 +551,6 @@ class ParamEstimatorAI(SoccerAI):
                 continue
             pos_trim = positions[:steps + 1]
             vel = pos_trim[1:] - pos_trim[:-1]
-            speeds = np.linalg.norm(vel, axis=1)
-            vmax_init = max(vmax_init, float(np.max(speeds)))
             power_steps = powers[:steps]
             heading_steps = headings[:steps]
             for i in range(1, steps):
@@ -656,11 +567,9 @@ class ParamEstimatorAI(SoccerAI):
             dash_rate_init = float(np.median(dash_rate_samples))
         else:
             raise ValueError("Insufficient dash data to estimate dash_power_rate.")
-        if vmax_init <= EPS:
-            vmax_init = 1.0
 
         def residual(params):
-            dash_rate, vmax = params
+            dash_rate = params[0]
             res_parts = []
             for traj in trajectories:
                 positions = np.asarray(traj.get("positions", []), dtype=float)
@@ -676,11 +585,9 @@ class ParamEstimatorAI(SoccerAI):
                 power_steps = powers[:steps]
                 heading_steps = headings[:steps]
                 for i in range(1, steps):
+                    # vel[i] = p[i+1] - p[i] = vel[i-1] * decay + dash_rate * u
                     u_vec = dash_rate * power_steps[i - 1] * heading_steps[i - 1]
-                    v_pred = decay * (vel[i - 1] + u_vec)
-                    speed = np.linalg.norm(v_pred)
-                    if speed > vmax + EPS:
-                        v_pred = v_pred * (vmax / (speed + EPS))
+                    v_pred = vel[i - 1] * decay + u_vec
                     res_parts.append(v_pred - vel[i])
             if not res_parts:
                 return np.array([0.0])
@@ -688,13 +595,13 @@ class ParamEstimatorAI(SoccerAI):
 
         res = least_squares(
             residual,
-            x0=np.array([dash_rate_init, vmax_init], dtype=float),
-            bounds=(np.array([EPS, EPS]), np.array([np.inf, np.inf])),
+            x0=np.array([dash_rate_init], dtype=float),
+            bounds=(np.array([EPS]), np.array([np.inf])),
         )
 
-        dash_rate_est, vmax_est = res.x
+        dash_rate_est = float(res.x[0])
         print(
-            f"Estimated dash_power_rate: {dash_rate_est:.6f}, vmax: {vmax_est:.6f}."
+            f"Estimated dash_power_rate: {dash_rate_est:.3f}."
         )
         player_stats = _init_fit_stats()
         for traj in trajectories:
@@ -710,7 +617,7 @@ class ParamEstimatorAI(SoccerAI):
                 headings,
                 decay=decay,
                 dash_rate=dash_rate_est,
-                vmax=vmax_est,
+                vmax=np.inf,
             )
         player_metrics = _finalize_fit_stats(player_stats)
         if player_metrics is None:
@@ -720,6 +627,6 @@ class ParamEstimatorAI(SoccerAI):
             r2_str = "nan" if r2 is None else f"{r2:.4f}"
             print(
                 "Player fit: rmse="
-                f"{player_metrics['rmse']:.6f}, r2={r2_str}, n={player_metrics['n']}"
+                f"{player_metrics['rmse']:.3f}, r2={r2_str}, n={player_metrics['n']}"
             )
-        return {"decay": decay, "dash_power_rate": dash_rate_est, "vmax": vmax_est}
+        return {"decay": decay, "dash_power_rate": dash_rate_est}
