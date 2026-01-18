@@ -148,7 +148,8 @@ def compute_bisector_target(ball_pos: Tuple[float, float],
     ball_to_goal_dist = math.hypot(goal_x - bx, goal_center[1] - by)
     # Scale step-out distance: closer ball = less step out, farther ball = more step out
     # But never exceed MAX_KEEPER_OUT
-    step_out_factor = min(1.0, ball_to_goal_dist / 30.0)  # Scale based on distance
+    #step_out_factor = min(1.0, 0.5 + ((abs(ball_to_goal_dist - 30) / 15)))  # Scale based on distance
+    step_out_factor = min(1.0, ball_to_goal_dist / 15)
     step_out_dist = MAX_KEEPER_OUT * step_out_factor
     
     # Step out along the bisector direction TOWARD the ball

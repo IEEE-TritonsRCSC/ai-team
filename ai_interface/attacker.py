@@ -309,7 +309,7 @@ class SmartAttacker(Player):
         # Only allow straight kick (angle=0)
         if kind == "skick":
             return f"skick {power:.1f} 0"
-        return f"kick {power:.1f} 0"
+        return f"kick {50:.1f} 0"
 
     # -------------------------------
     # Decision logic: with ball
@@ -456,7 +456,14 @@ class SmartAttacker(Player):
         rx, ry = float(self_pose[0]), float(self_pose[1])
 
         dist_to_ball = math.hypot(bx - rx, by - ry)
-
+        print("YESSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS")
+        # If defender is close to ball, offset approach away from defender to avoid getting pinned
+        if defender_pose is not None:
+            defx, defy = float(defender_pose[0]), float(defender_pose[1])
+            print("AHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH")
+            if math.hypot(defx - bx, defy - by) < 6.0:
+                return self._goto_point(10, 0, self_pose, game_state, margin=0.1, speed=95.0, face=(bx, by))
+        
         # Far: chase predicted position
         if dist_to_ball > self.cfg.chase_far_dist:
             px = bx + float(v_next[0]) * self.cfg.predict_horizon
@@ -475,21 +482,6 @@ class SmartAttacker(Player):
             ax = bx - float(to_goal[0] / n) * back
             ay = by - float(to_goal[1] / n) * back
 
-        # If defender is close to ball, offset approach away from defender to avoid getting pinned
-        if defender_pose is not None:
-            defx, defy = float(defender_pose[0]), float(defender_pose[1])
-            if math.hypot(defx - bx, defy - by) < 6.0:
-                away = np.array([bx - defx, by - defy], dtype=float)
-                an = float(np.linalg.norm(away))
-                if an > 1e-6:
-                    away = away / an
-                    ax += float(away[0]) * 2.0
-                    ay += float(away[1]) * 2.0
-
-        ax = clamp(ax, FIELD_X[0] + 0.8, FIELD_X[1] - 0.8)
-        ay = clamp(ay, FIELD_Y[0] + 0.8, FIELD_Y[1] - 0.8)
-
-        # Small margin prevents "freezing" near approach point
         return self._goto_point(ax, ay, self_pose, game_state, margin=0.1, speed=95.0, face=(bx, by))
 
     def _set_plan(self, tick: int, tx: float, ty: float, kind: str, power: float, ttl: int = 5) -> None:

@@ -13,9 +13,9 @@ from ai_interface.naive import SoccerAI
 from ai_interface.attacker import SmartAttacker, AttackerConfig
 from ai_interface.player import Player
 from ai_interface.utils.intercept import earliest_intercept_control
-from ai_interface.utils.algo_utils import estimate_ball_velocity
+from ai_interface.utils.algo_utils import estimate_ball_velocity, normalize_angle
 from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, kick, dribble
-from ai_interface.goalie import goalie_action, infer_side_from_position
+from ai_interface.goalie import goalie_action, infer_side_from_position, compute_bisector_target
 from constants.player_constants import *
 from constants.field_constants import *
 
@@ -37,6 +37,7 @@ class InterceptDemoAI(SoccerAI):
         self.receiver_decision = None
         self.receiver_decision_expiring = 0
         self.receiver_shoot_angle = 0
+        self.receiver_caught = False
         self.decision_count = 0
         self.KICKABLE_RANGE = PLAYER_SIZE + KICKABLE_MARGIN + BALL_SIZE
         self.shooter_dribbling = False
@@ -113,8 +114,8 @@ class InterceptDemoAI(SoccerAI):
         self._attacker_player = None
         self._smart_attacker = None
 
-    def _receiver_region(self):
-        return (FIELD_X[1] - 30, FIELD_X[1], -20, 20)
+    def _receiver_region(self, self_p0):
+        return (self_p0[0], FIELD_X[1], -20, 20)
 
     def _inside_region(self, pos, region) -> bool:
         x, y = float(pos[0]), float(pos[1])
@@ -160,6 +161,7 @@ class InterceptDemoAI(SoccerAI):
                 power = min(100.0, np.linalg.norm(u) / DASH_POWER_RATE)
                 decision = (power, ang)
                 decision_expiring = 3
+                print("--------------------------------INTERCEPT FOUND------------------------------")
                 return f"dash {power:.1f} {ang}", decision, decision_expiring
 
             power, ang = decision
@@ -170,7 +172,7 @@ class InterceptDemoAI(SoccerAI):
                         game_state=game_state)
         return goto_cmd, None, 0
 
-    def _action_shooter(self, self_p0, heading, ball_vel_est, ball_pos, receiver_pos=None,
+    def _action_shooter(self, self_p0, heading, ball_vel_est, ball_pos, receiver_pos,
                         game_state=None):
         #READ RECEIVER (GOALIE) POSE
         goalie_pose = None
@@ -207,9 +209,13 @@ class InterceptDemoAI(SoccerAI):
             self_pose=self_pose,
             attack_goal=attack_goal,
             goalie_pose=goalie_pose,
-            defender_pose=None,
+            defender_pose=goalie_pose,
             game_state=game_state
         )
+
+        if cmd[:4] == 'kick':
+            self.shooter_turn = False
+        
         return cmd
 
 
@@ -219,68 +225,86 @@ class InterceptDemoAI(SoccerAI):
         to_ball = ball - self_p0
         dist = np.linalg.norm(to_ball)
         ball_speed = np.linalg.norm(ball_vel_est)
-        close_threshold = 2.0 * (PLAYER_SIZE + BALL_SIZE)
         slow_threshold = 0.2
-        region = self._receiver_region()
+        region = self._receiver_region(self_p0)
+        
+        # Initialize random shoot angle if not set
         if self.receiver_shoot_angle == 0:
-                self.receiver_shoot_angle = math.radians(random.uniform(-30, 30))
-        if not self._inside_region(ball, region):
-            return "dash 0 0"
-
-        if self.shooter_turn:
-            goalie_pos = (float(self_p0[0]), float(self_p0[1]))
-            goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
-            has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
-            side = infer_side_from_position(goalie_pos)
-            print('-----------------------------GOALIE ACTION-----------------------------')
-            goalie_cmd = goalie_action(
-                ball_pos=(float(ball[0]), float(ball[1])),
-                goalie_pose=goalie_pose,
-                has_ball=has_ball,
-                goalie_to_ball_dist=dist,
-                side=side,
-                charge_distance=10,
-                game_state=game_state
+            self.receiver_shoot_angle = math.radians(random.uniform(-30, 30))
+        
+        # Determine which goal we're defending
+        side = infer_side_from_position(self_p0)
+        
+        # 3) Catch the ball and shoot in a random direction
+        kickable_range = PLAYER_SIZE + KICKABLE_MARGIN + BALL_SIZE
+        if dist < kickable_range:
+            # Ball is within kickable range
+            if dist < 1.2:  # Very close, try to catch
+                self.receiver_caught = True
+                return "catch 0"
+            # Close enough to kick, shoot in random direction
+            target_angle = heading + self.receiver_shoot_angle
+            kick_cmd = kick(np.array([self_p0[0], self_p0[1], heading], dtype=float),
+                           ball, target_angle, kick_power=80.0, dribbling=False)
+            # If kick command is not a direct kick (e.g., turn or failed), try catch
+            if kick_cmd.startswith("kick"):
+                self.receiver_caught = False
+            return kick_cmd
+        
+        # Determine if ball is a threat (heading towards our goal)
+        goal_center = GOAL_L if side == "left" else GOAL_R
+        goal_x = goal_center[0]
+        
+        # Check if ball is moving towards our goal
+        ball_vel_norm = ball_vel_est / (ball_speed + 1e-6) if ball_speed > 1e-6 else np.zeros(2)
+        to_goal = np.array([goal_x, goal_center[1]]) - ball
+        to_goal_norm = to_goal / (np.linalg.norm(to_goal) + 1e-6)
+        
+        # Ball is a threat if it's moving towards goal and has significant speed
+        is_threat = (ball_speed > slow_threshold and 
+                    np.dot(ball_vel_norm, to_goal_norm) > 0.3 and
+                    abs(ball[0] - goal_x) < 20)  # Ball is reasonably close to goal line
+        
+        # 2) Fast interception using hybrid_capture when ball is shot towards goal
+        if is_threat:
+            # Use hybrid_capture for fast interception
+            theta = math.atan2(to_ball[1], to_ball[0])
+            rect_bounds = region  # Use receiver region as bounds
+            cmd, decision, expiring = self.hybrid_capture(
+                self_p0=self_p0,
+                heading=heading,
+                ball_vel_est=ball_vel_est,
+                ball_pos=ball_pos,
+                decision=self.receiver_decision,
+                decision_expiring=self.receiver_decision_expiring,
+                theta=theta,
+                rect_bounds=rect_bounds,
+                game_state=game_state,
+                teamname=self.receiver_id[0] if self.receiver_id else None,
+                unum=self.receiver_id[1] if self.receiver_id else None
             )
-            return goalie_cmd
+            # Update decision state
+            self.receiver_decision = decision
+            self.receiver_decision_expiring = expiring
+            return cmd
         
-        if dist <= close_threshold and ball_speed <= slow_threshold:
-            kick_pos = ball + np.array([np.cos(self.receiver_shoot_angle), np.sin(self.receiver_shoot_angle)]) * (PLAYER_SIZE + BALL_SIZE)
-            kick_angle = math.atan2(ball[1] - kick_pos[1], ball[0] - kick_pos[0])
-            goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float),
-                            kick_pos[0], kick_pos[1], theta=kick_angle, speed=50.0,
-                            game_state=game_state)
-            if goto_cmd != "done":
-                return goto_cmd
-        
-        if self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0]))):
-            cmd = kick([*self_p0, heading], ball, kick_angle, dribbling=self.receiver_dribbling)
-            # receiver_cmd = f"kick {100} {self.receiver_shoot_angle}"
-            if "kick" in cmd:
-                self.shooter_turn = True
-                self.receiver_decision = None
-                self.receiver_decision_expiring = 0
-                self.receiver_shoot_angle = 0
-                self.receiver_dribbling = False
-                return cmd
-            elif "catch" in cmd:
-                self.receiver_dribbling = True
-                return cmd
-            elif cmd == "failed":
-                print('[Warning] Receiver kick failed')
-                return "dash 0 0"
-            else:
-                return cmd
-        else:
-            print('Ball distance:', dist, 'Ball angle:', math.degrees(math.atan2(to_ball[1], to_ball[0])), 'Heading:', math.degrees(heading))
-        cmd, self.receiver_decision, self.receiver_decision_expiring = self.hybrid_capture(
-            self_p0, heading, ball_vel_est, ball_pos,
-            self.receiver_decision, self.receiver_decision_expiring,
-            math.pi,
-            rect_bounds=(FIELD_X[1] - 30, FIELD_X[1], -20 , 20),
-            game_state=game_state, teamname=self.receiver_id[0]
+        # 1) Optimal placement at the angular bisector
+        # Compute optimal target position using angle bisector
+        goalie_pos = (float(self_p0[0]), float(self_p0[1]))
+        goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
+        has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
+        side = infer_side_from_position(goalie_pos)
+        print('-----------------------------GOALIE ACTION-----------------------------')
+        goalie_cmd = goalie_action(
+            ball_pos=(float(ball[0]), float(ball[1])),
+            goalie_pose=goalie_pose,
+            has_ball=has_ball,
+            goalie_to_ball_dist=dist,
+            side=side,
+            charge_distance=10,
+            game_state=game_state
         )
-        return "dash 0 0" if cmd == "done" else cmd
+        return goalie_cmd
 
     def hasBall(self, robot_to_ball_dist: float, angle_diff: float) -> bool:
         angle_diff = min(angle_diff, 2 * math.pi - angle_diff)

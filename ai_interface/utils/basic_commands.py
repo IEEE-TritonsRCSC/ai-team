@@ -82,7 +82,7 @@ def build_avoid_points(game_state, self_pose,
 
 def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
          margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
-         detour_margin: float = 1.5) -> str:
+         detour_margin: float = 1.5, is_goalie: bool = False) -> str:
     """
     Create a `dash` or `turn` command to move toward a destination.
 
@@ -119,7 +119,8 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
             return f"turn {angle_diff}" if abs(angle_diff) > math.radians(5.0) else "done"
         else:
             return "done"
-    speed = min(speed, max(distance * (1 / PLAYER_DECAY - 1) / dt, 20))
+    if not is_goalie:
+        speed = min(speed, max(distance * (1 / PLAYER_DECAY - 1) / dt, 20))
     return f"dash {speed} {angle}"
 
 
