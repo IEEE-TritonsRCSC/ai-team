@@ -16,6 +16,8 @@ from ai_interface.constants.field_constants import (
     GOAL_R,
     MAX_KEEPER_OUT,
 )
+from ai_interface.utils.basic_commands import goto
+from ai_interface.player import Player
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -173,14 +175,170 @@ def compute_bisector_target(ball_pos: Tuple[float, float],
     return (kx, ky)
 
 
+class Goalie(Player):
+    """
+    Goalkeeper class that inherits from Player.
+    
+    Provides goalie-specific positioning and control logic using angle-bisector positioning.
+    """
+    
+    def __init__(self,
+                 teamname: str,
+                 unum: int,
+                 side: str = None,
+                 charge_distance: float = 15,
+                 dribbling: bool = False) -> None:
+        """
+        Initialize the Goalie.
+        
+        Args:
+            teamname: Team name
+            unum: Uniform number
+            side: 'left' or 'right' - which goal we're defending. If None, will be inferred from position.
+            charge_distance: Distance threshold for charging at the ball (default: 15.0)
+            dribbling: Whether the goalie is currently dribbling
+        """
+        super().__init__(teamname, unum, dribbling=dribbling, is_goalie=True)
+        self.side = side
+        self.charge_distance = charge_distance
+    
+    def infer_side(self, goalie_pos: Tuple[float, float] = None) -> str:
+        """
+        Infer which side we're defending.
+        
+        Args:
+            goalie_pos: (x, y) position of the goalie. If None, uses stored side.
+            
+        Returns:
+            'left' or 'right'
+        """
+        if self.side is not None:
+            return self.side
+        if goalie_pos is None:
+            raise ValueError("Cannot infer side: no goalie position provided and side not set")
+        return infer_side_from_position(goalie_pos)
+    
+    def compute_target_position(self, ball_pos: Tuple[float, float],
+                                goalie_pos: Tuple[float, float] = None) -> Tuple[float, float]:
+        """
+        Compute desired target position using angle-bisector positioning.
+        
+        Args:
+            ball_pos: (x, y) position of the ball
+            goalie_pos: (x, y) position of the goalie. If None, side must be set.
+            
+        Returns:
+            (x, y) target position for the goalkeeper
+        """
+        if goalie_pos is None:
+            raise ValueError("goalie_pos is required")
+        side = self.infer_side(goalie_pos)
+        return compute_bisector_target(ball_pos, goalie_pos, side)
+    
+    def action(self, ball_pos: Tuple[float, float],
+               goalie_pose: Tuple[float, float, float],
+               has_ball: bool = None,
+               goalie_to_ball_dist: float = None,
+               game_state=None) -> str:
+        """
+        Compute goalkeeper action command using angle-bisector positioning.
+        
+        Args:
+            ball_pos: (x, y) position of the ball
+            goalie_pose: (x, y, theta_deg) position and heading of the goalie
+            has_ball: Whether the goalie currently has the ball. If None, will be computed.
+            goalie_to_ball_dist: Distance between goalie and ball. If None, will be computed.
+            game_state: Game state object for obstacle avoidance in goto command
+            
+        Returns:
+            Action command string (e.g., "dash 100 0", "catch 0", "kick 100 0", etc.)
+        """
+        goalie_pos = (goalie_pose[0], goalie_pose[1])
+        goalie_dir = math.radians(goalie_pose[2])
+        goalie_pose_rad = (goalie_pose[0], goalie_pose[1], goalie_dir)
+        
+        # Compute distance and has_ball if not provided
+        if goalie_to_ball_dist is None:
+            goalie_to_ball_dist = math.hypot(ball_pos[0] - goalie_pos[0], 
+                                            ball_pos[1] - goalie_pos[1])
+        
+        if has_ball is None:
+            ball_pose = (ball_pos[0], ball_pos[1], 0)  # dummy heading for hasBall check
+            has_ball = self.hasBall(goalie_pose_rad, ball_pose, check_angle=False)
+        
+        side = self.infer_side(goalie_pos)
+        
+        # Immediate ball interaction logic
+        if has_ball:
+            return "kick 100 0"
+        elif goalie_to_ball_dist < 1.2:
+            return "catch 0"
+
+        gx, gy = goalie_pos
+
+        # If the ball is very close to the center of our goal, the keeper must charge
+        _, _, goal_center = _compute_goal_params(side)
+        ball_goal_center_dist = math.hypot(ball_pos[0] - goal_center[0], 
+                                           ball_pos[1] - goal_center[1])
+        if ball_goal_center_dist < self.charge_distance:
+            # Charge straight toward the ball using goto
+            charge_heading = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
+            goto_cmd = self.goto(
+                ball_pos[0],
+                ball_pos[1],
+                goalie_pose_rad,
+                game_state,
+                margin=0.1,
+                theta=charge_heading,
+                speed=100.0
+            )
+            return goto_cmd if goto_cmd != "done" else "dash 0 0"
+
+        # Compute desired target using angle-bisector positioning
+        target_pos = self.compute_target_position(ball_pos, goalie_pos)
+        tx, ty = target_pos
+
+        # Use goto to move to target position, facing the ball when close
+        dist_to_target = math.hypot(tx - gx, ty - gy)
+        facing_ball = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
+        
+        # If we're close to the target, align to face the ball
+        if dist_to_target < 0.5:
+            goto_cmd = self.goto(
+                tx,
+                ty,
+                goalie_pose_rad,
+                game_state,
+                margin=0.5,
+                theta=facing_ball,
+                speed=0.0
+            )
+            return goto_cmd if goto_cmd != "done" else "dash 0 0"
+        
+        # Move to target position
+        goto_cmd = self.goto(
+            tx,
+            ty,
+            goalie_pose_rad,
+            game_state,
+            margin=0.1,
+            speed=100.0
+        )
+        return goto_cmd if goto_cmd != "done" else "dash 0 0"
+
+
+# Backward compatibility: keep the function interface
 def goalie_action(ball_pos: Tuple[float, float],
                   goalie_pose: Tuple[float, float, float],
                   has_ball: bool,
                   goalie_to_ball_dist: float,
                   side: str = None,
-                  charge_distance: float = 20) -> str:
+                  charge_distance: float = 15,
+                  game_state=None) -> str:
     """
     Compute goalkeeper action command using angle-bisector positioning.
+    
+    This is a backward-compatibility wrapper around the Goalie class.
     
     Args:
         ball_pos: (x, y) position of the ball
@@ -189,54 +347,26 @@ def goalie_action(ball_pos: Tuple[float, float],
         goalie_to_ball_dist: Distance between goalie and ball
         side: 'left' or 'right' - which goal we're defending. If None, inferred from goalie position.
         charge_distance: Distance threshold for charging at the ball (default: 15.0)
+        game_state: Game state object for obstacle avoidance in goto command
         
     Returns:
         Action command string (e.g., "dash 100 0", "catch 0", "kick 100 0", etc.)
     """
+    # Create a temporary Goalie instance for backward compatibility
     goalie_pos = (goalie_pose[0], goalie_pose[1])
-    goalie_dir = math.radians(goalie_pose[2])
+    inferred_side = infer_side_from_position(goalie_pos) if side is None else side
     
-    if side is None:
-        side = infer_side_from_position(goalie_pos)
+    goalie = Goalie(
+        teamname="temp",
+        unum=1,
+        side=inferred_side,
+        charge_distance=charge_distance
+    )
     
-    # Immediate ball interaction logic
-    if has_ball:
-        return "kick 100 0"
-    elif goalie_to_ball_dist < 1.2:
-        return "catch 0"
-
-    gx, gy = goalie_pos
-
-    # If the ball is very close to the center of our goal, the keeper must charge
-    _, _, goal_center = _compute_goal_params(side)
-    ball_goal_center_dist = math.hypot(ball_pos[0] - goal_center[0], 
-                                       ball_pos[1] - goal_center[1])
-    if ball_goal_center_dist < charge_distance:
-        # Charge straight toward the ball with max power
-        charge_heading = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
-        charge_direction = charge_heading - goalie_dir
-        charge_direction = (charge_direction + math.pi) % (2 * math.pi) - math.pi
-        return f"dash 100 {charge_direction}"
-
-    # Compute desired target using angle-bisector positioning
-    target_pos = compute_bisector_target(ball_pos, goalie_pos, side)
-    tx, ty = target_pos
-
-    # Convert target position into a dash/turn command
-    dist_to_target = math.hypot(tx - gx, ty - gy)
-    desired_heading = math.atan2(ty - gy, tx - gx)
-    direction = desired_heading - goalie_dir
-    direction = (direction + math.pi) % (2 * math.pi) - math.pi
-
-    # If we're close to the target, just align to the ball or stay still
-    if dist_to_target < 0.5:
-        facing_ball = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)
-        turn_to_ball = facing_ball - goalie_dir
-        turn_to_ball = (turn_to_ball + math.pi) % (2 * math.pi) - math.pi
-        if abs(turn_to_ball) > math.pi / 36:
-            return f"turn {turn_to_ball * 10}"
-        return "dash 0 0"
-
-    power = min(100, dist_to_target * 10.0)
-    return f"dash {power} {direction}"
-
+    return goalie.action(
+        ball_pos=ball_pos,
+        goalie_pose=goalie_pose,
+        has_ball=has_ball,
+        goalie_to_ball_dist=goalie_to_ball_dist,
+        game_state=game_state
+    )

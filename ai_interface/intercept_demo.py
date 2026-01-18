@@ -10,9 +10,12 @@ import numpy as np
 import random
 import time
 from ai_interface.naive import SoccerAI
+from ai_interface.attacker import SmartAttacker, AttackerConfig
+from ai_interface.player import Player
 from ai_interface.utils.intercept import earliest_intercept_control
 from ai_interface.utils.algo_utils import estimate_ball_velocity
 from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, kick, dribble
+from ai_interface.utils.goalie import goalie_action, infer_side_from_position
 from constants.player_constants import *
 from constants.field_constants import *
 
@@ -38,6 +41,9 @@ class InterceptDemoAI(SoccerAI):
         self.KICKABLE_RANGE = PLAYER_SIZE + KICKABLE_MARGIN + BALL_SIZE
         self.shooter_dribbling = False
         self.receiver_dribbling = False
+        self._attacker_player = None
+        self._smart_attacker = None
+        self._attacker_cfg = AttackerConfig()
 
     def decide_action(self, game_state, teamname: str):
         actions = []
@@ -104,6 +110,8 @@ class InterceptDemoAI(SoccerAI):
         self.receiver_decision = None
         self.receiver_decision_expiring = 0
         self.decision_count = 0
+        self._attacker_player = None
+        self._smart_attacker = None
 
     def _receiver_region(self):
         return (FIELD_X[1] - 30, FIELD_X[1], -20, 20)
@@ -161,40 +169,49 @@ class InterceptDemoAI(SoccerAI):
                         target_pos[0], target_pos[1], theta=theta, margin=0.05,
                         game_state=game_state)
         return goto_cmd, None, 0
-    
+
     def _action_shooter(self, self_p0, heading, ball_vel_est, ball_pos, receiver_pos=None,
                         game_state=None):
-        if not self.shooter_turn:
-            print('Waiting for receiver to catch')
-            return "dash 0 0"
-        ball = np.array(ball_pos[:2], dtype=float)
-        to_ball = ball - self_p0
-        dist = np.linalg.norm(to_ball)
-        if self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0]))):
-            cmd = shoot_at_goal([*self_p0, heading], ball, GOAL_R, kick_power=80.0, dribbling=self.shooter_dribbling)
-            if "kick" in cmd:
-                self.shooter_turn = False
-                self.shooter_dribbling = False
-                self.shooter_decision = None
-                self.shooter_decision_expiring = 0
-                return cmd
-            elif "catch" in cmd:
-                self.shooter_dribbling = True
-                return cmd
-            elif cmd == "failed":
-                print('[Warning] Shooter kick failed')
-                return "dash 0 0"
-            else:
-                return cmd
+        #READ RECEIVER (GOALIE) POSE
+        goalie_pose = None
+        if self.receiver_id is not None:
+            recv_team, recv_unum = self.receiver_id
+            for r in game_state.robot_poses.get(recv_team, []):
+                u = int(next(iter(r.keys())))
+                if u == recv_unum:
+                    p = r[u]
+                    goalie_pose = (float(p[0]), float(p[1]), math.radians(float(p[2])))   # (x, y, heading_deg)
+                    break
+        # Ensure attacker module is initialized once
+        if self._attacker_player is None or self._smart_attacker is None:
+            # In your current InterceptDemoAI, shooter_id is (teamname, unum).
+            # We wrap that unum with Player to reuse goto() defaults.
+            teamname = self.shooter_id[0] if self.shooter_id is not None else "TritonBots"
+            unum = self.shooter_id[1] if self.shooter_id is not None else 1
+            self._attacker_player = Player(teamname=teamname, unum=unum, dribbling=False, is_goalie=False)
+            self._smart_attacker = SmartAttacker(self._attacker_player, self._attacker_cfg)
 
-        desired_theta = math.atan2(GOAL_R[1] - self_p0[1], GOAL_R[0] - self_p0[0])
-        cmd, self.shooter_decision, self.shooter_decision_expiring = self.hybrid_capture(
-            self_p0, heading, ball_vel_est, ball_pos,
-            self.shooter_decision, self.shooter_decision_expiring,
-            desired_theta,
-            game_state=game_state,
+        # Convert pose format for SmartAttacker: (x, y, heading_deg)
+        self_pose = (float(self_p0[0]), float(self_p0[1]), float(heading))
+        ball_xy = (float(ball_pos[0]), float(ball_pos[1]))
+
+        # Attacker is TritonBots -> attacks right goal (GOAL_R)
+        attack_goal = (float(GOAL_R[0]), float(GOAL_R[1]))
+
+        # We do NOT touch goalie code, so we pass None for goalie/defender info here.
+        # (If you later want attacker to "see" goalie, we can pass receiver pose,
+        # but that would be a non-attacker structural change.)
+        cmd = self._smart_attacker.step(
+            tick=int(getattr(game_state, "count", 0)),
+            ball=ball_xy,
+            self_pose=self_pose,
+            attack_goal=attack_goal,
+            goalie_pose=goalie_pose,
+            defender_pose=None,
+            game_state=game_state
         )
-        return "dash 0 0" if cmd == "done" else cmd
+        return cmd
+
 
     def _action_receiver(self, self_p0, heading, ball_vel_est, ball_pos,
                          game_state=None,):
@@ -211,11 +228,21 @@ class InterceptDemoAI(SoccerAI):
             return "dash 0 0"
 
         if self.shooter_turn:
-            ang = math.atan2(to_ball[1], to_ball[0])
-            goto_cmd = goto(np.array([self_p0[0], self_p0[1], heading], dtype=float), 
-                        GOAL_R[0] - 10, GOAL_R[1], theta=ang, margin=0.5,
-                        game_state=game_state)
-            return goto_cmd if goto_cmd != "done" else "dash 0 0"
+            goalie_pos = (float(self_p0[0]), float(self_p0[1]))
+            goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
+            has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
+            side = infer_side_from_position(goalie_pos)
+            print('-----------------------------GOALIE ACTION-----------------------------')
+            goalie_cmd = goalie_action(
+                ball_pos=(float(ball[0]), float(ball[1])),
+                goalie_pose=goalie_pose,
+                has_ball=has_ball,
+                goalie_to_ball_dist=dist,
+                side=side,
+                charge_distance=10,
+                game_state=game_state
+            )
+            return goalie_cmd
         
         if dist <= close_threshold and ball_speed <= slow_threshold:
             kick_pos = ball + np.array([np.cos(self.receiver_shoot_angle), np.sin(self.receiver_shoot_angle)]) * (PLAYER_SIZE + BALL_SIZE)
@@ -251,7 +278,7 @@ class InterceptDemoAI(SoccerAI):
             self.receiver_decision, self.receiver_decision_expiring,
             math.pi,
             rect_bounds=(FIELD_X[1] - 30, FIELD_X[1], -20 , 20),
-            game_state=game_state,
+            game_state=game_state, teamname=self.receiver_id[0]
         )
         return "dash 0 0" if cmd == "done" else cmd
 

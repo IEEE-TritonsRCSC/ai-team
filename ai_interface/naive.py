@@ -10,7 +10,7 @@ import random
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-# We should ideally package the module instead of using sys.path.append
+
 from networking.data_utils import TeamInfo, GameState
 from ai_interface.utils.goalie import goalie_action
 
