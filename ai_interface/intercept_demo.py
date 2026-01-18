@@ -15,7 +15,7 @@ from ai_interface.player import Player
 from ai_interface.utils.intercept import earliest_intercept_control
 from ai_interface.utils.algo_utils import estimate_ball_velocity
 from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, kick, dribble
-from ai_interface.utils.goalie import goalie_action, infer_side_from_position
+from ai_interface.goalie import goalie_action, infer_side_from_position
 from constants.player_constants import *
 from constants.field_constants import *
 
