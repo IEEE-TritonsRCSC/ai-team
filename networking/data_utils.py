@@ -126,7 +126,7 @@ class Deserializer:
             ball_pos = self.cam_get_ball_pos(data.balls)
             robot_data = (data.robots_yellow, data.robots_blue)
             robot_poses = self.cam_get_robot_poses(robot_data)
-            return GameState(count, timestamp, ball_pos, robot_poses)
+            return GameState(count, timestamp, ball_pos, robot_poses, None)
         except Exception as e:
             print(f"Error deserializing camera data: {e}")
         return None
@@ -150,7 +150,7 @@ class Deserializer:
                 highest_confident_ball = ball
 
         if highest_confident_ball is not None:
-            return (highest_confident_ball.x, highest_confident_ball.y)
+            return (highest_confident_ball.x/100, highest_confident_ball.y/100)
         return None
 
     def cam_get_robot_poses(self, robot_data) -> dict[str, list]:
@@ -171,11 +171,11 @@ class Deserializer:
                 # Convert camera radians [-π, π] to simulator degrees [-180, 180]
                 # Camera and simulator have 180° reference difference, 
                 # both use clockwise direction
-                orientation = math.degrees(theta) + 180
+                orientation = math.degrees(theta)
                 # Normalize to [-180, 180] range
                 if orientation > 180:
                     orientation -= 360
-                pose = (robot.x, robot.y, orientation)
+                pose = (robot.x/100, robot.y/100, orientation)
                 robot_poses[teamname].append({pattern_id: pose})
         return robot_poses
 
