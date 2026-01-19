@@ -52,7 +52,7 @@ class Player:
             theta=theta,
             speed=self.goto_speed if speed is None else speed,
             detour_margin=self.detour_margin if detour_margin is None else detour_margin,
-            is_goalie=is_goalie
+            is_goalie=is_goalie, allow_decay=False
         )
         return cmd
     

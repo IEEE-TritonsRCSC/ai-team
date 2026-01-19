@@ -75,6 +75,9 @@ class AttackerConfig:
     # Dribble kick power (skick)
     dribble_touch_power: float = 22.0
 
+    # How far behind the ball to stage before approaching along the shot line
+    approach_back_extra: float = 1.2
+
     # ---------- Predictive chase ----------
     chase_far_dist: float = 3.2
     predict_horizon: float = 4.0
@@ -83,8 +86,10 @@ class AttackerConfig:
     kick_align_tol: float = math.radians(1.0)
     turn_gain: float = 1.0
 
+
     # ---------- Catching ----------
     catch_face_tol: float = math.radians(12.0)
+    aim_align_tol: float = math.radians(8.0)
 
 
 class SmartAttacker(Player):
@@ -119,6 +124,7 @@ class SmartAttacker(Player):
         self.attacker_caught = False
         self.with_ball_counter = 0
         self.with_ball_counter_thresh = 10
+        self._use_deep_approach = True
     # -------------------------------
     # Core public API
     # -------------------------------
@@ -173,21 +179,23 @@ class SmartAttacker(Player):
             and abs(bx) < self.cfg.kickoff_center_box
             and abs(by) < self.cfg.kickoff_center_box
         ):
-            if np.linalg.norm(np.array([bx-rx, by-ry], dtype = float))-BALL_SIZE-PLAYER_SIZE >= 0.3:
-                shoot_pos = -np.array([gx-bx, gy-0], dtype=float)/np.linalg.norm(np.array([gx-bx, gy-0], dtype=float))*(BALL_SIZE+PLAYER_SIZE+KICKABLE_MARGIN/2)
-                theta = math.atan2(gy - shoot_pos[1], gx - shoot_pos[0])
-                return self._goto_point(shoot_pos[0], shoot_pos[1], self_pose, game_state, margin=0.25, speed=100.0, face=theta)
-            if not self.attacker_caught:
-                self.attacker_caught = True
-                heading = float(self_pose[2])
-                desired = math.atan2(by - ry, bx - rx)
-                diff = norm_angle(desired - heading)
-                if abs(diff) > self.cfg.catch_face_tol:
-                    return f"turn {diff:.4f}"
-                return "catch 0"
-            else:
+            if self.attacker_caught:
                 self.attacker_caught = False
-                return f"kick {self.cfg.kickoff_touch_power} {0}"
+                return f"kick {self.cfg.kickoff_touch_power} 0"
+            kickoff_tgt = (gx, 0.0)
+            approach_p = np.array([bx, by], dtype=float) + self._approach_offset(kickoff_tgt, (bx, by))
+            if self._use_deep_approach and math.hypot(float(approach_p[0]) - rx, float(approach_p[1]) - ry) > 0.25:
+                theta = math.atan2(kickoff_tgt[1] - approach_p[1], kickoff_tgt[0] - approach_p[0])
+                return self._goto_point(float(approach_p[0]), float(approach_p[1]), self_pose, game_state, margin=0.25, speed=100.0, face=theta)
+            self._use_deep_approach = False
+            contact_p = self._contact_point(kickoff_tgt, (bx, by))
+            if math.hypot(float(contact_p[0]) - rx, float(contact_p[1]) - ry) > 0.1:
+                theta = math.atan2(kickoff_tgt[1] - contact_p[1], kickoff_tgt[0] - contact_p[0])
+                return self._goto_point(float(contact_p[0]), float(contact_p[1]), self_pose, game_state, margin=0.1, speed=100.0, face=theta)
+            pending = self._require_catch_before_kick(self_pose, (bx, by), attack_goal)
+            if pending:
+                return pending
+            return f"kick {self.cfg.kickoff_touch_power} {0}"
 
         # 2) If we have ball: shoot or dribble
         has_ball = np.linalg.norm(np.array([bx - rx, by - ry], dtype=float)) - BALL_SIZE - PLAYER_SIZE <= 2
@@ -195,6 +203,8 @@ class SmartAttacker(Player):
         # Once has_ball is true, keep running _with_ball for a few extra ticks even if we drift away.
         if has_ball:
             self.with_ball_counter = self.with_ball_counter_thresh + 1  # include this tick + next 10
+        else:
+            self._use_deep_approach = True  # reset staging when we don't have the ball
 
         if self.with_ball_counter > 0:
             self.with_ball_counter -= 1
@@ -262,6 +272,28 @@ class SmartAttacker(Player):
     # -------------------------------
     # Movement helpers
     # -------------------------------
+    def _approach_offset(self, target: Tuple[float, float], ball_xy: Tuple[float, float]) -> np.ndarray:
+        """Vector from ball to a staging point behind it along the shot line."""
+        bx, by = float(ball_xy[0]), float(ball_xy[1])
+        dir_vec = np.array([float(target[0]) - bx, float(target[1]) - by], dtype=float)
+        norm = float(np.linalg.norm(dir_vec))
+        if norm < 1e-6:
+            dir_vec = np.array([1.0, 0.0], dtype=float)
+            norm = 1.0
+        back = BALL_SIZE + PLAYER_SIZE + KICKABLE_MARGIN / 2 + self.cfg.approach_back_extra
+        return -(dir_vec / norm) * back
+
+    def _contact_point(self, target: Tuple[float, float], ball_xy: Tuple[float, float]) -> np.ndarray:
+        """Point just behind the ball along the shot line for contact."""
+        bx, by = float(ball_xy[0]), float(ball_xy[1])
+        dir_vec = np.array([float(target[0]) - bx, float(target[1]) - by], dtype=float)
+        norm = float(np.linalg.norm(dir_vec))
+        if norm < 1e-6:
+            dir_vec = np.array([1.0, 0.0], dtype=float)
+            norm = 1.0
+        back = BALL_SIZE + PLAYER_SIZE + KICKABLE_MARGIN / 2
+        return np.array([bx, by], dtype=float) - (dir_vec / norm) * back
+
     def _goto_point(
         self,
         tx: float,
@@ -299,6 +331,34 @@ class SmartAttacker(Player):
         p = min(100.0, max(35.0, speed * min(1.0, dist / 6.0)))
         return f"dash {p:.1f} {ang:.4f}"
 
+    def _require_catch_before_kick(
+        self,
+        self_pose: Tuple[float, float, float],
+        ball_xy: Tuple[float, float],
+        target_xy: Optional[Tuple[float, float]] = None,
+    ) -> Optional[str]:
+        """Ensure we catch (and face ball + shot line) before allowing a kick/skick."""
+        rx, ry, heading = float(self_pose[0]), float(self_pose[1]), float(self_pose[2])
+        bx, by = float(ball_xy[0]), float(ball_xy[1])
+
+        # If already caught, do not force extra turning here.
+        if self.attacker_caught:
+            return None
+
+        desired = math.atan2(by - ry, bx - rx)
+        diff = norm_angle(desired - heading)
+        if abs(diff) > self.cfg.catch_face_tol:
+            return f"turn {diff:.4f}"
+
+        if target_xy is not None:
+            shot_dir = math.atan2(float(target_xy[1]) - by, float(target_xy[0]) - bx)
+            shot_diff = norm_angle(shot_dir - heading)
+            if abs(shot_diff) > self.cfg.aim_align_tol:
+                return f"turn {shot_diff:.4f}"
+
+        self.attacker_caught = True
+        return "catch 0"
+
     # -------------------------------
     # Kicking (STRICT: must face + angle=0)
     # -------------------------------
@@ -319,8 +379,15 @@ class SmartAttacker(Player):
         if abs(diff) > self.cfg.kick_align_tol:
             return f"turn {(diff * self.cfg.turn_gain):.4f}"
 
+        if self._ball_hist:
+            pending = self._require_catch_before_kick(self_pose, self._ball_hist[-1], target)
+            if pending:
+                return pending
+
         if kind == "skick":
+            self.attacker_caught = False
             return f"skick {power:.1f} 0"
+        self.attacker_caught = False
         return f"kick {power:.1f} 0"
 
     def _kick_to(self, pose: tuple[float, float, float], tx: float, ty: float,
@@ -338,8 +405,15 @@ class SmartAttacker(Player):
             return f"turn {(diff * TURN_GAIN):.4f}"
 
         # Only allow straight kick (angle=0)
+        if self._ball_hist:
+            pending = self._require_catch_before_kick(pose, self._ball_hist[-1], (tx, ty))
+            if pending:
+                return pending
+
         if kind == "skick":
+            self.attacker_caught = False
             return f"skick {power:.1f} 0"
+        self.attacker_caught = False
         return f"kick {50:.1f} 0"
 
     # -------------------------------
@@ -389,7 +463,7 @@ class SmartAttacker(Player):
                 backoff_p = ball_p + away * self.cfg.goalie_backoff_step
                 backoff_p[0] = clamp(backoff_p[0], FIELD_X[0] + self.cfg.boundary_buffer, FIELD_X[1] - self.cfg.boundary_buffer)
                 backoff_p[1] = clamp(backoff_p[1], FIELD_Y[0] + self.cfg.boundary_buffer, FIELD_Y[1] - self.cfg.boundary_buffer)
-                return self._goto_point(float(backoff_p[0]), float(backoff_p[1]), self_pose, game_state, margin=0.5, speed=90.0, face=(bx, by))
+                return self._goto_point(float(backoff_p[0]), float(backoff_p[1]), self_pose, game_state, margin=0.3, speed=90.0, face=(bx, by))
 
         best_score = -1e18
         best_target = targets[0]
@@ -433,23 +507,24 @@ class SmartAttacker(Player):
             # Lock the shot for a few ticks so we will turn-then-kick reliably
             self._set_plan(tick, float(tgt[0]), float(tgt[1]), kind="kick", power=100.0, ttl=6)
 
-            # Execute immediately (will be turn or kick)
-            if np.linalg.norm(np.array([bx-rx, by-ry], dtype = float))-BALL_SIZE-PLAYER_SIZE >= 0.3:
-                offset = -(np.array([tgt[0]-bx, tgt[1]-by], dtype=float) / np.linalg.norm(np.array([tgt[0]-bx, tgt[1]-by], dtype=float))) * (BALL_SIZE + PLAYER_SIZE + KICKABLE_MARGIN/2)
-                shoot_pos = np.array([bx, by], dtype=float) + offset
-                theta = math.atan2(tgt[1] - shoot_pos[1], tgt[0] - shoot_pos[0])
-                return self._goto_point(shoot_pos[0], shoot_pos[1], self_pose, game_state, margin=0.4, speed=100.0, face=theta)
-            if not self.attacker_caught:
-                self.attacker_caught = True
-                heading = float(self_pose[2])
-                desired = math.atan2(by - ry, bx - rx)
-                diff = norm_angle(desired - heading)
-                if abs(diff) > self.cfg.catch_face_tol:
-                    return f"turn {diff:.4f}"
-                return "catch 0"
-            else:
+            if self.attacker_caught:
                 self.attacker_caught = False
-                return f"kick {self.cfg.kickoff_touch_power} {0}"
+                return "kick 100 0"
+
+            # Execute immediately (will be turn or kick)
+            approach_p = np.array([bx, by], dtype=float) + self._approach_offset(tgt, (bx, by))
+            if self._use_deep_approach and math.hypot(float(approach_p[0]) - rx, float(approach_p[1]) - ry) > 0.25:
+                theta = math.atan2(tgt[1] - approach_p[1], tgt[0] - approach_p[0])
+                return self._goto_point(float(approach_p[0]), float(approach_p[1]), self_pose, game_state, margin=0.3, speed=100.0, face=theta)
+            self._use_deep_approach = False
+            contact_p = self._contact_point(tgt, (bx, by))
+            if math.hypot(float(contact_p[0]) - rx, float(contact_p[1]) - ry) > 0.1:
+                theta = math.atan2(tgt[1] - contact_p[1], tgt[0] - contact_p[0])
+                return self._goto_point(float(contact_p[0]), float(contact_p[1]), self_pose, game_state, margin=0.1, speed=100.0, face=theta)
+            pending = self._require_catch_before_kick(self_pose, (bx, by), tgt)
+            if pending:
+                return pending
+            return f"kick {self.cfg.kickoff_touch_power} {0}"
 
         # # (C) Otherwise dribble: one touch with cooldown, bias toward center near sideline
         # if tick - self._last_touch_tick < self.cfg.touch_cooldown:
@@ -497,22 +572,22 @@ class SmartAttacker(Player):
         tgt = (float(drib_tx), float(drib_ty))
         self._set_plan(tick, float(tgt[0]), float(tgt[1]), kind="skick", power=self.cfg.dribble_touch_power, ttl=4)
         
-        if np.linalg.norm(np.array([bx-rx, by-ry], dtype = float))-BALL_SIZE-PLAYER_SIZE >= 0.3:
-            offset = -(np.array([tgt[0]-bx, tgt[1]-by], dtype=float) / np.linalg.norm(np.array([tgt[0]-bx, tgt[1]-by], dtype=float))) * (BALL_SIZE + PLAYER_SIZE + KICKABLE_MARGIN/2)
-            shoot_pos = np.array([bx, by], dtype=float) + offset
-            theta = math.atan2(tgt[1] - shoot_pos[1], tgt[0] - shoot_pos[0])
-            return self._goto_point(shoot_pos[0], shoot_pos[1], self_pose, game_state, margin=0.4, speed=100.0, face=theta)
-        if not self.attacker_caught:
-            self.attacker_caught = True
-            heading = float(self_pose[2])
-            desired = math.atan2(by - ry, bx - rx)
-            diff = norm_angle(desired - heading)
-            if abs(diff) > self.cfg.catch_face_tol:
-                return f"turn {diff:.4f}"
-            return "catch 0"
-        else:
+        approach_p = np.array([bx, by], dtype=float) + self._approach_offset(tgt, (bx, by))
+        if self._use_deep_approach and math.hypot(float(approach_p[0]) - rx, float(approach_p[1]) - ry) > 0.25:
+            theta = math.atan2(tgt[1] - approach_p[1], tgt[0] - approach_p[0])
+            return self._goto_point(float(approach_p[0]), float(approach_p[1]), self_pose, game_state, margin=0.3, speed=100.0, face=theta)
+        self._use_deep_approach = False
+        if self.attacker_caught:
             self.attacker_caught = False
-            return f"kick {self.cfg.dribble_touch_power} {0}"
+            return f"skick {self.cfg.dribble_touch_power:.1f} 0"
+        contact_p = self._contact_point(tgt, (bx, by))
+        if math.hypot(float(contact_p[0]) - rx, float(contact_p[1]) - ry) > 0.1:
+            theta = math.atan2(tgt[1] - contact_p[1], tgt[0] - contact_p[0])
+            return self._goto_point(float(contact_p[0]), float(contact_p[1]), self_pose, game_state, margin=0.1, speed=100.0, face=theta)
+        pending = self._require_catch_before_kick(self_pose, (bx, by), tgt)
+        if pending:
+            return pending
+        return f"kick {self.cfg.dribble_touch_power} {0}"
         return self.face_then_kick(self_pose, tgt, power=self.cfg.dribble_touch_power, kind="skick")
 
     # -------------------------------
