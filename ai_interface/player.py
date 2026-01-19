@@ -41,7 +41,8 @@ class Player:
              margin: float | None = None,
              theta: float | None = None,
              speed: float | None = None,
-             detour_margin: float | None = None) -> str:
+             detour_margin: float | None = None,
+             is_goalie: bool = False) -> str:
         cmd = basic_commands.goto(
             self_pose,
             x,
@@ -51,6 +52,7 @@ class Player:
             theta=theta,
             speed=self.goto_speed if speed is None else speed,
             detour_margin=self.detour_margin if detour_margin is None else detour_margin,
+            is_goalie=is_goalie
         )
         return cmd
     
@@ -123,5 +125,5 @@ class Player:
             angle_diff = min(angle_diff, 2 * math.pi - angle_diff)
         robot_to_ball_vec = np.array(ball_pose[:2]) - np.array(self_pose[:2])
         robot_to_ball_dist = np.linalg.norm(robot_to_ball_vec)
-        return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < KICKABLE_MARGIN / 2 and \
+        return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < KICKABLE_MARGIN and \
             (not check_angle or abs(angle_diff) < math.radians(5))

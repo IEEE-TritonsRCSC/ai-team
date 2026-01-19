@@ -257,7 +257,6 @@ class Goalie(Player):
         goalie_pos = (goalie_pose[0], goalie_pose[1])
         goalie_dir = math.radians(goalie_pose[2])
         goalie_pose_rad = (goalie_pose[0], goalie_pose[1], goalie_dir)
-        
         # Compute distance and has_ball if not provided
         if goalie_to_ball_dist is None:
             goalie_to_ball_dist = math.hypot(ball_pos[0] - goalie_pos[0], 
@@ -291,7 +290,8 @@ class Goalie(Player):
                 game_state,
                 margin=0.1,
                 theta=charge_heading,
-                speed=100.0
+                speed=100.0,
+                is_goalie=True
             )
             return goto_cmd if goto_cmd != "done" else "dash 0 0"
 

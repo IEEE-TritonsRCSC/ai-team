@@ -227,29 +227,36 @@ class InterceptDemoAI(SoccerAI):
         ball_speed = np.linalg.norm(ball_vel_est)
         slow_threshold = 0.2
         region = self._receiver_region(self_p0)
+        has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
         
         # Initialize random shoot angle if not set
         if self.receiver_shoot_angle == 0:
+            print("New angle")
             self.receiver_shoot_angle = math.radians(random.uniform(-30, 30))
+            print(self.receiver_shoot_angle)
         
         # Determine which goal we're defending
         side = infer_side_from_position(self_p0)
-        
         # 3) Catch the ball and shoot in a random direction
         kickable_range = PLAYER_SIZE + KICKABLE_MARGIN + BALL_SIZE
-        if dist < kickable_range:
-            # Ball is within kickable range
-            if dist < 1.2:  # Very close, try to catch
+        if dist <= 2:
+            shoot_pos = np.array([np.cos(self.receiver_shoot_angle), 
+                                  np.sin(self.receiver_shoot_angle)], dtype=float)*(kickable_range)+ball
+            if np.linalg.norm(shoot_pos-self_p0) >= 0.3:
+                return goto(np.array([self_p0[0], self_p0[1], heading], dtype=float), shoot_pos[0], shoot_pos[1], game_state, margin=0.3, theta=self.receiver_shoot_angle+np.pi, is_goalie=True) 
+            if not self.receiver_caught:  # Very close, try to catch
                 self.receiver_caught = True
                 return "catch 0"
-            # Close enough to kick, shoot in random direction
-            target_angle = heading + self.receiver_shoot_angle
-            kick_cmd = kick(np.array([self_p0[0], self_p0[1], heading], dtype=float),
-                           ball, target_angle, kick_power=80.0, dribbling=False)
-            # If kick command is not a direct kick (e.g., turn or failed), try catch
-            if kick_cmd.startswith("kick"):
+            else:
+                # harded to always kick at 80 power 
                 self.receiver_caught = False
-            return kick_cmd
+                self.receiver_shoot_angle = 0
+                return f"kick {80} {0}"
+        #     # Close enough to kick, shoot in random direction
+        # kick_cmd = kick(np.array([self_p0[0], self_p0[1], heading], dtype=float),
+        #                 ball, self.receiver_shoot_angle, kick_power=80.0, dribbling=False)
+        # # If kick command is not a direct kick (e.g., turn or failed), try catch
+
         
         # Determine if ball is a threat (heading towards our goal)
         goal_center = GOAL_L if side == "left" else GOAL_R
@@ -292,7 +299,6 @@ class InterceptDemoAI(SoccerAI):
         # Compute optimal target position using angle bisector
         goalie_pos = (float(self_p0[0]), float(self_p0[1]))
         goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
-        has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
         side = infer_side_from_position(goalie_pos)
         print('-----------------------------GOALIE ACTION-----------------------------')
         goalie_cmd = goalie_action(
