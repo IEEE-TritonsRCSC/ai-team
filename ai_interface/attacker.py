@@ -463,7 +463,8 @@ class SmartAttacker(Player):
                 backoff_p = ball_p + away * self.cfg.goalie_backoff_step
                 backoff_p[0] = clamp(backoff_p[0], FIELD_X[0] + self.cfg.boundary_buffer, FIELD_X[1] - self.cfg.boundary_buffer)
                 backoff_p[1] = clamp(backoff_p[1], FIELD_Y[0] + self.cfg.boundary_buffer, FIELD_Y[1] - self.cfg.boundary_buffer)
-                return self._goto_point(float(backoff_p[0]), float(backoff_p[1]), self_pose, game_state, margin=0.3, speed=90.0, face=(bx, by))
+                theta = math.atan2(by - self_pose[1], bx - self_pose[0])
+                return self._goto_point(float(backoff_p[0]), float(backoff_p[1]), self_pose, game_state, margin=0.3, speed=90.0, face=theta)
 
         best_score = -1e18
         best_target = targets[0]
@@ -509,7 +510,7 @@ class SmartAttacker(Player):
 
             if self.attacker_caught:
                 self.attacker_caught = False
-                return "kick 100 0"
+                return "kick 50 0"
 
             # Execute immediately (will be turn or kick)
             approach_p = np.array([bx, by], dtype=float) + self._approach_offset(tgt, (bx, by))
@@ -611,7 +612,8 @@ class SmartAttacker(Player):
         if defender_pose is not None:
             defx, defy = float(defender_pose[0]), float(defender_pose[1])
             if math.hypot(defx - bx, defy - by) < 1.5:
-                return self._goto_point(10, 0, self_pose, game_state, margin=0.1, speed=95.0, face=(bx, by))
+                theta = math.atan2(by - self_pose[1], bx - self_pose[0])
+                return self._goto_point(10, 0, self_pose, game_state, margin=0.1, speed=95.0, face=theta)
         
         # Far: chase predicted position
         if dist_to_ball > self.cfg.chase_far_dist:
@@ -619,6 +621,7 @@ class SmartAttacker(Player):
             py = by + float(v_next[1]) * self.cfg.predict_horizon
             px = clamp(px, FIELD_X[0] + 0.8, FIELD_X[1] - 0.8)
             py = clamp(py, FIELD_Y[0] + 0.8, FIELD_Y[1] - 0.8)
+            theta = math.atan2(by - self_pose[1], bx - self_pose[0])
             return self._goto_point(px, py, self_pose, game_state, margin=0.7, speed=100.0, face=(bx, by))
 
         # Close: approach from behind ball (relative to goal direction)
@@ -630,8 +633,8 @@ class SmartAttacker(Player):
             back = KICKABLE_MARGIN + 0.35
             ax = bx - float(to_goal[0] / n) * back
             ay = by - float(to_goal[1] / n) * back
-
-        return self._goto_point(ax, ay, self_pose, game_state, margin=0.1, speed=95.0, face=(bx, by))
+        theta = math.atan2(by - self_pose[1], bx - self_pose[0])
+        return self._goto_point(ax, ay, self_pose, game_state, margin=0.1, speed=95.0, face=theta)
 
     def _set_plan(self, tick: int, tx: float, ty: float, kind: str, power: float, ttl: int = 5) -> None:
         """Lock a plan for a few ticks to avoid changing targets every frame."""
