@@ -128,12 +128,12 @@ class InterceptDemoAI(SoccerAI):
             if mode in ("kick_off_r", "kick_off_l"): 
                 self._reset_state()
         # Assign shooter only on TritonBots, receiver only on the other team
-        if teamname == "TritonBots" and self.shooter_id is None:
+        if teamname != "TritonBots" and self.shooter_id is None:
             unums = sorted(int(next(iter(r.keys()))) for r in robots)
             if unums:
                 self.shooter_id = (teamname, unums[0])
                 self.shooter.set_identity(teamname, unums[0])
-        if teamname != "TritonBots" and self.receiver_id is None:
+        if teamname == "TritonBots" and self.receiver_id is None:
             unums = sorted(int(next(iter(r.keys()))) for r in robots)
             if unums:
                 self.receiver_id = (teamname, unums[0])
@@ -180,7 +180,7 @@ class InterceptDemoAI(SoccerAI):
         self.receiver.reset()
 
     def _receiver_region(self):
-        return (FIELD_X[1] - 30, FIELD_X[1], -20, 20)
+        return (FIELD_X[0], FIELD_X[0] + 45, -30, 30)
 
     def _inside_region(self, pos, region) -> bool:
         x, y = float(pos[0]), float(pos[1])
@@ -194,13 +194,15 @@ class InterceptDemoAI(SoccerAI):
             return "dash 0 0"
         ball = np.array(ball_pos[:2], dtype=float)
         if player.hasBall([*self_p0, heading], ball_pos):
-            cmd = player.shoot_at_goal(GOAL_R, [*self_p0, heading], ball, kick_power=100)
+            print('FLAG2')
+            cmd = player.shoot_at_goal(GOAL_L, [*self_p0, heading], ball, kick_power=100)
             if "kick" in cmd:
                 self.shooter_turn = False
             elif cmd == "failed":
                 print('[Warning] Shooter kick failed')
             return cmd
-        desired_theta = math.atan2(GOAL_R[1] - self_p0[1], GOAL_R[0] - self_p0[0])
+        desired_theta = math.atan2(GOAL_L[1] - self_p0[1], GOAL_L[0] - self_p0[0])
+        print('FLAG3')
         cmd = player.hybrid_capture(
             self_p0,
             heading,
@@ -219,15 +221,16 @@ class InterceptDemoAI(SoccerAI):
         ball_speed = np.linalg.norm(ball_vel_est)
         region = self._receiver_region()
         if player.shoot_angle == 0:
-            player.shoot_angle = math.radians(random.uniform(-30, 30))
+            player.shoot_angle = math.radians(random.uniform(-30, 30)) + np.pi
         if not self._inside_region(ball, region):
+            print('FLAG1')
             return "dash 0 0"
 
         if self.shooter_turn:
             ang = math.atan2(to_ball[1], to_ball[0])
             goto_cmd = player.goto(
-                GOAL_R[0] - 10,
-                GOAL_R[1],
+                GOAL_L[0] + 10,
+                GOAL_L[1],
                 [self_p0[0], self_p0[1], heading],
                 game_state,
                 theta=ang,
@@ -269,7 +272,7 @@ class InterceptDemoAI(SoccerAI):
             ball_vel_est,
             ball_pos,
             math.pi,
-            rect_bounds=(FIELD_X[1] - 30, FIELD_X[1], -20 , 20),
+            rect_bounds=(FIELD_X[0], FIELD_X[0]+30, -20 , 20),
             game_state=game_state,
         )
         return cmd
