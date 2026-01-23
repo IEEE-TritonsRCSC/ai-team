@@ -12,8 +12,6 @@ import time
 from queue import Queue, Full, Empty
 from networking.networker import TeamInfo, GameState, Networker
 from ai_interface.naive import SoccerAI
-from ai_interface.intercept_demo import InterceptDemoAI
-from ai_interface.simple_intercept_demo import SimpleInterceptDemoAI
 
 UCSD_ROBOCUP_TEAM_NAME = "TritonBots"
 
@@ -29,6 +27,7 @@ parser.add_argument("--env", choices=[
     "field-practice",  # one or both teams - camera + physical robots
     "field-tournament" # our team only - camera + physical robots
 ], default="sim-only")
+parser.add_argument("--demo", type=str, default=None, help="Run a demo: enter AI demo file name")
 parser.add_argument("--estimate", choices=["ball", "player"], dest="estimate_params", default=None,)
 
 
@@ -47,9 +46,18 @@ def main():
         soccer_ai = ParamEstimatorAI(team_infos, mode=args.estimate_params)
     else:
         team_infos = load_team_config(args.team_config)
-        # soccer_ai = SoccerAI(team_infos)
-        # soccer_ai = InterceptDemoAI(team_infos)
-        soccer_ai = SimpleInterceptDemoAI(team_infos)
+        if args.demo is None:
+            soccer_ai = SoccerAI(team_infos)
+            print("Running default SoccerAI.")
+        else:
+            demo_name = args.demo
+            try:
+                class_name = ''.join(p.capitalize() for p in demo_name.split('_')) + 'AI'
+                soccer_ai_class = getattr(__import__("ai_interface.demos." + demo_name, fromlist=[demo_name]), class_name)
+                print(f"Running demo: {demo_name}.")
+            except (ImportError, AttributeError) as e:
+                raise RuntimeError(f"Error: Could not load demo '{demo_name}'. Falling back to default SoccerAI.") from e
+            soccer_ai = soccer_ai_class(team_infos)
     networker = Networker(team_infos, args.env)
     game_state_queue: Queue[GameState] = Queue(maxsize=1)
     stop_event = threading.Event()
