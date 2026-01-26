@@ -62,13 +62,18 @@ class Player:
     def kick(self, target_angle: float,
              self_pose: List | Tuple,
              ball_pose: List | Tuple,
-             kick_power: int | None = None) -> str:
+             kick_power: int | None = None,
+             allow_dribble: bool = True,
+             game_state = None) -> str:
+        assert allow_dribble or game_state is not None, "game_state must be provided when allow_dribble is False"
         kick_cmd = basic_commands.kick(
             self_pose,
             ball_pose,
             target_angle,
             kick_power=self.kick_power if kick_power is None else kick_power,
             dribbling=self.dribbling,
+            allow_dribble=allow_dribble,
+            game_state=game_state,
         )
         if "kick" in kick_cmd:
             self.dribbling = False

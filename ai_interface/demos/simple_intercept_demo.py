@@ -44,8 +44,10 @@ class SimpleInterceptPlayer(Player):
     def kick(self, target_angle: float,
              self_pose: list | tuple,
              ball_pose: list | tuple,
-             kick_power: int | None = None,) -> str:
-        cmd = super().kick(target_angle, self_pose, ball_pose, kick_power)
+             kick_power: int | None = None,
+             allow_dribble: bool = True,
+             game_state=None) -> str:
+        cmd = super().kick(target_angle, self_pose, ball_pose, kick_power, allow_dribble=allow_dribble, game_state=game_state)
         if "kick" in cmd:
             self.decision = None
             self.decision_expiring = 0
@@ -58,7 +60,7 @@ class SimpleInterceptPlayer(Player):
         to_ball = ball - self_p0
         dist = np.linalg.norm(to_ball)
         ball_speed = np.linalg.norm(ball_vel_est)
-        far_threshold = 4.0 * (PLAYER_SIZE + BALL_SIZE)
+        far_threshold = 2.0 * (PLAYER_SIZE + BALL_SIZE)
         moving_threshold = 0.2
         offset = np.array([math.cos(theta), math.sin(theta)]) * (PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN) * 2
         target_pos = ball - offset
@@ -221,7 +223,6 @@ class SimpleInterceptDemoAI(SoccerAI):
             else:
                 self.shooter_attempt_kick_buffer = 0
             
-        print('FLAG2')
         if self.shooter_attempt_kick_buffer % 2 == 0:
             cmd = f"kick {100} {0}"
         else:
@@ -236,7 +237,7 @@ class SimpleInterceptDemoAI(SoccerAI):
 
 
     def _action_receiver(self, self_p0, heading, ball_vel_est, ball_pos, player: SimpleInterceptPlayer,
-                         game_state=None, close_threshold=10.0, slow_threshold=0.5):
+                         game_state=None, close_threshold=4.0, slow_threshold=0.2):
         ball = np.array(ball_pos[:2], dtype=float)
         to_ball = ball - self_p0
         dist = np.linalg.norm(to_ball)
@@ -245,11 +246,10 @@ class SimpleInterceptDemoAI(SoccerAI):
         
         # Generate New Shooting Angle
         if player.shoot_angle == 0:
-            player.shoot_angle = math.radians(random.uniform(-50, 50)) + np.pi
+            player.shoot_angle = math.radians(random.uniform(-50, 50))
         
         # Check if ball on right half of field
         if not self._inside_region(ball, region):
-            print('FLAG1')
             if ball_speed < 0.05:
                 self.shooter_turn = True
             return "dash 0 0"
@@ -269,7 +269,7 @@ class SimpleInterceptDemoAI(SoccerAI):
         
         # If ball not dangerous
         kick_angle = None
-        kick_pos = ball + np.array([np.cos(player.shoot_angle), np.sin(player.shoot_angle)]) * (PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN) * 2
+        kick_pos = ball - np.array([np.cos(player.shoot_angle), np.sin(player.shoot_angle)]) * (PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN/2)
         kick_angle = math.atan2(ball[1] - kick_pos[1], ball[0] - kick_pos[0])
         if dist <= close_threshold and ball_speed <= slow_threshold and self.receiver_attempt_kick_buffer >= 15:
             cmd = player.goto(
@@ -278,13 +278,16 @@ class SimpleInterceptDemoAI(SoccerAI):
                 [self_p0[0], self_p0[1], heading],
                 game_state,
                 theta=kick_angle,
-                speed=50.0,
-                margin= 0.3
+                speed=100.0,
+                margin=2.0
             )
             if cmd != "done":
                 return cmd
             else:
-                self.receiver_attempt_kick_buffer = 0
+                cmd = player.kick(player.shoot_angle, [self_p0[0], self_p0[1], heading], ball_pos, allow_dribble=False, game_state=game_state)
+                if "kick" in cmd:
+                    self.receiver_attempt_kick_buffer = 0
+                return cmd
         
         # Ball is dangerous
         print("This is ball speed:", ball_speed)
@@ -298,7 +301,7 @@ class SimpleInterceptDemoAI(SoccerAI):
                     ball_vel_est,
                     ball_pos,
                     player.shoot_angle,
-                    rect_bounds=(FIELD_X[0], FIELD_X[0]+30, -20 , 20),
+                    # rect_bounds=(FIELD_X[0], FIELD_X[0]+30, -20 , 20),
                     game_state=game_state,
                     margin = 0.3,
                 )

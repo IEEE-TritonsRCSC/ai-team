@@ -1,3 +1,4 @@
+from re import S
 import sys
 import os
 
@@ -67,7 +68,7 @@ def build_avoid_points(game_state, self_pose,
     Build avoid points for a player, skipping itself.
     """
     avoid_points = []
-    ball_pos = getattr(game_state, "ball_pos", None)
+    ball_pos = game_state.ball_pos
     if ball_pos is not None:
         avoid_points.append((ball_pos[0], ball_pos[1], ball_radius))
     for other_team, team_robots in game_state.robot_poses.items():
@@ -94,6 +95,7 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
     """
     origin = np.array(self_pose[:2], dtype=float)
     destination = np.array([x, y], dtype=float)
+    self_angle = self_pose[2]
     avoid_points = build_avoid_points(game_state, self_pose, ball_radius=0.215, player_radius=0.9)
 
     if avoid_points:
@@ -110,13 +112,15 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
         if waypoint is not None:
             print('Going to', destination, 'Detouring via', waypoint)
             destination = waypoint
+        else:
+            print('Going to', destination)
 
     distance = np.linalg.norm(destination - origin)
-    angle = np.arctan2(destination[1] - origin[1], destination[0] - origin[0]) - self_pose[2]
+    angle = np.arctan2(destination[1] - origin[1], destination[0] - origin[0]) - self_angle
     if distance < margin:
         if theta is not None:
             angle_diff = normalize_angle(theta - self_pose[2])
-            return f"turn {angle_diff}" if abs(angle_diff) > math.radians(5.0) else "done"
+            return turn(self_pose, theta) if abs(angle_diff) > math.radians(5.0) else "done"
         else:
             return "done"
     if not is_goalie:
@@ -146,25 +150,49 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling)
     
 def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
-         target_angle: float, kick_power: float = 80.0, dribbling=False, ) -> str:
+         target_angle: float, kick_power: float = 80.0, dribbling=False, allow_dribble=True, game_state=None) -> str:
     """
     Creates 'kick' or 'turn' commands to aim and kick the ball towards a specific global angle
     
     self_pose is [x, y, theta] in radians; target_angle is in radians;
+    dribbling indicates if the agent is currently dribbling the ball.
+    allow_dribble indicates if dribbling is allowed.
     
     Returns 'kick {kick_power} 0'
     """
     
     angle_diff = normalize_angle(target_angle - self_pose[2])
-    if np.abs(angle_diff) > math.radians(5.0):
-        if dribbling:
-            return f"turn {angle_diff}"
+    if allow_dribble:
+        if np.abs(angle_diff) > math.radians(5.0):
+            if dribbling:
+                return turn(self_pose, target_angle)  # "turn ang_vel" or "done"
+            else:
+                return dribble(self_pose, ball_pose) # "failed", "turn {angle_diff}" or "catch 0"
         else:
-            return dribble(self_pose, ball_pose) # "failed", "turn {angle_diff}" or "catch 0"
+            return f"kick {kick_power} {0}"
     else:
-        return f"kick {kick_power} {0}"
-        
+        target_pos = ball_pose - np.array([math.cos(target_angle), math.sin(target_angle)]) * (PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN * 0.5)  
+        print('[Kick] Target position for kicking:', target_pos)
+        cmd = goto(self_pose, target_pos[0], target_pos[1], game_state=game_state, margin=0.1, speed=80.0, theta=target_angle)
+        if "done" in cmd:
+            return f"kick {kick_power} {0}"
+        else:
+            return cmd
 
+def turn(self_pose: np.ndarray | Tuple | List, theta: float) -> str:
+    """
+    Create a `turn` command to face toward a target position.
+    This function is needed because the turn command turns in angular velocity
+    self_pose is [x, y, theta] in radians; target is [x, y].
+    Returns `turn ang_vel`.
+    """
+    angle_diff = normalize_angle(theta - self_pose[2])
+    if np.abs(angle_diff) < math.radians(MAX_TURN_SPEED) * dt:
+        return f"turn {angle_diff}"
+    elif np.abs(angle_diff) < math.radians(5.0):
+        return "done"
+    else:
+        return f"turn {np.sign(angle_diff) * math.radians(MAX_TURN_SPEED)}"  # max angular velocity
 
 def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
                   goal: np.ndarray | Tuple | List, kick_power: float = 80.0, dribbling=False) -> str:
@@ -198,6 +226,6 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     ball_dir = normalize_angle(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0]))
     angle_diff = normalize_angle(ball_dir - self_pose[2])
     if abs(angle_diff) > angle_tolerance:
-        return f"turn {angle_diff}"
+        return turn(self_pose, ball_dir)
 
     return f"catch 0"
