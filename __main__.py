@@ -27,7 +27,7 @@ parser.add_argument("--env", choices=[
     "field-practice",  # one or both teams - camera + physical robots
     "field-tournament" # our team only - camera + physical robots
 ], default="sim-only")
-parser.add_argument("--demo", type=str, default=None, help="Run a demo: enter AI demo file path")
+parser.add_argument("--demo", type=str, default=None, help="Run a demo: enter AI demo file name without .py extension")
 parser.add_argument("--estimate", choices=["ball", "player"], dest="estimate_params", default=None,)
 
 
