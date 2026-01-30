@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from ai_interface.utils import basic_commands
 from ai_interface.constants.player_constants import *
@@ -58,6 +58,67 @@ class Player:
     
     def reset(self) -> None:
         self.dribbling = False
+
+    def estimate_velocity(self,
+                          current_pos: Tuple[float, float],
+                          position_history: List[np.ndarray],
+                          dt: float = 0.1) -> np.ndarray:
+        if not position_history:
+            return np.zeros(2)
+        try:
+            last_pos = position_history[-1]
+            cur = np.array(current_pos, dtype=float)
+            if dt <= 0:
+                return np.zeros(2)
+            return (cur - last_pos) / dt
+        except Exception:
+            return np.zeros(2)
+
+    def find_nearest_teammate(self,
+                              self_pos: Tuple[float, float],
+                              game_state) -> Optional[Tuple[float, float]]:
+        """
+        Find nearest teammate position (x, y).
+
+        Robust to missing/partial `game_state` and to unexpected robot pose structures.
+        Excludes this player (`self.unum`) when possible.
+        """
+        if game_state is None:
+            return None
+        robot_poses = getattr(game_state, "robot_poses", None)
+        if not isinstance(robot_poses, dict):
+            return None
+
+        team_robots = robot_poses.get(self.teamname)
+        if not isinstance(team_robots, list):
+            return None
+
+        origin = np.array(self_pos, dtype=float)
+        best_pos: Optional[Tuple[float, float]] = None
+        best_dist = float("inf")
+
+        for robot in team_robots:
+            if not isinstance(robot, dict) or not robot:
+                continue
+            try:
+                unum = int(next(iter(robot.keys())))
+            except Exception:
+                continue
+            if unum == self.unum:
+                continue
+            pose = robot.get(unum)
+            if pose is None or len(pose) < 2:
+                continue
+            try:
+                pos = np.array([float(pose[0]), float(pose[1])], dtype=float)
+            except Exception:
+                continue
+            d = float(np.linalg.norm(pos - origin))
+            if d < best_dist:
+                best_dist = d
+                best_pos = (float(pose[0]), float(pose[1]))
+
+        return best_pos
 
     def kick(self, target_angle: float,
              self_pose: List | Tuple,

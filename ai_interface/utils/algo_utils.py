@@ -1,17 +1,35 @@
 import sys
 import os
-import time
-from turtle import distance
-
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
+
 import numpy as np
+import math
 from scipy.optimize import differential_evolution
+from typing import Tuple
 from constants.player_constants import KICKABLE_MARGIN
-from constants.field_constants import GOAL_L, GOAL_R
+from constants.field_constants import GOAL_L, GOAL_R, GOAL_L_Y_TOP, GOAL_L_Y_BOTTOM, GOAL_R_Y_TOP, GOAL_R_Y_BOTTOM, MAX_KEEPER_OUT
 
 def normalize_angle(angle: float) -> float:
     """Normalize angle to be within [-pi, pi] radians."""
     return (angle + np.pi) % (2 * np.pi) - np.pi
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    """Clamp a value between bounds."""
+    return max(lo, min(hi, v))
+
+def get_side(position: Tuple[float, ...]) -> str:
+    """Get the side of the field from a position. position is (x, y) or (x, y, theta)."""
+    if position[0] < 0:
+        return "left"
+    return "right"
+
+def get_goal_params(side: str) -> Tuple[float, float, float]:
+    """Get goal parameters based on the side of the field."""
+    if side == "left":
+        return GOAL_L_Y_TOP, GOAL_L_Y_BOTTOM, GOAL_L
+    else:
+        return GOAL_R_Y_TOP, GOAL_R_Y_BOTTOM, GOAL_R
+
 
 def calculate_shooting_pose(ball_pose: np.ndarray, target: np.ndarray) -> np.ndarray:
     ball_pose, target = np.array(ball_pose), np.array(target)
@@ -59,3 +77,84 @@ def estimate_ball_velocity(positions, alpha):
         v_next = (alpha**(k-1)) * v0_est
     
     return v_next.reshape(-1)
+
+def compute_bisector_target(ball_pos: Tuple[float, float], 
+                            goalie_pos: Tuple[float, float],
+                            side: str = None) -> Tuple[float, float]:
+    """
+    Compute desired target position for goalkeeper using angle-bisector positioning.
+    
+    Parameters:
+    - ball_pos: (x, y) position of the ball
+    - goalie_pos: (x, y) position of the goalie (used to infer side if not provided)
+    - side: 'left' if defending left goal, 'right' if defending right goal.
+        
+    Returns:
+    - (x, y) target position for the goalkeeper
+    """
+    if side is None:
+        side = get_side(goalie_pos)
+    
+    bx, by = ball_pos
+    post_top, post_bottom, goal_center = get_goal_params(side)
+    goal_x = goal_center[0]
+
+    vTx, vTy = post_top[0] - bx, post_top[1] - by
+    vBx, vBy = post_bottom[0] - bx, post_bottom[1] - by
+
+    normT = math.hypot(vTx, vTy)
+    normB = math.hypot(vBx, vBy)
+
+    if normT < 1e-6 or normB < 1e-6:
+        dir_x, dir_y = goal_center[0] - bx, goal_center[1] - by
+        dir_norm = math.hypot(dir_x, dir_y)
+        if dir_norm < 1e-6:
+            return goal_center
+        dir_x /= dir_norm
+        dir_y /= dir_norm
+    else:
+        uTx, uTy = vTx / normT, vTy / normT
+        uBx, uBy = vBx / normB, vBy / normB
+
+        vb_x, vb_y = uTx + uBx, uTy + uBy
+        vb_norm = math.hypot(vb_x, vb_y)
+        if vb_norm < 1e-6:
+            dir_x, dir_y = goal_center[0] - bx, goal_center[1] - by
+            dir_norm = math.hypot(dir_x, dir_y)
+            if dir_norm < 1e-6:
+                return goal_center
+            dir_x /= dir_norm
+            dir_y /= dir_norm
+        else:
+            dir_x, dir_y = vb_x / vb_norm, vb_y / vb_norm
+    
+    if abs(dir_x) < 1e-6:
+        intersect_y = goal_center[1]
+        intersect_x = goal_x
+    else:
+        t_intersect = (goal_x - bx) / dir_x
+        intersect_y = by + t_intersect * dir_y
+        intersect_x = goal_x
+    
+    ball_to_goal_dist = math.hypot(goal_x - bx, goal_center[1] - by)
+    #step_out_factor = min(1.0, 0.5 + ((abs(ball_to_goal_dist - 30) / 15)))  # Scale based on distance
+    step_out_factor = min(1.0, ball_to_goal_dist / 15)
+    step_out_dist = MAX_KEEPER_OUT * step_out_factor
+    
+    step_out_x = intersect_x - step_out_dist * dir_x
+    step_out_y = intersect_y - step_out_dist * dir_y
+    
+    if goal_x < 0:
+        min_x = goal_x
+        max_x = goal_x + MAX_KEEPER_OUT
+    else:
+        min_x = goal_x - MAX_KEEPER_OUT
+        max_x = goal_x
+    kx = clamp(step_out_x, min_x, max_x)
+    
+    post_y_top = max(post_top[1], post_bottom[1])
+    post_y_bottom = min(post_top[1], post_bottom[1])
+    margin = 2.0
+    ky = clamp(step_out_y, post_y_bottom - margin, post_y_top + margin)
+
+    return (kx, ky)
