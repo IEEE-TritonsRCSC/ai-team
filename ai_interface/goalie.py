@@ -128,7 +128,7 @@ class Goalie(Player):
         if has_ball is None:
             has_ball = super().hasBall(goalie_pose_rad, ball_pos, check_angle=False)
 
-        side = get_side(goalie_pos_2d)
+        side = self.side if self.side is not None else get_side(goalie_pos_2d)
 
         # ========== PRIORITY 1: Ball Possession and Clearing ==========
         if has_ball:

@@ -60,17 +60,16 @@ class Player:
         self.dribbling = False
 
     def estimate_velocity(self,
-                          current_pos: Tuple[float, float],
                           position_history: List[np.ndarray],
                           dt: float = 0.1) -> np.ndarray:
-        if not position_history:
+        if len(position_history) < 2:
             return np.zeros(2)
         try:
+            prev_pos = position_history[-2]
             last_pos = position_history[-1]
-            cur = np.array(current_pos, dtype=float)
             if dt <= 0:
                 return np.zeros(2)
-            return (cur - last_pos) / dt
+            return (last_pos - prev_pos) / dt
         except Exception:
             return np.zeros(2)
 

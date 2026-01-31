@@ -13,9 +13,9 @@ from ai_interface.naive import SoccerAI
 from ai_interface.attacker import SmartAttacker, AttackerConfig
 from ai_interface.player import Player
 from ai_interface.utils.intercept import earliest_intercept_control
-from ai_interface.utils.algo_utils import estimate_ball_velocity, normalize_angle
+from ai_interface.utils.algo_utils import estimate_ball_velocity, get_side
 from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, kick, dribble
-from ai_interface.goalie import goalie_action, infer_side_from_position, compute_bisector_target
+from ai_interface.goalie import Goalie
 from constants.player_constants import *
 from constants.field_constants import *
 
@@ -45,6 +45,21 @@ class InterceptDemoAI(SoccerAI):
         self._attacker_player = None
         self._smart_attacker = None
         self._attacker_cfg = AttackerConfig()
+        if not team_info or len(team_info) < 2:
+            raise ValueError("team_info must contain at least two team entries")
+        goalie_teamname = getattr(team_info[1], "name", None)
+        goalie_unum = getattr(team_info[1], "goalie_id", None)
+        if goalie_teamname is None or goalie_unum is None:
+            raise ValueError("team_info[1] must provide name and goalie_id")
+        if goalie_teamname not in self.side:
+            raise ValueError(f"Unknown team name in team_info[1]: {goalie_teamname}")
+        goalie_side = self.side[goalie_teamname]
+        self._goalie = Goalie(
+            teamname=goalie_teamname,
+            unum=int(goalie_unum),
+            side=goalie_side,
+            charge_distance=10,
+        )
 
     def decide_action(self, game_state, teamname: str):
         actions = []
@@ -77,8 +92,8 @@ class InterceptDemoAI(SoccerAI):
 
         pose_map = {int(next(iter(r.keys()))): r[int(next(iter(r.keys())))] for r in robots}
         receiver_pos = None
-        if self.receiver_id is not None and self.receiver_id in pose_map:
-            rp = pose_map[self.receiver_id]
+        if self.receiver_id is not None and self.receiver_id[1] in pose_map:
+            rp = pose_map[self.receiver_id[1]]
             receiver_pos = np.array([rp[0], rp[1]], dtype=float)
         for robot in robots:
             unum = int(next(iter(robot.keys())))
@@ -113,6 +128,8 @@ class InterceptDemoAI(SoccerAI):
         self.decision_count = 0
         self._attacker_player = None
         self._smart_attacker = None
+        self._goalie.ball_history = []
+        self._goalie.goalie_history = []
 
     def _receiver_region(self, self_p0):
         return (self_p0[0], FIELD_X[1], -20, 20)
@@ -236,7 +253,7 @@ class InterceptDemoAI(SoccerAI):
             print(self.receiver_shoot_angle)
         
         # Determine which goal we're defending
-        side = infer_side_from_position(self_p0)
+        side = get_side(self_p0)
         # 3) Catch the ball and shoot in a random direction
         kickable_range = PLAYER_SIZE + KICKABLE_MARGIN + BALL_SIZE
         if dist <= 2:
@@ -299,15 +316,12 @@ class InterceptDemoAI(SoccerAI):
         # Compute optimal target position using angle bisector
         goalie_pos = (float(self_p0[0]), float(self_p0[1]))
         goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
-        side = infer_side_from_position(goalie_pos)
         print('-----------------------------GOALIE ACTION-----------------------------')
-        goalie_cmd = goalie_action(
+        goalie_cmd = self._goalie.action(
             ball_pos=(float(ball[0]), float(ball[1])),
             goalie_pose=goalie_pose,
             has_ball=has_ball,
             goalie_to_ball_dist=dist,
-            side=side,
-            charge_distance=10,
             game_state=game_state
         )
         return goalie_cmd
