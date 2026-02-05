@@ -1,0 +1,166 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical, Normal
+
+# -------------------------
+# Hyperparameters
+# -------------------------
+GAMMA = 0.99
+LR = 3e-4
+EPS_CLIP = 0.2
+K_EPOCHS = 4
+HIGH_LEVEL_ACTIONS = 3  # e.g., GoToBall, Shoot, Reposition
+LOW_LEVEL_DIM = 4       # [v_x, v_y, omega, kick_power]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# -------------------------
+# Actor-Critic Network
+# -------------------------
+class HierarchicalActorCritic(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        # Shared Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(obs_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
+        
+        # High-level discrete policy head
+        self.high_policy = nn.Linear(128, HIGH_LEVEL_ACTIONS)
+        
+        # Low-level continuous policy head (mean + log_std)
+        self.low_mean = nn.Linear(128, LOW_LEVEL_DIM)
+        self.low_log_std = nn.Parameter(torch.zeros(LOW_LEVEL_DIM))
+        
+        # Critic head
+        self.value_head = nn.Linear(128, 1)
+    
+    def forward(self, x):
+        x = self.encoder(x)
+        # High-level policy logits
+        high_logits = self.high_policy(x)
+        # Low-level policy
+        low_mean = self.low_mean(x)
+        low_std = torch.exp(self.low_log_std)
+        # Value
+        value = self.value_head(x)
+        return high_logits, low_mean, low_std, value
+
+
+# -------------------------
+# PPO Agent
+# -------------------------
+class PPOAgent:
+    def __init__(self, obs_dim):
+        self.model = HierarchicalActorCritic(obs_dim).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=LR)
+        self.memory = []
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(device)
+        high_logits, low_mean, low_std, value = self.model(state)
+        
+        # Discrete high-level
+        high_dist = Categorical(logits=high_logits)
+        high_action = high_dist.sample()
+        high_logprob = high_dist.log_prob(high_action)
+        
+        # Continuous low-level
+        low_dist = Normal(low_mean, low_std)
+        low_action = low_dist.sample()
+        low_logprob = low_dist.log_prob(low_action).sum()
+        
+        # Store in memory
+        self.memory.append({
+            "state": state.detach(),
+            "high_action": high_action.detach(),
+            "low_action": low_action.detach(),
+            "high_logprob": high_logprob.detach(),
+            "low_logprob": low_logprob.detach(),
+            "value": value.detach()
+        })
+        
+        return {"high_level": high_action.item(),
+                "low_level": low_action.detach().cpu().numpy()}
+
+    def compute_advantages(self, rewards, masks, values):
+        advantages = []
+        gae = 0
+        values = values + [0]  # bootstrap
+        for i in reversed(range(len(rewards))):
+            delta = rewards[i] + GAMMA * values[i+1] * masks[i] - values[i]
+            gae = delta + GAMMA * 0.95 * masks[i] * gae
+            advantages.insert(0, gae)
+        return advantages
+
+    def update(self, rewards, masks):
+        # Prepare memory tensors (detach from computation graph)
+        states = torch.stack([m['state'] for m in self.memory]).to(device)
+        high_actions = torch.stack([m['high_action'] for m in self.memory]).to(device)
+        low_actions = torch.stack([m['low_action'] for m in self.memory]).to(device)
+        old_high_logprobs = torch.stack([m['high_logprob'] for m in self.memory]).to(device)
+        old_low_logprobs = torch.stack([m['low_logprob'] for m in self.memory]).to(device)
+        old_values = torch.stack([m['value'] for m in self.memory]).squeeze().to(device)
+        
+        # Compute advantages
+        advantages = torch.FloatTensor(self.compute_advantages(rewards, masks, old_values.detach().cpu().tolist())).to(device)
+        returns = advantages + old_values
+
+        # PPO update
+        for epoch in range(K_EPOCHS):
+            # Re-evaluate actions and values (creates fresh computational graph)
+            high_logits, low_mean, low_std, values = self.model(states)
+            
+            # High-level policy
+            high_dist = Categorical(logits=high_logits)
+            high_logprobs = high_dist.log_prob(high_actions)
+            high_ratio = torch.exp(high_logprobs - old_high_logprobs)
+            
+            # Low-level policy
+            low_dist = Normal(low_mean, low_std)
+            low_logprobs = low_dist.log_prob(low_actions).sum(dim=1)
+            low_ratio = torch.exp(low_logprobs - old_low_logprobs)
+            
+            # Clipped surrogate objectives
+            high_surr1 = high_ratio * advantages
+            high_surr2 = torch.clamp(high_ratio, 1 - EPS_CLIP, 1 + EPS_CLIP) * advantages
+            high_surrogate = torch.min(high_surr1, high_surr2)
+            
+            low_surr1 = low_ratio * advantages
+            low_surr2 = torch.clamp(low_ratio, 1 - EPS_CLIP, 1 + EPS_CLIP) * advantages
+            low_surrogate = torch.min(low_surr1, low_surr2)
+            
+            # Combined policy loss
+            policy_loss = -(high_surrogate + low_surrogate).mean()
+            
+            # Value loss
+            value_loss = (returns - values.squeeze()).pow(2).mean()
+            
+            # Total loss
+            total_loss = policy_loss + 0.5 * value_loss
+            
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            self.optimizer.step()
+        
+        # Clear memory
+        self.memory = []
+
+    def save(self, filepath: str):
+        """Save model checkpoint to filepath."""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, filepath)
+
+    def load(self, filepath: str):
+        """Load model checkpoint from filepath."""
+        checkpoint = torch.load(filepath, map_location=device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.model.eval()

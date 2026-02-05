@@ -243,6 +243,11 @@ class Serializer:
                 action = self._convert_command_for_simulator(action, 2)
             elif action.startswith("kick "):    # Convert rad to degrees for simulator
                 action = self._convert_command_for_simulator(action, 2)
+            elif action.startswith("skick "):
+                # Convert kick direction from radians to degrees
+                action = self._convert_command_for_simulator(action, 2)
+                # Remove the 's' prefix for simulator
+                action = action.replace("skick", "kick")
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages

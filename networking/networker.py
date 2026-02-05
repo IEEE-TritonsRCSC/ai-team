@@ -78,6 +78,11 @@ class Networker:
             messages = self.serializer.robot_serialize(output)
             self.commander.send_to_robots(team_name, messages)
 
+    def reset_sim(self):
+        """Reset the simulator to initial state."""
+        if hasattr(self.commander, 'reset_sim'):
+            self.commander.reset_sim()
+
     def shutdown(self):
         """Cleanly shutdown all networking connections."""
         if self.environment in ["sim-only", "sim-mixed"]:

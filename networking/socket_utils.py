@@ -291,6 +291,31 @@ class Commander:
         """
         sock, addr = self.socks[teamname], self.addrs[teamname]
         sock.sendto(command, addr)
+        print(command, addr)
+
+    def reset_sim(self):
+        """Reset simulator by moving players to initial positions."""
+        if not hasattr(self, 'sim_clients'):
+            return
+        
+        # Reset each client to initial position instead of full disconnect/reconnect
+        for team_info, side in zip(self.team_infos, ["left", "right"]):
+            team_clients = self.sim_clients[team_info.name]
+            for i, client in enumerate(team_clients):
+                if client:
+                    # Get new initial pose
+                    init_pose = client.get_init_pose(i == 0, side)
+                    # Move to initial position
+                    move_args = f"{init_pose[0]} {init_pose[1]}".encode()
+                    turn_args = f"{init_pose[2]}".encode()
+                    
+                    try:
+                        client.send_command(b"(move %b)\0" % move_args)
+                        time.sleep(0.05)
+                        client.send_command(b"(turn %b)\0" % turn_args)
+                    except Exception:
+                        # If command fails, continue with other clients
+                        pass
 
     def disconnect_from_sim(self):
         """Disconnect all simulator clients."""

@@ -1,0 +1,12 @@
+{
+  "trainer_type": "hier_ppo",
+  "team_config": "team_config.json",
+  "env_mode": "sim-only",
+  "team_name": "TritonBots",
+  "episodes": 1000,
+  "max_steps": 200,
+  "obs_dim": 10,
+  "save_path": "models/hier_ppo_policy.pth",
+  "save_interval": 100,
+  "load_model": null
+}
