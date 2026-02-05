@@ -145,8 +145,8 @@ class HierarchicalPPOTrainer(BaseTrainer):
         if len(team1_info) != 3 or len(team2_info) != 3:
             raise ValueError("Each team configuration must have name, n_players, and goalie_id.")
         
-        # TeamInfo only takes name and n_players, skip the goalie_id (third element)
-        return [TeamInfo(team1_info[0], team1_info[1]), TeamInfo(team2_info[0], team2_info[1])]
+        # TeamInfo requires name, n_players, and goalie_id
+        return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
     
     def _get_checkpoint_path(self, base_path: str, episode: int) -> Path:
         """Generate checkpoint path with episode number."""
