@@ -1,6 +1,7 @@
 import typing as _typing
 import gymnasium as gym
 from stable_baselines3 import PPO
+import torch
 
 from ai_interface.algorithms.base import AlgorithmBase
 
@@ -35,6 +36,11 @@ class AI_Trainer:
         self._buffer = []  # list of (state, action, reward, next_state, done)
 
         params = model_params or {}
+        # Determine device and add to params if not explicitly set
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        if "device" not in params:
+            params = dict(params)
+            params["device"] = device_str
         # default to SB3 PPO if no class provided
         if model_class is None:
             model_class = PPO

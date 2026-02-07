@@ -5,6 +5,7 @@ This trainer handles hierarchical PPO training using the custom hier_ppo algorit
 with the SoccerEnv environment that supports hierarchical actions.
 """
 import gymnasium as gym
+import torch
 from typing import Dict, Any
 from pathlib import Path
 
@@ -44,7 +45,17 @@ class HierarchicalPPOTrainer(BaseTrainer):
     
     def setup_model(self, env: gym.Env):
         """Setup the hierarchical PPO agent."""
+        # Determine device (CPU/CUDA) and inform the agent if necessary
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.logger.info(f"Using device: {device}")
+
         self.agent = PPOAgent(obs_dim=self.config.get("obs_dim", 10))
+        # If the agent exposes a model, move it to the chosen device
+        try:
+            if hasattr(self.agent, "model") and self.agent.model is not None:
+                self.agent.model.to(device)
+        except Exception:
+            pass
         
         # Load pre-trained model if specified
         if self.config.get("load_model"):

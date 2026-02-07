@@ -6,6 +6,7 @@ This trainer wraps the existing SB3 trainer with the new base trainer interface.
 import gymnasium as gym
 from typing import Dict, Any, Optional
 from pathlib import Path
+import torch
 
 from .base_trainer import BaseTrainer
 from ai_interface.envs.sim_env import SimulatorEnv
@@ -42,6 +43,12 @@ class SB3PPOTrainer(BaseTrainer):
         """Setup the SB3 PPO model."""
         model_params = self.config.get("model_params", {})
         model_class = self.config.get("model_class", PPO)
+        # Determine device for the model and inject into params if not provided
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        self.logger.info(f"Using device for model: {device_str}")
+        if "device" not in model_params:
+            model_params = dict(model_params)
+            model_params["device"] = device_str
         
         # Determine if it's a custom algorithm or SB3
         try:
