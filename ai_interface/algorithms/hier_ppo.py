@@ -74,6 +74,21 @@ class PPOAgent:
         low_dist = Normal(low_mean, low_std)
         low_action = low_dist.sample()
         low_logprob = low_dist.log_prob(low_action).sum()
+
+        # If the high-level action is Shoot (1), force kick angle to 0.
+        # The simulator derives kick angle from arctan2(v_y, v_x), so
+        # we ensure v_y == 0 and v_x is positive so the angle = 0.
+        if int(high_action.item()) == 1:
+            # work on a copy to avoid in-place issues
+            low_action = low_action.clone()
+            # set lateral component to zero (v_y)
+            if low_action.numel() >= 2:
+                low_action[1] = 0.0
+            # ensure forward component (v_x) is positive
+            if low_action.numel() >= 1:
+                low_action[0] = torch.abs(low_action[0]) + 1e-6
+            # recompute logprob for the modified low_action
+            low_logprob = low_dist.log_prob(low_action).sum()
         
         # Store in memory
         self.memory.append({
