@@ -79,9 +79,35 @@ class Networker:
             self.commander.send_to_robots(team_name, messages)
 
     def reset_sim(self):
-        """Reset the simulator to initial state."""
-        if hasattr(self.commander, 'reset_sim'):
-            self.commander.reset_sim()
+        """Reset the simulator: move all players to initial poses, reset ball, restart play."""
+        import time
+
+        # The Listener (game_watcher) holds the monitor socket which has authority
+        # to move any object via (move <obj> x y theta).
+        monitor_sock = getattr(self.game_watcher, 'sock', None)
+        monitor_addr = getattr(self.game_watcher, 'addr', None)
+        if monitor_sock is None or monitor_addr is None:
+            return
+
+        # 1. Move every player back to its initial pose
+        for obj_name, pose in self.commander.desired_init_poses:
+            cmd = f"(move {obj_name} {pose[0]} {pose[1]} {pose[2]})\0".encode()
+            try:
+                monitor_sock.sendto(cmd, monitor_addr)
+                monitor_sock.recvfrom(16)  # consume (ok move)
+            except Exception:
+                pass
+            time.sleep(0.02)
+
+        # 2. Reset the ball to centre
+        try:
+            monitor_sock.sendto(b"(move (ball) 0 0)\0", monitor_addr)
+            monitor_sock.recvfrom(16)
+        except Exception:
+            pass
+
+        # 3. Restart play so players can act immediately
+        self.game_watcher.restart_game()
 
     def shutdown(self):
         """Cleanly shutdown all networking connections."""

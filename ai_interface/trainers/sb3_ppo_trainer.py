@@ -18,11 +18,12 @@ from stable_baselines3 import PPO
 class SB3PPOTrainer(BaseTrainer):
     """Trainer for Stable Baselines3 PPO algorithm."""
     
-    def __init__(self, config: Dict[str, Any], log_dir: str = None):
+    def __init__(self, config: Dict[str, Any], log_dir: str = None, device=None):
         super().__init__(config, log_dir)
         self.networker = None
         self.env = None
         self.model = None
+        self.device = device
     
     def setup_environment(self) -> gym.Env:
         """Setup the simulator environment."""
@@ -43,12 +44,10 @@ class SB3PPOTrainer(BaseTrainer):
         """Setup the SB3 PPO model."""
         model_params = self.config.get("model_params", {})
         model_class = self.config.get("model_class", PPO)
-        # Determine device for the model and inject into params if not provided
-        device_str = "cuda" if torch.cuda.is_available() else "cpu"
-        self.logger.info(f"Using device for model: {device_str}")
+        self.logger.info(f"Using device for model: {str(self.device)}")
         if "device" not in model_params:
             model_params = dict(model_params)
-            model_params["device"] = device_str
+            model_params["device"] = str(self.device)
         
         # Determine if it's a custom algorithm or SB3
         try:

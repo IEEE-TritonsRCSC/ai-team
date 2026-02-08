@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Any
 
+import torch
+
 from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer
 
 
@@ -72,7 +74,15 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> BaseTrainer:
     if trainer_type not in trainers:
         raise ValueError(f"Unknown trainer type: {trainer_type}. Available: {list(trainers.keys())}")
     
-    return trainers[trainer_type](config)
+    # Determine device and pass to trainer so models/data can be placed on CUDA when available
+    device = torch.device("cpu")
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+
+    return trainers[trainer_type](config, device=device)
 
 
 def main():
