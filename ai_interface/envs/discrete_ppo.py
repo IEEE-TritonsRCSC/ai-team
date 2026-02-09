@@ -62,7 +62,10 @@ class SimplifiedSoccerEnv(gym.Env):
         self.prev_robot_pos = None
         self.prev_ball_to_goal_dist = None
         
+        # Termination flags
         self._out_of_bounds = False
+        self._goal_scored = False
+        self._ball_out_of_bounds = False
         
         # Field dimensions
         self.field_length = 90.0
@@ -168,6 +171,8 @@ class SimplifiedSoccerEnv(gym.Env):
         self.prev_robot_pos = None
         self.prev_ball_to_goal_dist = None
         self._out_of_bounds = False
+        self._goal_scored = False
+        self._ball_out_of_bounds = False
         self.ball_history = []
         
         return np.array(obs, dtype=np.float32)
@@ -196,12 +201,32 @@ class SimplifiedSoccerEnv(gym.Env):
             game_state = self.networker.get_game_state()
         
         obs = self._game_state_to_obs(game_state)
+        
+        # Reset termination flags before computing reward
+        self._out_of_bounds = False
+        self._goal_scored = False
+        self._ball_out_of_bounds = False
+        
         reward = self._compute_reward(game_state, action)
         
         self.current_step += 1
-        done = (self.current_step >= self.max_steps) or self._out_of_bounds
         
-        info = {"action": action}
+        # Check all termination conditions
+        done = (
+            self.current_step >= self.max_steps or 
+            self._out_of_bounds or 
+            self._goal_scored or
+            self._ball_out_of_bounds
+        )
+        
+        # Provide info about why episode ended
+        info = {
+            "action": action,
+            "goal_scored": self._goal_scored,
+            "robot_out_of_bounds": self._out_of_bounds,
+            "ball_out_of_bounds": self._ball_out_of_bounds,
+            "max_steps_reached": self.current_step >= self.max_steps
+        }
         
         return obs, reward, done, info
     
@@ -466,9 +491,10 @@ class SimplifiedSoccerEnv(gym.Env):
                 ball_goal_change = self.prev_ball_to_goal_dist - ball_to_goal_dist
                 total_reward += ball_goal_change * 0.5
             
-            # GOAL scored!
+            # GOAL scored! (Episode ends)
             if ball_x >= self.goal_x and abs(ball_y) < 7.32 / 2:
                 total_reward += 20.0
+                self._goal_scored = True
             
             # Massive kick rewards
             if self.prev_ball_pos is not None:
@@ -497,6 +523,23 @@ class SimplifiedSoccerEnv(gym.Env):
                     total_reward += 0.2
             
             total_reward += 0.05  # Alive bonus
+            
+            # Check robot out of bounds (episode ends with penalty)
+            half_length = self.field_length / 2  # 45
+            half_width = self.field_width / 2    # 30
+            
+            if abs(robot_x) > half_length or abs(robot_y) > half_width:
+                total_reward -= 1.0  # Penalty for going out
+                self._out_of_bounds = True
+            
+            # Check ball out of bounds (episode ends with penalty)
+            # Ball out on sides or back, but NOT through the goal
+            ball_out_sides = abs(ball_y) > half_width
+            ball_out_back = ball_x < -half_length
+            
+            if ball_out_sides or ball_out_back:
+                total_reward -= 0.5  # Smaller penalty (you might have kicked it out)
+                self._ball_out_of_bounds = True
             
             # Update tracking
             self.prev_ball_dist = ball_dist
