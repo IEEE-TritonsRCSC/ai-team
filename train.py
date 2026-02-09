@@ -5,6 +5,7 @@ Unified Training Script
 This script provides a unified interface for training different RL algorithms
 with various configurations. It supports:
 - Hierarchical PPO
+- Discrete PPO
 - Stable Baselines3 PPO
 - Other custom algorithms (extensible)
 
@@ -22,7 +23,7 @@ from typing import Dict, Any
 
 import torch
 
-from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer
+from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer, DiscretePPOTrainer
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -49,6 +50,16 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "save_interval": args.save_interval,
             "load_model": args.load_model
         }
+    elif trainer_type == "discrete_ppo":
+        return {
+            **base_config,
+            "episodes": args.episodes,
+            "max_steps": args.max_steps,
+            "obs_dim": args.obs_dim,
+            "save_path": args.save_path or "models/discrete_ppo_policy.pth",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model
+        }
     elif trainer_type == "sb3_ppo":
         return {
             **base_config,
@@ -67,6 +78,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> BaseTrainer:
     """Create and return the appropriate trainer instance."""
     trainers = {
         "hier_ppo": HierarchicalPPOTrainer,
+        "discrete_ppo": DiscretePPOTrainer,
         "sb3_ppo": SB3PPOTrainer,
         # Add more trainers here as they are implemented
     }
@@ -101,7 +113,7 @@ Examples:
     # Configuration options
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
-    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "sb3_ppo"],
+    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "discrete_ppo", "sb3_ppo"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
