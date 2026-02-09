@@ -6,5 +6,6 @@ This module contains all Gym environment implementations for the AI team.
 
 from .sim_env import SimulatorEnv
 from .ppo_env import SoccerEnv
+from .curriculum_ppo import CurriculumSoccerEnv
 
-__all__ = ["SimulatorEnv", "SoccerEnv"]
+__all__ = ["SimulatorEnv", "SoccerEnv", "CurriculumSoccerEnv"]

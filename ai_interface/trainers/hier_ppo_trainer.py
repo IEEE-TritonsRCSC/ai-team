@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .base_trainer import BaseTrainer
 from ai_interface.envs.ppo_env import SoccerEnv
+from ai_interface.envs.curriculum_ppo import CurriculumSoccerEnv
 from ai_interface.algorithms.hier_ppo import PPOAgent
 from networking.networker import Networker, TeamInfo
 
@@ -35,7 +36,7 @@ class HierarchicalPPOTrainer(BaseTrainer):
         self.networker = Networker(team_infos, self.config.get("env_mode", "sim-only"))
         
         # Create environment
-        self.env = SoccerEnv(
+        self.env = CurriculumSoccerEnv(
             networker=self.networker,
             team_name=team_name,
             obs_dim=self.config.get("obs_dim", 18)  # Updated to 18 for new obs space
