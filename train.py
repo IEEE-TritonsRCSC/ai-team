@@ -23,7 +23,7 @@ from typing import Dict, Any
 
 import torch
 
-from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer, DiscretePPOTrainer
+from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer, DiscretePPOTrainer, MAPPOTrainer
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -60,6 +60,17 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "save_interval": args.save_interval,
             "load_model": args.load_model
         }
+    elif trainer_type == "mappo":
+        return {
+            **base_config,
+            "episodes": args.episodes,
+            "max_steps": args.max_steps,
+            "obs_dim": args.obs_dim,
+            "num_agents": getattr(args, "num_agents", 3),
+            "save_path": args.save_path or "models/mappo_team.pth",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model
+        }
     elif trainer_type == "sb3_ppo":
         return {
             **base_config,
@@ -79,8 +90,8 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> BaseTrainer:
     trainers = {
         "hier_ppo": HierarchicalPPOTrainer,
         "discrete_ppo": DiscretePPOTrainer,
+        "mappo": MAPPOTrainer,
         "sb3_ppo": SB3PPOTrainer,
-        # Add more trainers here as they are implemented
     }
     
     if trainer_type not in trainers:
@@ -104,16 +115,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python train_unified.py --config configs/hier_ppo_config.json
-  python train_unified.py --trainer hier_ppo --episodes 1000 --max_steps 200
-  python train_unified.py --trainer sb3_ppo --timesteps 20000
+  python train.py --config configs/hier_ppo_config.json
+  python train.py --trainer hier_ppo --episodes 1000 --max_steps 200
+  python train.py --trainer mappo --num_agents 3 --obs_dim 25 --episodes 3000
+  python train.py --config configs/mappo_config.json
+  python train.py --trainer sb3_ppo --timesteps 20000
         """
     )
     
     # Configuration options
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
-    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "discrete_ppo", "sb3_ppo"],
+    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
@@ -131,7 +144,9 @@ Examples:
     parser.add_argument("--max_steps", type=int, default=200,
                         help="Maximum steps per episode (hier_ppo)")
     parser.add_argument("--obs_dim", type=int, default=10,
-                        help="Observation dimension (hier_ppo)")
+                        help="Observation dimension (hier_ppo, discrete_ppo, mappo)")
+    parser.add_argument("--num_agents", type=int, default=3,
+                        help="Number of agents per team (mappo)")
     
     # SB3 PPO specific options
     parser.add_argument("--timesteps", type=int, default=10000,

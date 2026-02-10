@@ -11,7 +11,7 @@ from torch.distributions import Categorical
 
 # Hyperparameters
 GAMMA = 0.99
-LR = 3e-4  # Can use higher LR with discrete actions
+LR = 1e-4  # Reduced from 3e-4 to prevent value explosion
 EPS_CLIP = 0.2
 K_EPOCHS = 4
 ENTROPY_COEFF = 0.01
@@ -121,6 +121,15 @@ class DiscretePPOAgent:
         ).to(self.device)
         returns = advantages + old_values
         
+        # Diagnostic: Check for value explosion
+        max_value = old_values.abs().max().item()
+        max_return = returns.abs().max().item()
+        if max_value > 1000 or max_return > 1000:
+            print(f"WARNING: Value explosion detected!")
+            print(f"  Max old value: {max_value:.2f}")
+            print(f"  Max return: {max_return:.2f}")
+            print(f"  Reward range: [{min(rewards):.2f}, {max(rewards):.2f}]")
+        
         # Normalize advantages
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -145,8 +154,21 @@ class DiscretePPOAgent:
             surr2 = torch.clamp(ratio, 1 - EPS_CLIP, 1 + EPS_CLIP) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
             
-            # Value loss
-            value_loss = (returns - values.squeeze()).pow(2).mean()
+            # Value loss with clipping (prevents value explosion)
+            # Clip the value predictions to stay near old values
+            values_pred = values.squeeze()
+            values_clipped = old_values + torch.clamp(
+                values_pred - old_values,
+                -EPS_CLIP,
+                EPS_CLIP
+            )
+            
+            # Compute value loss for both clipped and unclipped
+            value_loss_unclipped = (returns - values_pred).pow(2)
+            value_loss_clipped = (returns - values_clipped).pow(2)
+            
+            # Take the max (more conservative, prevents explosion)
+            value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
             
             # Total loss
             total_loss = policy_loss + 0.5 * value_loss - ENTROPY_COEFF * entropy
@@ -166,7 +188,11 @@ class DiscretePPOAgent:
             "policy_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
             "entropy": entropy.item(),
-            "total_loss": total_loss.item()
+            "total_loss": total_loss.item(),
+            "max_value": old_values.abs().max().item(),
+            "max_return": returns.abs().max().item(),
+            "mean_value": old_values.mean().item(),
+            "mean_return": returns.mean().item()
         }
     
     def save(self, filepath: str):
