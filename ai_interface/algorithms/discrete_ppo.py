@@ -101,9 +101,18 @@ class DiscretePPOAgent:
         
         return advantages
     
-    def update(self):
-        """Run PPO update."""
-        if len(self.memory) < BATCH_SIZE:
+    def update(self, force: bool = False):
+        """Run PPO update.
+
+        Args:
+            force: If True, run the update even when the buffer has fewer
+                   than BATCH_SIZE transitions (useful for flushing at end
+                   of training).  Returns ``{}`` only when the buffer is
+                   completely empty.
+        """
+        if not self.memory:
+            return {}
+        if not force and len(self.memory) < BATCH_SIZE:
             return {}
         
         rewards = self.rewards

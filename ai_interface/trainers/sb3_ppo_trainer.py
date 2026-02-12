@@ -19,7 +19,7 @@ class SB3PPOTrainer(BaseTrainer):
     """Trainer for Stable Baselines3 PPO algorithm."""
     
     def __init__(self, config: Dict[str, Any], log_dir: str = None, device=None):
-        super().__init__(config, log_dir)
+        super().__init__(config, log_dir, algorithm_name="sb3_ppo")
         self.networker = None
         self.env = None
         self.model = None
@@ -100,14 +100,15 @@ class SB3PPOTrainer(BaseTrainer):
             
             # Save model periodically
             if timesteps_trained % save_interval == 0 or remaining == 0:
-                save_path = self.config.get("save_path", "models/sb3_ppo_policy.zip")
+                save_name = Path(self.config.get("save_path", "models/sb3_ppo_policy.zip")).name
                 if remaining > 0:  # Checkpoint save
-                    checkpoint_path = self._get_checkpoint_path(save_path, timesteps_trained)
+                    checkpoint_path = self._get_checkpoint_path(save_name, timesteps_trained)
                     self.save_model(str(checkpoint_path))
                     self.logger.info(f"Model checkpoint saved to {checkpoint_path}")
                 else:  # Final save
-                    self.save_model(save_path)
-                    self.logger.info(f"Final model saved to {save_path}")
+                    final_path = self.model_dir / save_name
+                    self.save_model(str(final_path))
+                    self.logger.info(f"Final model saved to {final_path}")
     
     def save_model(self, path: str):
         """Save the trained SB3 model."""
@@ -172,7 +173,7 @@ class SB3PPOTrainer(BaseTrainer):
         
         return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
     
-    def _get_checkpoint_path(self, base_path: str, timesteps: int) -> Path:
-        """Generate checkpoint path with timesteps."""
-        save_path = Path(base_path)
-        return save_path.parent / f"{save_path.stem}_steps{timesteps}{save_path.suffix}"
+    def _get_checkpoint_path(self, filename: str, timesteps: int) -> Path:
+        """Generate checkpoint path with timesteps inside model_dir."""
+        p = Path(filename)
+        return self.model_dir / f"{p.stem}_steps{timesteps}{p.suffix}"

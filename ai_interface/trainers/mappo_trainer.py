@@ -20,7 +20,7 @@ class MAPPOTrainer(BaseTrainer):
     """Trainer for multi-agent PPO (MAPPO) algorithm."""
     
     def __init__(self, config: Dict[str, Any], log_dir: str = None, device=None):
-        super().__init__(config, log_dir)
+        super().__init__(config, log_dir, algorithm_name="mappo")
         self.networker = None
         self.env = None
         self.agent = None
@@ -155,8 +155,8 @@ class MAPPOTrainer(BaseTrainer):
             
             # Save periodically
             if (episode + 1) % save_interval == 0:
-                save_path = self.config.get("save_path", "models/mappo_team.pth")
-                checkpoint_path = self._get_checkpoint_path(save_path, episode + 1)
+                save_name = Path(self.config.get("save_path", "models/mappo_team.pth")).name
+                checkpoint_path = self._get_checkpoint_path(save_name, episode + 1)
                 self.save_model(str(checkpoint_path))
                 self.logger.info(f"Checkpoint saved: {checkpoint_path}")
         
@@ -166,8 +166,9 @@ class MAPPOTrainer(BaseTrainer):
             n_updates += 1
             self.logger.info(f"Final update #{n_updates}")
         
-        final_save_path = self.config.get("save_path", "models/mappo_team.pth")
-        self.save_model(final_save_path)
+        final_save_name = Path(self.config.get("save_path", "models/mappo_team.pth")).name
+        final_save_path = self.model_dir / final_save_name
+        self.save_model(str(final_save_path))
         self.logger.info(f"Final model saved to {final_save_path}")
         
         # Plot training
@@ -212,10 +213,7 @@ class MAPPOTrainer(BaseTrainer):
         
         return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
     
-    def _get_checkpoint_path(self, base_path: str, episode: int) -> Path:
-        """Generate checkpoint path with episode number."""
-        save_path = Path(base_path)
-        return save_path.parent / f"{save_path.stem}_ep{episode}{save_path.suffix}"
+
 
 
 # ============================================================================

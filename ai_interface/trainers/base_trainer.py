@@ -25,18 +25,25 @@ class BaseTrainer(abc.ABC):
     regardless of the specific algorithm or approach being used.
     """
     
-    def __init__(self, config: Dict[str, Any], log_dir: Optional[str] = None):
+    def __init__(self, config: Dict[str, Any], log_dir: Optional[str] = None,
+                 algorithm_name: Optional[str] = None):
         """Initialize the base trainer.
         
         Args:
             config: Configuration dictionary containing training parameters
             log_dir: Optional directory for log files. If None, logs will be created in train_logs/
+            algorithm_name: Short identifier for the algorithm (e.g. "discrete_ppo").
+                Used to create a datetime + algorithm named model directory.
         """
         self.config = config
         self.log_dir = log_dir or "train_logs"
+        self.algorithm_name = algorithm_name or "unknown"
         
         # Setup logging
         self._setup_logging()
+        
+        # Setup model output directory (mirrors run_dir pattern)
+        self._setup_model_dir()
         
         # Initialize metrics tracking
         self.training_metrics = {
@@ -151,6 +158,32 @@ class BaseTrainer(abc.ABC):
         """Cleanup resources after training completion."""
         self.logger.info("Training session completed")
         self.logger.info(f"Final metrics: {json.dumps(self.training_metrics, indent=2)}")
+
+    # ------------------------------------------------------------------
+    # Model directory helpers
+    # ------------------------------------------------------------------
+    def _setup_model_dir(self):
+        """Create a datetime + algorithm named directory under ``models/``.
+
+        The directory mirrors the ``run_dir`` pattern used for logs, e.g.
+        ``models/20260212_153000_discrete_ppo/``.
+        """
+        self.model_dir = Path("models") / f"{self.run_timestamp}_{self.algorithm_name}"
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Model output directory: {self.model_dir}")
+
+    def _get_checkpoint_path(self, filename: str, tag) -> Path:
+        """Build a checkpoint path inside :attr:`model_dir`.
+
+        Args:
+            filename: Base filename for the checkpoint (e.g. ``"policy.pth"``).
+            tag: Episode number or timestep count appended to the stem.
+
+        Returns:
+            Full path like ``models/20260212_…_discrete_ppo/policy_ep100.pth``.
+        """
+        p = Path(filename)
+        return self.model_dir / f"{p.stem}_ep{tag}{p.suffix}"
 
     # ------------------------------------------------------------------
     # Plotting helpers
