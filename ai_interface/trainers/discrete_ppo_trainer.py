@@ -12,6 +12,7 @@ import json
 
 from .base_trainer import BaseTrainer
 from ai_interface.envs.discrete_ppo import SimplifiedSoccerEnv
+from ai_interface.envs.discrete_curriculum_ppo import DiscreteCurriculumEnv
 from ai_interface.algorithms.discrete_ppo import DiscretePPOAgent
 from networking.networker import Networker, TeamInfo
 
@@ -25,9 +26,11 @@ class DiscretePPOTrainer(BaseTrainer):
         self.env = None
         self.agent = None
         self.device = device
+        # Track the source checkpoint so we never overwrite it
+        self._source_checkpoint: str | None = config.get("load_model")
     
     def setup_environment(self) -> gym.Env:
-        """Setup the simplified soccer environment."""
+        """Setup the soccer environment (standard or curriculum)."""
         # Load team configuration
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
@@ -35,19 +38,36 @@ class DiscretePPOTrainer(BaseTrainer):
         # Setup networker
         self.networker = Networker(team_infos, self.config.get("env_mode", "sim-only"))
         
-        # Create environment
-        self.env = SimplifiedSoccerEnv(
-            networker=self.networker,
-            team_name=team_name,
-            obs_dim=self.config.get("obs_dim", 18)
-        )
+        use_curriculum = self.config.get("curriculum", False)
+        obs_dim = self.config.get("obs_dim", 18)
         
-        self.logger.info(f"Environment setup complete - Team: {team_name}, Obs dim: {self.config.get('obs_dim', 18)}")
-        self.logger.info(f"Action space: Discrete(5) - APPROACH_BALL, SHOOT_GOAL, DRIBBLE_FORWARD, CLEAR_BALL, REPOSITION")
+        if use_curriculum:
+            start_phase = self.config.get("start_phase", 0)
+            self.env = DiscreteCurriculumEnv(
+                networker=self.networker,
+                team_name=team_name,
+                obs_dim=obs_dim,
+                start_phase=start_phase,
+            )
+            self.logger.info(
+                f"Curriculum environment setup - Team: {team_name}, "
+                f"Obs dim: {obs_dim}, Start phase: {start_phase}"
+            )
+        else:
+            self.env = SimplifiedSoccerEnv(
+                networker=self.networker,
+                team_name=team_name,
+                obs_dim=obs_dim,
+            )
+            self.logger.info(
+                f"Standard environment setup - Team: {team_name}, Obs dim: {obs_dim}"
+            )
+        
+        self.logger.info("Action space: Discrete(5) - APPROACH_BALL, SHOOT_GOAL, DRIBBLE_FORWARD, CLEAR_BALL, REPOSITION")
         return self.env
     
     def setup_model(self, env: gym.Env):
-        """Setup the discrete PPO agent."""
+        """Setup the discrete PPO agent, optionally loading a checkpoint."""
         self.logger.info(f"Using device: {self.device}")
 
         self.agent = DiscretePPOAgent(
@@ -57,9 +77,14 @@ class DiscretePPOTrainer(BaseTrainer):
         )
         
         # Load pre-trained model if specified
-        if self.config.get("load_model"):
-            self.logger.info(f"Loading model from {self.config['load_model']}")
-            self.agent.load(self.config["load_model"])
+        load_path = self.config.get("load_model")
+        if load_path:
+            self.logger.info(f"Loading checkpoint from: {load_path}")
+            self.agent.load(load_path)
+            self.logger.info(
+                f"Checkpoint loaded successfully. Original file will NOT be "
+                f"modified — all new saves go to: {self.model_dir}/"
+            )
         
         self.logger.info("Discrete PPO Agent setup complete")
     
@@ -176,11 +201,24 @@ class DiscretePPOTrainer(BaseTrainer):
         self.plot_training()
     
     def save_model(self, path: str):
-        """Save the trained discrete PPO agent."""
+        """Save the trained discrete PPO agent.
+        
+        Raises an error if the target path matches the source checkpoint
+        to prevent accidental overwrites.
+        """
         if self.agent is None:
             raise RuntimeError("Agent not initialized")
         
-        save_path = Path(path)
+        # Safety: never overwrite the source checkpoint
+        save_path = Path(path).resolve()
+        if self._source_checkpoint:
+            source_path = Path(self._source_checkpoint).resolve()
+            if save_path == source_path:
+                raise RuntimeError(
+                    f"Refusing to overwrite source checkpoint: {source_path}. "
+                    f"Choose a different save path."
+                )
+        
         save_path.parent.mkdir(parents=True, exist_ok=True)
         self.agent.save(str(save_path))
     
