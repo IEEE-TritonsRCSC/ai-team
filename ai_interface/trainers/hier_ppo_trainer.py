@@ -138,7 +138,7 @@ class HierarchicalPPOTrainer(BaseTrainer):
         super().cleanup()
         if self.networker:
             try:
-                self.networker.disconnect_from_sim()
+                self.networker.shutdown()
             except Exception as e:
                 self.logger.error(f"Error during networker shutdown: {e}")
     

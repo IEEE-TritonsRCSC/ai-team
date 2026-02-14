@@ -109,11 +109,15 @@ class SoccerEnv(gym.Env):
     def reset(self):
         """Reset simulator and step counter"""
         # Reset the simulator to initial state (less aggressive approach)
+        reset_ok = False
         try:
-            self.networker.reset_sim()
-        except Exception:
-            # If reset fails, just continue - the game will keep running
-            pass
+            reset_ok = bool(self.networker.reset_sim())
+        except Exception as e:
+            print(f"[SoccerEnv] reset_sim failed: {e}")
+
+        # In simulator modes, a failed reset should be visible in logs.
+        if self.networker.environment in ["sim-only", "sim-mixed"] and not reset_ok:
+            print("[SoccerEnv] reset_sim did not complete; continuing current match state.")
         
         # Wait a moment for reset to take effect
         import time

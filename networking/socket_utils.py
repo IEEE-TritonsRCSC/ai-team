@@ -10,6 +10,7 @@ import random
 import time
 import socket
 import threading
+from typing import Optional
 import sslclient
 from .data_utils import GameState, TeamInfo, Deserializer
 
@@ -43,6 +44,7 @@ class Listener:
             self.addr = SIM_TRAINER_ADDR
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(0.2)    # Non-blocking with timeout
+            self.desired_init_poses = desired_init_poses
             self.connect_to_sim(desired_init_poses)
         else:
             self.source = "camera"
@@ -112,6 +114,43 @@ class Listener:
         (data, address) = self.sock.recvfrom(16)
         if (self.addr != address or data != b"(ok change_mode)"):
             raise Exception(f"Unexpected response: {data} from {address}")
+
+    def _wait_for_trainer_ok(self, expected_prefix: bytes, timeout_s: float = 1.0) -> bool:
+        """Wait until trainer socket receives an expected OK response."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                data, address = self.sock.recvfrom(BUFFER_SIZE)
+            except (TimeoutError, socket.timeout):
+                continue
+            if address != self.addr:
+                continue
+            if data.startswith(expected_prefix):
+                return True
+        return False
+
+    def reset_sim(self, desired_init_poses: Optional[list] = None) -> bool:
+        """Reset simulator playmode and restore initial poses through trainer port."""
+        if self.source != "simulator":
+            return False
+
+        poses = desired_init_poses if desired_init_poses is not None else self.desired_init_poses
+
+        try:
+            self.sock.sendto(b"(change_mode before_kick_off)\0", self.addr)
+            if not self._wait_for_trainer_ok(b"(ok change_mode)"):
+                return False
+
+            for obj_name, pose in poses:
+                init_command = f"(move {obj_name} {pose[0]} {pose[1]} {pose[2]})\0".encode()
+                self.sock.sendto(init_command, self.addr)
+                if not self._wait_for_trainer_ok(b"(ok move)"):
+                    return False
+
+            self.sock.sendto(b"(change_mode play_on)\0", self.addr)
+            return self._wait_for_trainer_ok(b"(ok change_mode)")
+        except Exception:
+            return False
 
     def disconnect_from_sim(self):
         """Disconnect from simulator and close socket."""
@@ -293,29 +332,46 @@ class Commander:
         sock.sendto(command, addr)
         print(command, addr)
 
-    def reset_sim(self):
-        """Reset simulator by moving players to initial positions."""
-        if not hasattr(self, 'sim_clients'):
-            return
+    def reset_sim(self) -> bool:
+        """Reset simulator by moving players to initial positions.
         
+        Returns:
+            True if at least one player reset command was sent successfully.
+        """
+        if not hasattr(self, "sim_clients"):
+            return False
+
+        reset_count = 0
+
         # Reset each client to initial position instead of full disconnect/reconnect
         for team_info, side in zip(self.team_infos, ["left", "right"]):
             team_clients = self.sim_clients[team_info.name]
+            goalie_0idx = team_info.goalie_id - 1
+
             for i, client in enumerate(team_clients):
-                if client:
-                    # Get new initial pose
-                    init_pose = client.get_init_pose(i == 0, side)
-                    # Move to initial position
+                if not client:
+                    continue
+
+                is_first = i == 0
+                is_goalie = i == goalie_0idx
+
+                try:
+                    # Keep role-aware spawn logic consistent with initial setup.
+                    init_pose = client.get_init_pose(side, is_first, is_goalie)
+
                     move_args = f"{init_pose[0]} {init_pose[1]}".encode()
                     turn_args = f"{init_pose[2]}".encode()
-                    
-                    try:
-                        client.send_command(b"(move %b)\0" % move_args)
-                        time.sleep(0.05)
-                        client.send_command(b"(turn %b)\0" % turn_args)
-                    except Exception:
-                        # If command fails, continue with other clients
-                        pass
+                    client.send_command(b"(move %b)\0" % move_args)
+                    time.sleep(0.05)
+                    client.send_command(b"(turn %b)\0" % turn_args)
+
+                    client.init_pose = init_pose
+                    reset_count += 1
+                except Exception:
+                    # If one client fails, continue resetting the remaining clients.
+                    continue
+
+        return reset_count > 0
 
     def disconnect_from_sim(self):
         """Disconnect all simulator clients."""
