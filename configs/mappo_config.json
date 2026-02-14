@@ -1,0 +1,13 @@
+{
+  "trainer_type": "mappo",
+  "team_config": "team_config.json",
+  "env_mode": "sim-only",
+  "team_name": "TritonBots",
+  "num_agents": 3,
+  "episodes": 3000,
+  "max_steps": 400,
+  "obs_dim": 25,
+  "save_path": "models/mappo_team.pth",
+  "save_interval": 100,
+  "load_model": null
+}

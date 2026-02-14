@@ -1,0 +1,14 @@
+{
+  "trainer_type": "discrete_ppo",
+  "team_config": "team_config.json",
+  "env_mode": "sim-only",
+  "team_name": "TritonBots",
+  "episodes": 1500,
+  "max_steps": 200,
+  "obs_dim": 18,
+  "save_path": "models/discrete_curriculum_policy.pth",
+  "save_interval": 100,
+  "load_model": "models/hier_ppo_policy_ep100.pth",
+  "curriculum": true,
+  "start_phase": 2
+}

@@ -59,7 +59,10 @@ class Listener:
             Current game state or None if no valid data received
         """
         if self.source == "simulator":
-            (data, address) = self.sock.recvfrom(BUFFER_SIZE)
+            try:
+                (data, address) = self.sock.recvfrom(BUFFER_SIZE)
+            except (TimeoutError, OSError):
+                return None  # socket timeout – no data this tick
             if address == self.addr:
                 game_state = self.parser.sim_deserialize(data)
                 return game_state
@@ -157,6 +160,18 @@ class Listener:
         self.sock.sendto(b"(bye)\0", self.addr)
         time.sleep(0.1)
         self.sock.close()
+
+    def restart_game(self):
+        """Keep sending change_mode play_on until the server acknowledges it."""
+        play_on = False
+        while not play_on:
+            self.sock.sendto(b"(change_mode play_on)\0", self.addr)
+            try:
+                (data, address) = self.sock.recvfrom(16)
+                if address == self.addr and data == b"(ok change_mode)":
+                    play_on = True
+            except TimeoutError:
+                pass
 
     def disconnect_from_camera(self):
         """Disconnect from camera vision client."""

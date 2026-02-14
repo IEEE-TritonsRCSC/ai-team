@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .base_trainer import BaseTrainer
 from ai_interface.envs.ppo_env import SoccerEnv
+from ai_interface.envs.curriculum_ppo import CurriculumSoccerEnv
 from ai_interface.algorithms.hier_ppo import PPOAgent
 from networking.networker import Networker, TeamInfo
 
@@ -18,11 +19,12 @@ from networking.networker import Networker, TeamInfo
 class HierarchicalPPOTrainer(BaseTrainer):
     """Trainer for hierarchical PPO algorithm."""
     
-    def __init__(self, config: Dict[str, Any], log_dir: str = None):
-        super().__init__(config, log_dir)
+    def __init__(self, config: Dict[str, Any], log_dir: str = None, device=None):
+        super().__init__(config, log_dir, algorithm_name="hier_ppo")
         self.networker = None
         self.env = None
         self.agent = None
+        self.device = device
     
     def setup_environment(self) -> gym.Env:
         """Setup the hierarchical soccer environment."""
@@ -34,28 +36,21 @@ class HierarchicalPPOTrainer(BaseTrainer):
         self.networker = Networker(team_infos, self.config.get("env_mode", "sim-only"))
         
         # Create environment
-        self.env = SoccerEnv(
+        self.env = CurriculumSoccerEnv(
             networker=self.networker,
             team_name=team_name,
-            obs_dim=self.config.get("obs_dim", 10)
+            obs_dim=self.config.get("obs_dim", 18)  # Updated to 18 for new obs space
         )
         
-        self.logger.info(f"Environment setup complete - Team: {team_name}, Obs dim: {self.config.get('obs_dim', 10)}")
+        self.logger.info(f"Environment setup complete - Team: {team_name}, Obs dim: {self.config.get('obs_dim', 18)}")
         return self.env
     
     def setup_model(self, env: gym.Env):
         """Setup the hierarchical PPO agent."""
-        # Determine device (CPU/CUDA) and inform the agent if necessary
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.logger.info(f"Using device: {device}")
+        # Determine device (use trainer.device if provided)
+        self.logger.info(f"Using device: {self.device}")
 
-        self.agent = PPOAgent(obs_dim=self.config.get("obs_dim", 10))
-        # If the agent exposes a model, move it to the chosen device
-        try:
-            if hasattr(self.agent, "model") and self.agent.model is not None:
-                self.agent.model.to(device)
-        except Exception:
-            pass
+        self.agent = PPOAgent(obs_dim=self.config.get("obs_dim", 18), device=self.device)  # Updated to 18
         
         # Load pre-trained model if specified
         if self.config.get("load_model"):
@@ -75,48 +70,69 @@ class HierarchicalPPOTrainer(BaseTrainer):
         max_steps = self.config.get("max_steps", 200)
         save_interval = self.config.get("save_interval", 100)
         
-        self.logger.info(f"Starting training for {episodes} episodes...")
+        from ai_interface.algorithms.hier_ppo import BATCH_SIZE
+        self.logger.info(
+            f"Starting training for {episodes} episodes  "
+            f"(PPO updates every {BATCH_SIZE} steps)..."
+        )
         
+        total_steps_since_update = 0
+        n_updates = 0
+
         for episode in range(episodes):
             state = self.env.reset()
             episode_reward = 0
-            rewards = []
-            masks = []
             
             for step in range(max_steps):
-                # Select action using agent
+                # Select action using agent (stores state/action in agent memory)
                 action = self.agent.select_action(state)
                 
                 # Take step in environment
                 next_state, reward, done, _ = self.env.step(action)
                 
-                # Store rewards and masks for advantage computation
-                rewards.append(reward)
-                masks.append(1.0 - float(done))
+                # Store reward and mask directly in agent buffer
+                self.agent.store_reward_mask(reward, 1.0 - float(done))
                 
                 episode_reward += reward
                 state = next_state
+                total_steps_since_update += 1
                 
                 if done:
                     break
             
-            # Update agent at end of episode
-            self.agent.update(rewards, masks)
-            
-            # Log episode
+            # Log episode (avg reward per 10 ep is logged automatically)
             self.log_episode(episode + 1, episode_reward, step + 1)
+            
+            # Run PPO update only after collecting enough transitions
+            if self.agent.batch_ready:
+                self.agent.update()
+                n_updates += 1
+                self.logger.info(
+                    f"PPO update #{n_updates} after {total_steps_since_update} steps"
+                )
+                total_steps_since_update = 0
             
             # Save model periodically
             if (episode + 1) % save_interval == 0:
-                save_path = self.config.get("save_path", "models/hier_ppo_policy.pth")
-                checkpoint_path = self._get_checkpoint_path(save_path, episode + 1)
+                save_name = Path(self.config.get("save_path", "models/hier_ppo_policy.pth")).name
+                checkpoint_path = self._get_checkpoint_path(save_name, episode + 1)
                 self.save_model(str(checkpoint_path))
                 self.logger.info(f"Model checkpoint saved to {checkpoint_path}")
         
+        # Flush any remaining transitions
+        if len(self.agent.memory) > 0:
+            self.agent.update()
+            n_updates += 1
+            self.logger.info(f"Final PPO update #{n_updates} (flushed remaining buffer)")
+
         # Final save
-        final_save_path = self.config.get("save_path", "models/hier_ppo_policy.pth")
-        self.save_model(final_save_path)
+        final_save_name = Path(self.config.get("save_path", "models/hier_ppo_policy.pth")).name
+        final_save_path = self.model_dir / final_save_name
+        self.save_model(str(final_save_path))
         self.logger.info(f"Final model saved to {final_save_path}")
+
+        # ---- Plot average reward per 10 episodes ----
+        self.plot_training()
     
     def save_model(self, path: str):
         """Save the trained PPO agent."""
@@ -138,7 +154,18 @@ class HierarchicalPPOTrainer(BaseTrainer):
         super().cleanup()
         if self.networker:
             try:
-                self.networker.shutdown()
+                # Prefer the high-level shutdown API; fall back to older disconnect methods
+                if hasattr(self.networker, "shutdown") and callable(self.networker.shutdown):
+                    self.networker.shutdown()
+                elif hasattr(self.networker, "disconnect_from_sim") and callable(self.networker.disconnect_from_sim):
+                    self.networker.disconnect_from_sim()
+                else:
+                    # Try commander/game watcher shutdown hooks where available
+                    try:
+                        if hasattr(self.networker, "commander") and hasattr(self.networker.commander, "disconnect_from_sim"):
+                            self.networker.commander.disconnect_from_sim()
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger.error(f"Error during networker shutdown: {e}")
     
@@ -159,7 +186,3 @@ class HierarchicalPPOTrainer(BaseTrainer):
         # TeamInfo requires name, n_players, and goalie_id
         return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
     
-    def _get_checkpoint_path(self, base_path: str, episode: int) -> Path:
-        """Generate checkpoint path with episode number."""
-        save_path = Path(base_path)
-        return save_path.parent / f"{save_path.stem}_ep{episode}{save_path.suffix}"
