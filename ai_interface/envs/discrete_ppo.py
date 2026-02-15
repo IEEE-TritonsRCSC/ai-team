@@ -19,6 +19,7 @@ import numpy as np
 from networking.networker import Networker
 from ai_interface.constants.player_constants import KICKABLE_MARGIN, PLAYER_SIZE, BALL_SIZE
 from ai_interface.constants.field_constants import GOAL_R
+from ai_interface.utils.basic_commands import goto, shoot_at_goal, shoot, dribble
 import math
 
 
@@ -232,8 +233,8 @@ class SimplifiedSoccerEnv(gym.Env):
     
     def _action_to_commands(self, action: int) -> list:
         """
-        Convert discrete action to simulator commands using hardcoded logic.
-        
+        Convert discrete action to simulator commands using skills from basic_commands.
+
         Actions:
         0. APPROACH_BALL - Chase ball (predictive if far, direct if close)
         1. SHOOT_GOAL - Shoot at goal (finds best corner, turns to face)
@@ -241,11 +242,15 @@ class SimplifiedSoccerEnv(gym.Env):
         3. CLEAR_BALL - Strong kick away from danger
         4. REPOSITION - Move to strategic position
         """
-        # Get current game state to extract positions
+        def _cmd_list(cmd: str) -> list:
+            if cmd in ("done", "failed") or cmd is None:
+                return [None]
+            return [cmd]
+
         game_state = self.networker.get_game_state()
         if game_state is None:
             return [None]
-        
+
         try:
             ball_pos = game_state.ball_pos or (0.0, 0.0)
             ball_x, ball_y = ball_pos
@@ -253,7 +258,7 @@ class SimplifiedSoccerEnv(gym.Env):
             our_team_poses = game_state.robot_poses.get(self.team_name, [])
             if not our_team_poses or len(our_team_poses) == 0:
                 return [None]
-            
+
             first_player = our_team_poses[0]
             if isinstance(first_player, dict) and 1 in first_player:
                 robot_x, robot_y, robot_theta = first_player[1]
@@ -261,7 +266,7 @@ class SimplifiedSoccerEnv(gym.Env):
                 return [None]
             
             ball_dist = np.sqrt((ball_x - robot_x)**2 + (ball_y - robot_y)**2)
-            
+
             # Update ball history for velocity estimation
             self.ball_history.append((ball_x, ball_y))
             if len(self.ball_history) > self.ball_history_max:
@@ -272,7 +277,7 @@ class SimplifiedSoccerEnv(gym.Env):
             if len(self.ball_history) >= 2:
                 ball_vx = self.ball_history[-1][0] - self.ball_history[-2][0]
                 ball_vy = self.ball_history[-1][1] - self.ball_history[-2][1]
-            
+
             # Action 0: APPROACH_BALL
             if action == 0:
                 # If far from ball, chase predicted position
@@ -292,65 +297,19 @@ class SimplifiedSoccerEnv(gym.Env):
                     # Position 0.5m behind ball
                     target_x = ball_x - (to_goal_x / norm) * 0.5
                     target_y = ball_y - (to_goal_y / norm) * 0.5
-                
-                # Calculate dash direction and power
-                dx = target_x - robot_x
-                dy = target_y - robot_y
-                distance = np.sqrt(dx**2 + dy**2)
-                
-                if distance < 0.1:
-                    return [None]  # Already at target
-                
-                direction = np.arctan2(dy, dx)
-                power = np.clip(distance * 20, 10, 100)
-                
-                # Turn toward target if not facing it
-                theta_rad = np.radians(robot_theta)
-                angle_diff = direction - theta_rad
-                angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-                
-                if abs(angle_diff) > np.radians(10):
-                    turn_power = np.degrees(angle_diff)
-                    return [f"turn {turn_power:.1f}"]
-                else:
-                    return [f"dash {power:.1f} {direction:.3f}"]
-            
+                cmd = goto((robot_x, robot_y, robot_theta), target_x, target_y, game_state)
+                return _cmd_list(cmd)
+
             # Action 1: SHOOT_GOAL
             elif action == 1:
                 if ball_dist < self.kickable_dist:
-                    # In kickable range - shoot at goal
-                    # Choose better corner based on simple heuristic
-                    goal_y_top = 3.5
-                    goal_y_bot = -3.5
-                    
-                    # Shoot at corner farther from ball's y position
-                    if ball_y > 0:
-                        target_y = goal_y_bot  # Shoot to opposite corner
-                    else:
-                        target_y = goal_y_top
-                    
-                    target_x = self.goal_x
-                    
-                    # Calculate kick direction
-                    to_target_x = target_x - ball_x
-                    to_target_y = target_y - ball_y
-                    kick_dir = np.arctan2(to_target_y, to_target_x)
-                    
-                    # Turn to face target if needed
-                    theta_rad = np.radians(robot_theta)
-                    angle_diff = kick_dir - theta_rad
-                    angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-                    
-                    if abs(angle_diff) > np.radians(5):
-                        turn_power = np.degrees(angle_diff)
-                        return [f"turn {turn_power:.1f}"]
-                    else:
-                        # Facing target, kick hard!
-                        return [f"kick 100 {kick_dir:.3f}"]
-                else:
-                    # Not in range, approach ball first
-                    return self._action_to_commands(0)  # Recursive call to APPROACH
-            
+                    goal_y = -3.5 if ball_y > 0 else 3.5
+                    goal_pos = (self.goal_x, goal_y)
+                    cmd = shoot_at_goal((robot_x, robot_y, robot_theta), ball_pos, goal_pos, kick_power=100.0)
+                    if cmd != "failed":
+                        return _cmd_list(cmd)
+                return self._action_to_commands(0)
+
             # Action 2: DRIBBLE_FORWARD
             elif action == 2:
                 if ball_dist < self.kickable_dist:
@@ -387,23 +346,12 @@ class SimplifiedSoccerEnv(gym.Env):
             # Action 3: CLEAR_BALL
             elif action == 3:
                 if ball_dist < self.kickable_dist:
-                    # Strong kick forward
-                    to_goal_x = self.goal_x - ball_x
-                    to_goal_y = 0.0 - ball_y
-                    kick_dir = np.arctan2(to_goal_y, to_goal_x)
-                    
-                    theta_rad = np.radians(robot_theta)
-                    angle_diff = kick_dir - theta_rad
-                    angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-                    
-                    if abs(angle_diff) > np.radians(5):
-                        turn_power = np.degrees(angle_diff)
-                        return [f"turn {turn_power:.1f}"]
-                    else:
-                        return [f"kick 100 {kick_dir:.3f}"]
-                else:
-                    return self._action_to_commands(0)
-            
+                    opponent_goal_pos = (self.goal_x, 0.0)
+                    cmd = shoot_at_goal((robot_x, robot_y, robot_theta), ball_pos, opponent_goal_pos, kick_power=100.0)
+                    if cmd != "failed":
+                        return _cmd_list(cmd)
+                return self._action_to_commands(0)
+
             # Action 4: REPOSITION
             elif action == 4:
                 # Move to a strategic position (between ball and goal)
@@ -413,27 +361,9 @@ class SimplifiedSoccerEnv(gym.Env):
                 # Bias toward goal side
                 target_x = mid_x + (self.goal_x - ball_x) * 0.2
                 target_y = mid_y
-                
-                dx = target_x - robot_x
-                dy = target_y - robot_y
-                distance = np.sqrt(dx**2 + dy**2)
-                
-                if distance < 0.5:
-                    return [None]
-                
-                direction = np.arctan2(dy, dx)
-                power = np.clip(distance * 15, 10, 80)
-                
-                theta_rad = np.radians(robot_theta)
-                angle_diff = direction - theta_rad
-                angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-                
-                if abs(angle_diff) > np.radians(10):
-                    turn_power = np.degrees(angle_diff)
-                    return [f"turn {turn_power:.1f}"]
-                else:
-                    return [f"dash {power:.1f} {direction:.3f}"]
-            
+                cmd = goto((robot_x, robot_y, robot_theta), target_x, target_y, game_state)
+                return _cmd_list(cmd)
+
             return [None]
             
         except Exception as e:
