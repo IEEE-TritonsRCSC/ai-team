@@ -17,18 +17,29 @@ class Networker:
     handling game state reception and command execution.
     """
     
-    def __init__(self, team_infos: list[TeamInfo], environment: str):
+    def __init__(self, team_infos: list[TeamInfo], environment: str,
+                 sim_host: str = "127.0.0.1",
+                 sim_player_port: int = 6000,
+                 sim_trainer_port: int = 6001):
         """
         Initialize the networker with team information and environment settings.
         
         Args:
             team_infos: List of team information including names and player counts
             environment: Environment type for the game
+            sim_host: Simulator host (for sim-only/sim-mixed)
+            sim_player_port: Simulator player port (default 6000)
+            sim_trainer_port: Simulator trainer/monitor port (default 6001)
         """
         self.environment = environment
         self.serializer = Serializer()
-        self.commander = Commander(team_infos, environment)
-        self.game_watcher = Listener(team_infos, environment, self.commander.desired_init_poses)
+        self.commander = Commander(team_infos, environment,
+                                   sim_host=sim_host,
+                                   sim_player_port=sim_player_port)
+        self.game_watcher = Listener(team_infos, environment,
+                                     self.commander.desired_init_poses,
+                                     sim_host=sim_host,
+                                     sim_trainer_port=sim_trainer_port)
         self._client_data_lock = threading.Lock()
         self._latest_client_data = None
 

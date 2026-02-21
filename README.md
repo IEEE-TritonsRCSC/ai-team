@@ -192,8 +192,9 @@ The `GameState` object contains:
 ### Networking Protocol
 
 **Simulation Mode**: Communicates with the Simulation Server using UDP sockets on localhost:
-- **Client Port**: 6000 (robot commands)
-- **Trainer Port**: 6001 (game state monitoring)
+- **Default Client Port**: 6000 (robot commands)
+- **Default Trainer Port**: 6001 (game state monitoring)
+- Ports are configurable from training config/CLI (`sim_player_port`, `sim_port_stride`, `num_envs`).
 
 **Camera Mode**: Uses SSL vision protocol via `sslclient`:
 - Receives detection data with ball and robot positions
@@ -220,6 +221,31 @@ The system uses threading to:
 - Process multiple teams concurrently
 - Send commands to multiple robots simultaneously
 - Maintain responsive network communication
+
+## Parallel Training
+
+`train.py` supports running multiple simulator environments in parallel for PPO training.
+
+Start simulators first:
+```bash
+python launch_sims.py --num_envs 4 --sim_player_port 6000 --sim_port_stride 10
+```
+
+If you also want monitor windows (similar to `rcsoccersim`):
+```bash
+python launch_sims.py --num_envs 2 --with_monitor --monitor_bin Downloads/rcssmonitor-19.0.1/src/rcssmonitor
+```
+
+Example:
+```bash
+python train.py --trainer discrete_ppo --episodes 2000 --num_envs 4 --sim_player_port 6000 --sim_port_stride 10
+```
+
+With this setup, env ports become:
+- env0: player `6000`, trainer `6001`
+- env1: player `6010`, trainer `6011`
+- env2: player `6020`, trainer `6021`
+- env3: player `6030`, trainer `6031`
 
 ## License
 

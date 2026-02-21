@@ -30,14 +30,23 @@ class SB3PPOTrainer(BaseTrainer):
         # Load team configuration
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
-        
-        # Setup networker
-        self.networker = Networker(team_infos, self.config.get("env_mode", "sim-only"))
+
+        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
+        self.networker = Networker(
+            team_infos,
+            self.config.get("env_mode", "sim-only"),
+            sim_host=sim_host,
+            sim_player_port=sim_player_port,
+            sim_trainer_port=sim_trainer_port,
+        )
         
         # Create environment
         self.env = SimulatorEnv(networker=self.networker, team_name=team_name)
         
-        self.logger.info(f"Environment setup complete - Team: {team_name}")
+        self.logger.info(
+            "Environment setup complete - Team: %s, Endpoint: %s:%d/%d",
+            team_name, sim_host, sim_player_port, sim_trainer_port
+        )
         return self.env
     
     def setup_model(self, env: gym.Env):

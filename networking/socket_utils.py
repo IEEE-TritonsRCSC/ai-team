@@ -10,14 +10,15 @@ import random
 import time
 import socket
 import threading
+from typing import Optional
 import sslclient
 from .data_utils import GameState, TeamInfo, Deserializer
 
 # Network constants for listening to simulator data
 BUFFER_SIZE = 1536
 LOCALHOST_IP = "127.0.0.1"
-SIM_CLIENT_ADDR = (LOCALHOST_IP, 6000)
-SIM_TRAINER_ADDR = (LOCALHOST_IP, 6001)
+DEFAULT_SIM_PLAYER_PORT = 6000
+DEFAULT_SIM_TRAINER_PORT = 6001
 INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) before_kick_off\)"
 PLAYMODE_REGEX = r"\(hear \d+ referee (\w+)\)"
 
@@ -27,7 +28,9 @@ COMMAND_PORT = 10000
 
 class Listener:
     """Listens for game state updates from simulators or cameras."""
-    def __init__(self, team_infos: list[TeamInfo], environment: str, desired_init_poses: list):
+    def __init__(self, team_infos: list[TeamInfo], environment: str,
+                 desired_init_poses: list, sim_host: str = LOCALHOST_IP,
+                 sim_trainer_port: int = DEFAULT_SIM_TRAINER_PORT):
         """
         Initialize listener for the specified environment.
         
@@ -40,9 +43,10 @@ class Listener:
 
         if environment in ["sim-only", "sim-mixed"]:
             self.source = "simulator"
-            self.addr = SIM_TRAINER_ADDR
+            self.addr = (sim_host, int(sim_trainer_port))
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(0.2)    # Non-blocking with timeout
+            self.desired_init_poses = desired_init_poses
             self.connect_to_sim(desired_init_poses)
         else:
             self.source = "camera"
@@ -116,6 +120,43 @@ class Listener:
         if (self.addr != address or data != b"(ok change_mode)"):
             raise Exception(f"Unexpected response: {data} from {address}")
 
+    def _wait_for_trainer_ok(self, expected_prefix: bytes, timeout_s: float = 1.0) -> bool:
+        """Wait until trainer socket receives an expected OK response."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                data, address = self.sock.recvfrom(BUFFER_SIZE)
+            except (TimeoutError, socket.timeout):
+                continue
+            if address != self.addr:
+                continue
+            if data.startswith(expected_prefix):
+                return True
+        return False
+
+    def reset_sim(self, desired_init_poses: Optional[list] = None) -> bool:
+        """Reset simulator playmode and restore initial poses through trainer port."""
+        if self.source != "simulator":
+            return False
+
+        poses = desired_init_poses if desired_init_poses is not None else self.desired_init_poses
+
+        try:
+            self.sock.sendto(b"(change_mode before_kick_off)\0", self.addr)
+            if not self._wait_for_trainer_ok(b"(ok change_mode)"):
+                return False
+
+            for obj_name, pose in poses:
+                init_command = f"(move {obj_name} {pose[0]} {pose[1]} {pose[2]})\0".encode()
+                self.sock.sendto(init_command, self.addr)
+                if not self._wait_for_trainer_ok(b"(ok move)"):
+                    return False
+
+            self.sock.sendto(b"(change_mode play_on)\0", self.addr)
+            return self._wait_for_trainer_ok(b"(ok change_mode)")
+        except Exception:
+            return False
+
     def disconnect_from_sim(self):
         """Disconnect from simulator and close socket."""
         self.sock.sendto(b"(bye)\0", self.addr)
@@ -142,7 +183,9 @@ class Listener:
 class Client:
     """Represents a single robot client connection to the simulator."""
     def __init__(self, teamname: str, side: str = "left", 
-                 first: bool = False, goalie: bool = False):
+                 first: bool = False, goalie: bool = False,
+                 sim_host: str = LOCALHOST_IP,
+                 sim_player_port: int = DEFAULT_SIM_PLAYER_PORT):
         """
         Initialize a client connection for a single robot.
         
@@ -155,7 +198,7 @@ class Client:
         self.teamname = teamname
         self.init_pose = self.get_init_pose(side, first, goalie)
 
-        self.addr = SIM_CLIENT_ADDR
+        self.addr = (sim_host, int(sim_player_port))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.connect_to_sim(goalie)
 
@@ -231,7 +274,9 @@ class Client:
 
 class Commander:
     """Manages command sending to both simulated and physical robots."""
-    def __init__(self, team_infos: list[TeamInfo], environment: str):
+    def __init__(self, team_infos: list[TeamInfo], environment: str,
+                 sim_host: str = LOCALHOST_IP,
+                 sim_player_port: int = DEFAULT_SIM_PLAYER_PORT):
         """
         Initialize commander for the given teams and environment.
         
@@ -241,6 +286,8 @@ class Commander:
         """
         self.team_infos = team_infos
         self.environment = environment
+        self.sim_host = sim_host
+        self.sim_player_port = int(sim_player_port)
         self.desired_init_poses = []
         self.sample_client = None
 
@@ -267,7 +314,9 @@ class Commander:
                 teamname = team_info.name
                 goalie = (i == goalie_0idx)
 
-                client = Client(teamname, side, i == 0, goalie)
+                client = Client(teamname, side, i == 0, goalie,
+                                sim_host=self.sim_host,
+                                sim_player_port=self.sim_player_port)
                 self.sim_clients[teamname][i] = client
                 if self.sample_client is None:
                     self.sample_client = client    # Save one sample client for reference
@@ -308,29 +357,46 @@ class Commander:
         sock.sendto(command, addr)
         print(command, addr)
 
-    def reset_sim(self):
-        """Reset simulator by moving players to initial positions."""
-        if not hasattr(self, 'sim_clients'):
-            return
+    def reset_sim(self) -> bool:
+        """Reset simulator by moving players to initial positions.
         
+        Returns:
+            True if at least one player reset command was sent successfully.
+        """
+        if not hasattr(self, "sim_clients"):
+            return False
+
+        reset_count = 0
+
         # Reset each client to initial position instead of full disconnect/reconnect
         for team_info, side in zip(self.team_infos, ["left", "right"]):
             team_clients = self.sim_clients[team_info.name]
+            goalie_0idx = team_info.goalie_id - 1
+
             for i, client in enumerate(team_clients):
-                if client:
-                    # Get new initial pose
-                    init_pose = client.get_init_pose(i == 0, side)
-                    # Move to initial position
+                if not client:
+                    continue
+
+                is_first = i == 0
+                is_goalie = i == goalie_0idx
+
+                try:
+                    # Keep role-aware spawn logic consistent with initial setup.
+                    init_pose = client.get_init_pose(side, is_first, is_goalie)
+
                     move_args = f"{init_pose[0]} {init_pose[1]}".encode()
                     turn_args = f"{init_pose[2]}".encode()
-                    
-                    try:
-                        client.send_command(b"(move %b)\0" % move_args)
-                        time.sleep(0.05)
-                        client.send_command(b"(turn %b)\0" % turn_args)
-                    except Exception:
-                        # If command fails, continue with other clients
-                        pass
+                    client.send_command(b"(move %b)\0" % move_args)
+                    time.sleep(0.05)
+                    client.send_command(b"(turn %b)\0" % turn_args)
+
+                    client.init_pose = init_pose
+                    reset_count += 1
+                except Exception:
+                    # If one client fails, continue resetting the remaining clients.
+                    continue
+
+        return reset_count > 0
 
     def disconnect_from_sim(self):
         """Disconnect all simulator clients."""

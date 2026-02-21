@@ -19,11 +19,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, TYPE_CHECKING
+import importlib
 
 import torch
 
-from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer, DiscretePPOTrainer, MAPPOTrainer, QLearningTrainer
+if TYPE_CHECKING:
+    from ai_interface.trainers.base_trainer import BaseTrainer
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -38,6 +40,10 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
         "team_config": args.team_config,
         "env_mode": args.env,
         "team_name": args.team,
+        "num_envs": args.num_envs,
+        "sim_host": args.sim_host,
+        "sim_player_port": args.sim_player_port,
+        "sim_port_stride": args.sim_port_stride,
     }
     
     if trainer_type == "hier_ppo":
@@ -105,18 +111,27 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
         raise ValueError(f"Unknown trainer type: {trainer_type}")
 
 
-def get_trainer(trainer_type: str, config: Dict[str, Any]) -> BaseTrainer:
+def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
     """Create and return the appropriate trainer instance."""
     trainers = {
-        "hier_ppo": HierarchicalPPOTrainer,
-        "discrete_ppo": DiscretePPOTrainer,
-        "mappo": MAPPOTrainer,
-        "sb3_ppo": SB3PPOTrainer,
-        "qlearning": QLearningTrainer,
+        "hier_ppo": ("ai_interface.trainers.hier_ppo_trainer", "HierarchicalPPOTrainer"),
+        "discrete_ppo": ("ai_interface.trainers.discrete_ppo_trainer", "DiscretePPOTrainer"),
+        "mappo": ("ai_interface.trainers.mappo_trainer", "MAPPOTrainer"),
+        "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
+        "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
     }
     
     if trainer_type not in trainers:
         raise ValueError(f"Unknown trainer type: {trainer_type}. Available: {list(trainers.keys())}")
+
+    module_name, class_name = trainers[trainer_type]
+    try:
+        trainer_module = importlib.import_module(module_name)
+        trainer_cls = getattr(trainer_module, class_name)
+    except Exception as e:
+        raise ImportError(
+            f"Failed to load trainer '{trainer_type}' from {module_name}.{class_name}: {e}"
+        ) from e
     
     # Determine device and pass to trainer so models/data can be placed on CUDA when available
     device = torch.device("cpu")
@@ -126,7 +141,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> BaseTrainer:
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
 
-    return trainers[trainer_type](config, device=device)
+    return trainer_cls(config, device=device)
 
 
 def main():
@@ -143,6 +158,7 @@ Examples:
   python train.py --trainer sb3_ppo --timesteps 20000
   python train.py --trainer discrete_ppo --resume_checkpoint models/old_run/policy_ep200.pth --curriculum --start_phase 2
   python train.py --trainer qlearning --episodes 2000 --lr 1e-3 --epsilon_decay 0.995
+  python train.py --trainer discrete_ppo --episodes 2000 --num_envs 4 --sim_player_port 6000 --sim_port_stride 10
         """
     )
     
@@ -160,6 +176,14 @@ Examples:
     ], default="sim-only", help="Environment mode for Networker")
     parser.add_argument("--team", type=str, default=None,
                         help="Team name to control")
+    parser.add_argument("--num_envs", type=int, default=1,
+                        help="Number of parallel simulator environments to use")
+    parser.add_argument("--sim_host", type=str, default="127.0.0.1",
+                        help="Simulator host for sim-only/sim-mixed")
+    parser.add_argument("--sim_player_port", type=int, default=6000,
+                        help="Base simulator player port (env0). Trainer port uses player_port+1")
+    parser.add_argument("--sim_port_stride", type=int, default=10,
+                        help="Port stride between parallel envs (must avoid overlap, recommended >= 3)")
     
     # Hierarchical PPO specific options
     parser.add_argument("--episodes", type=int, default=1000,
@@ -225,10 +249,23 @@ Examples:
             print(f"Loading configuration from {args.config}")
             config = load_config(args.config)
             trainer_type = config.get("trainer_type", args.trainer)
+            # Backfill runtime defaults for older config files.
+            config.setdefault("num_envs", args.num_envs)
+            config.setdefault("sim_host", args.sim_host)
+            config.setdefault("sim_player_port", args.sim_player_port)
+            config.setdefault("sim_port_stride", args.sim_port_stride)
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
             config = create_default_config(trainer_type, args)
+
+        num_envs = int(config.get("num_envs", 1))
+        sim_port_stride = int(config.get("sim_port_stride", 10))
+        env_mode = config.get("env_mode", "sim-only")
+        if num_envs > 1 and env_mode not in ["sim-only", "sim-mixed"]:
+            raise ValueError("Parallel simulator training requires env_mode to be sim-only or sim-mixed")
+        if sim_port_stride < 3:
+            raise ValueError("sim_port_stride must be >= 3 to avoid simulator port overlap")
         
         # Validate checkpoint safety: if resuming, warn that original is read-only
         resume_path = config.get("load_model")

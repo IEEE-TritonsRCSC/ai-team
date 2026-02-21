@@ -8,6 +8,7 @@ import gymnasium as gym
 import torch
 from typing import Dict, Any
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from .base_trainer import BaseTrainer
 from ai_interface.envs.ppo_env import SoccerEnv
@@ -22,7 +23,10 @@ class HierarchicalPPOTrainer(BaseTrainer):
     def __init__(self, config: Dict[str, Any], log_dir: str = None, device=None):
         super().__init__(config, log_dir, algorithm_name="hier_ppo")
         self.networker = None
+        self.networkers = []
         self.env = None
+        self.envs = []
+        self.num_envs = 1
         self.agent = None
         self.device = device
     
@@ -31,18 +35,43 @@ class HierarchicalPPOTrainer(BaseTrainer):
         # Load team configuration
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
-        
-        # Setup networker
-        self.networker = Networker(team_infos, self.config.get("env_mode", "sim-only"))
-        
-        # Create environment
-        self.env = CurriculumSoccerEnv(
-            networker=self.networker,
-            team_name=team_name,
-            obs_dim=self.config.get("obs_dim", 18)  # Updated to 18 for new obs space
+
+        self.num_envs = max(1, int(self.config.get("num_envs", 1)))
+        self.networkers = []
+        self.envs = []
+
+        for env_idx in range(self.num_envs):
+            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(env_idx)
+            networker = Networker(
+                team_infos,
+                self.config.get("env_mode", "sim-only"),
+                sim_host=sim_host,
+                sim_player_port=sim_player_port,
+                sim_trainer_port=sim_trainer_port,
+            )
+            env = CurriculumSoccerEnv(
+                networker=networker,
+                team_name=team_name,
+                obs_dim=self.config.get("obs_dim", 18),
+            )
+            self.networkers.append(networker)
+            self.envs.append(env)
+            self.logger.info(
+                "Env %d connected to %s:%d/%d",
+                env_idx,
+                sim_host,
+                sim_player_port,
+                sim_trainer_port,
+            )
+
+        self.networker = self.networkers[0]
+        self.env = self.envs[0]
+        self.logger.info(
+            "Environment setup complete - Team: %s, Obs dim: %s, Parallel envs: %d",
+            team_name,
+            self.config.get("obs_dim", 18),
+            self.num_envs,
         )
-        
-        self.logger.info(f"Environment setup complete - Team: {team_name}, Obs dim: {self.config.get('obs_dim', 18)}")
         return self.env
     
     def setup_model(self, env: gym.Env):
@@ -75,49 +104,102 @@ class HierarchicalPPOTrainer(BaseTrainer):
             f"Starting training for {episodes} episodes  "
             f"(PPO updates every {BATCH_SIZE} steps)..."
         )
-        
+
         total_steps_since_update = 0
         n_updates = 0
 
-        for episode in range(episodes):
-            state = self.env.reset()
-            episode_reward = 0
-            
-            for step in range(max_steps):
-                # Select action using agent (stores state/action in agent memory)
-                action = self.agent.select_action(state)
-                
-                # Take step in environment
-                next_state, reward, done, _ = self.env.step(action)
-                
-                # Store reward and mask directly in agent buffer
-                self.agent.store_reward_mask(reward, 1.0 - float(done))
-                
-                episode_reward += reward
-                state = next_state
-                total_steps_since_update += 1
-                
-                if done:
-                    break
-            
-            # Log episode (avg reward per 10 ep is logged automatically)
-            self.log_episode(episode + 1, episode_reward, step + 1)
-            
-            # Run PPO update only after collecting enough transitions
-            if self.agent.batch_ready:
-                self.agent.update()
-                n_updates += 1
-                self.logger.info(
-                    f"PPO update #{n_updates} after {total_steps_since_update} steps"
-                )
-                total_steps_since_update = 0
-            
-            # Save model periodically
-            if (episode + 1) % save_interval == 0:
-                save_name = Path(self.config.get("save_path", "models/hier_ppo_policy.pth")).name
-                checkpoint_path = self._get_checkpoint_path(save_name, episode + 1)
-                self.save_model(str(checkpoint_path))
-                self.logger.info(f"Model checkpoint saved to {checkpoint_path}")
+        if self.num_envs <= 1:
+            for episode in range(episodes):
+                state = self.env.reset()
+                episode_reward = 0
+
+                for step in range(max_steps):
+                    action = self.agent.select_action(state)
+                    next_state, reward, done, _ = self.env.step(action)
+                    self.agent.store_reward_mask(reward, 1.0 - float(done))
+
+                    episode_reward += reward
+                    state = next_state
+                    total_steps_since_update += 1
+
+                    if done:
+                        break
+
+                self.log_episode(episode + 1, episode_reward, step + 1)
+
+                if self.agent.batch_ready:
+                    self.agent.update()
+                    n_updates += 1
+                    self.logger.info(
+                        f"PPO update #{n_updates} after {total_steps_since_update} steps"
+                    )
+                    total_steps_since_update = 0
+
+                if (episode + 1) % save_interval == 0:
+                    save_name = Path(self.config.get("save_path", "models/hier_ppo_policy.pth")).name
+                    checkpoint_path = self._get_checkpoint_path(save_name, episode + 1)
+                    self.save_model(str(checkpoint_path))
+                    self.logger.info(f"Model checkpoint saved to {checkpoint_path}")
+        else:
+            self.logger.info(f"Parallel rollout enabled with {self.num_envs} simulator instances")
+            episode_counter = 0
+            with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
+                while episode_counter < episodes:
+                    batch_envs = min(self.num_envs, episodes - episode_counter)
+                    states = [self.envs[i].reset() for i in range(batch_envs)]
+                    episode_rewards = [0.0 for _ in range(batch_envs)]
+                    episode_lengths = [0 for _ in range(batch_envs)]
+                    done_flags = [False for _ in range(batch_envs)]
+
+                    for _ in range(max_steps):
+                        active_envs = [i for i in range(batch_envs) if not done_flags[i]]
+                        if not active_envs:
+                            break
+
+                        actions = [None for _ in range(batch_envs)]
+                        transitions = [None for _ in range(batch_envs)]
+                        for env_idx in active_envs:
+                            action, transition = self.agent.sample_action(states[env_idx])
+                            actions[env_idx] = action
+                            transitions[env_idx] = transition
+
+                        futures = {
+                            env_idx: executor.submit(self.envs[env_idx].step, actions[env_idx])
+                            for env_idx in active_envs
+                        }
+
+                        for env_idx in active_envs:
+                            next_state, reward, done, _ = futures[env_idx].result()
+                            self.agent.append_transition(
+                                transitions[env_idx], reward, 1.0 - float(done)
+                            )
+                            episode_rewards[env_idx] += reward
+                            episode_lengths[env_idx] += 1
+                            states[env_idx] = next_state
+                            done_flags[env_idx] = bool(done)
+                            total_steps_since_update += 1
+
+                        if self.agent.batch_ready:
+                            self.agent.update()
+                            n_updates += 1
+                            self.logger.info(
+                                f"PPO update #{n_updates} after {total_steps_since_update} steps"
+                            )
+                            total_steps_since_update = 0
+
+                    for env_idx in range(batch_envs):
+                        episode_counter += 1
+                        self.log_episode(
+                            episode_counter,
+                            episode_rewards[env_idx],
+                            max(1, episode_lengths[env_idx]),
+                        )
+
+                        if episode_counter % save_interval == 0:
+                            save_name = Path(self.config.get("save_path", "models/hier_ppo_policy.pth")).name
+                            checkpoint_path = self._get_checkpoint_path(save_name, episode_counter)
+                            self.save_model(str(checkpoint_path))
+                            self.logger.info(f"Model checkpoint saved to {checkpoint_path}")
         
         # Flush any remaining transitions
         if len(self.agent.memory) > 0:
@@ -152,18 +234,24 @@ class HierarchicalPPOTrainer(BaseTrainer):
     def cleanup(self):
         """Cleanup resources after training."""
         super().cleanup()
-        if self.networker:
+        networkers = self.networkers or ([self.networker] if self.networker else [])
+        seen = set()
+        for networker in networkers:
+            if networker is None:
+                continue
+            key = id(networker)
+            if key in seen:
+                continue
+            seen.add(key)
             try:
-                # Prefer the high-level shutdown API; fall back to older disconnect methods
-                if hasattr(self.networker, "shutdown") and callable(self.networker.shutdown):
-                    self.networker.shutdown()
-                elif hasattr(self.networker, "disconnect_from_sim") and callable(self.networker.disconnect_from_sim):
-                    self.networker.disconnect_from_sim()
+                if hasattr(networker, "shutdown") and callable(networker.shutdown):
+                    networker.shutdown()
+                elif hasattr(networker, "disconnect_from_sim") and callable(networker.disconnect_from_sim):
+                    networker.disconnect_from_sim()
                 else:
-                    # Try commander/game watcher shutdown hooks where available
                     try:
-                        if hasattr(self.networker, "commander") and hasattr(self.networker.commander, "disconnect_from_sim"):
-                            self.networker.commander.disconnect_from_sim()
+                        if hasattr(networker, "commander") and hasattr(networker.commander, "disconnect_from_sim"):
+                            networker.commander.disconnect_from_sim()
                     except Exception:
                         pass
             except Exception as e:
