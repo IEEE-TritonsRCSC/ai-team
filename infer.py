@@ -10,6 +10,7 @@ environment. Supports:
 Usage examples:
     python infer.py --trainer hier_ppo --model_path models/hier_ppo_policy.pth
     python infer.py --trainer discrete_ppo --model_path models/discrete_ppo_policy.pth
+    python infer.py --trainer discreteq_learning --model_path models/qlearning_policy.pth
     python infer.py --trainer sb3_ppo --model_path models/sb3_ppo_policy.zip
 """
 import argparse
@@ -120,6 +121,33 @@ def _run_discrete_ppo(args, networker: Networker, team_name: str):
     print(f"Discrete PPO inference complete — {args.steps} steps.")
 
 
+def _run_discreteq_learning(args, networker: Networker, team_name: str):
+    """Run inference with the Discrete Q-Learning agent."""
+    from ai_interface.envs.discrete_simple import SimpleDiscreteEnv
+    from ai_interface.algorithms.discrete_qlearning import QLearningAgent
+
+    device = _resolve_device()
+
+    env = SimpleDiscreteEnv(
+        networker=networker,
+        team_name=team_name,
+        obs_dim=args.obs_dim,
+    )
+
+    agent = QLearningAgent(obs_dim=args.obs_dim, num_actions=5, device=device)
+    agent.load(args.model_path)
+
+    obs = env.reset()
+    for step in range(int(args.steps)):
+        state = np.array(obs, dtype=np.float32)
+        action = agent.select_action(state, eval_mode=True)
+        obs, _reward, done, _info = env.step(action)
+        if done:
+            obs = env.reset()
+
+    print(f"Discrete Q-Learning inference complete — {args.steps} steps.")
+
+
 def _run_sb3_ppo(args, networker: Networker, team_name: str):
     """Run inference with Stable Baselines3 PPO."""
     from ai_interface.envs.sim_env import SimulatorEnv
@@ -147,6 +175,7 @@ def _run_sb3_ppo(args, networker: Networker, team_name: str):
 _TRAINER_RUNNERS = {
     "hier_ppo": _run_hier_ppo,
     "discrete_ppo": _run_discrete_ppo,
+    "discreteq_learning": _run_discreteq_learning,
     "sb3_ppo": _run_sb3_ppo,
 }
 
