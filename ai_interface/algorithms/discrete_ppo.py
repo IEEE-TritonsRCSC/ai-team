@@ -65,28 +65,41 @@ class DiscretePPOAgent:
     def store_reward_mask(self, reward: float, mask: float):
         self.rewards.append(reward)
         self.masks.append(mask)
-    
-    def select_action(self, state):
-        """Select an action using the policy."""
+
+    def sample_action(self, state):
+        """Sample an action without mutating replay buffers.
+
+        Returns:
+            (action_int, transition_dict)
+        """
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        
+
         with torch.no_grad():
             logits, value = self.model(state)
-        
-        # Sample action from categorical distribution
+
         dist = Categorical(logits=logits)
         action = dist.sample()
         logprob = dist.log_prob(action)
-        
-        # Store in memory
-        self.memory.append({
+
+        transition = {
             "state": state.detach(),
             "action": action.detach(),
             "logprob": logprob.detach(),
             "value": value.detach()
-        })
-        
-        return action.item()  # Return as integer
+        }
+        return action.item(), transition
+
+    def append_transition(self, transition: dict, reward: float, mask: float):
+        """Append a precomputed transition and its reward/mask."""
+        self.memory.append(transition)
+        self.rewards.append(reward)
+        self.masks.append(mask)
+    
+    def select_action(self, state):
+        """Select an action using the policy."""
+        action, transition = self.sample_action(state)
+        self.memory.append(transition)
+        return action  # Return as integer
     
     def compute_advantages(self, rewards, masks, values):
         """Compute GAE advantages."""

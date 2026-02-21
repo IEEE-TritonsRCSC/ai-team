@@ -29,6 +29,12 @@ parser.add_argument("--env", choices=[
     "field-tournament" # our team only - camera + physical robots
 ], default="sim-only")
 parser.add_argument("--estimate", choices=["ball", "player"], dest="estimate_params", default=None,)
+parser.add_argument("--sim_host", type=str, default="127.0.0.1",
+    help="Simulator host for sim-only/sim-mixed")
+parser.add_argument("--sim_player_port", type=int, default=6000,
+    help="Simulator player port")
+parser.add_argument("--sim_trainer_port", type=int, default=6001,
+    help="Simulator trainer/monitor port")
 
 
 def main():
@@ -48,7 +54,13 @@ def main():
         team_infos = load_team_config(args.team_config)
         # soccer_ai = SoccerAI(team_infos)
         soccer_ai = InterceptDemoAI(team_infos)
-    networker = Networker(team_infos, args.env)
+    networker = Networker(
+        team_infos,
+        args.env,
+        sim_host=args.sim_host,
+        sim_player_port=args.sim_player_port,
+        sim_trainer_port=args.sim_trainer_port,
+    )
     game_state_queue: Queue[GameState] = Queue(maxsize=1)
     stop_event = threading.Event()
     client_thread = None

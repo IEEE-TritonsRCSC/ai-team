@@ -17,6 +17,7 @@ Useful helpers
 - `BaseTrainer` provides logging setup (`self.logger`) and a per-run `run_dir`.
 - Use `self.log_episode(episode, reward, length)` and `self.log_metrics(metrics)` to keep metrics consistent with other trainers.
 - `plot_training()` can be used to save a reward plot into `run_dir`.
+- Use `self._sim_endpoint_for_env(env_index)` to derive host/player/trainer ports for parallel simulator training.
 
 Minimal skeleton
 ```python

@@ -17,8 +17,8 @@ from .data_utils import GameState, TeamInfo, Deserializer
 # Network constants for listening to simulator data
 BUFFER_SIZE = 1536
 LOCALHOST_IP = "127.0.0.1"
-SIM_CLIENT_ADDR = (LOCALHOST_IP, 6000)
-SIM_TRAINER_ADDR = (LOCALHOST_IP, 6001)
+DEFAULT_SIM_PLAYER_PORT = 6000
+DEFAULT_SIM_TRAINER_PORT = 6001
 INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) before_kick_off\)"
 PLAYMODE_REGEX = r"\(hear \d+ referee (\w+)\)"
 
@@ -28,7 +28,9 @@ COMMAND_PORT = 10000
 
 class Listener:
     """Listens for game state updates from simulators or cameras."""
-    def __init__(self, team_infos: list[TeamInfo], environment: str, desired_init_poses: list):
+    def __init__(self, team_infos: list[TeamInfo], environment: str,
+                 desired_init_poses: list, sim_host: str = LOCALHOST_IP,
+                 sim_trainer_port: int = DEFAULT_SIM_TRAINER_PORT):
         """
         Initialize listener for the specified environment.
         
@@ -41,7 +43,7 @@ class Listener:
 
         if environment in ["sim-only", "sim-mixed"]:
             self.source = "simulator"
-            self.addr = SIM_TRAINER_ADDR
+            self.addr = (sim_host, int(sim_trainer_port))
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(0.2)    # Non-blocking with timeout
             self.desired_init_poses = desired_init_poses
@@ -181,7 +183,9 @@ class Listener:
 class Client:
     """Represents a single robot client connection to the simulator."""
     def __init__(self, teamname: str, side: str = "left", 
-                 first: bool = False, goalie: bool = False):
+                 first: bool = False, goalie: bool = False,
+                 sim_host: str = LOCALHOST_IP,
+                 sim_player_port: int = DEFAULT_SIM_PLAYER_PORT):
         """
         Initialize a client connection for a single robot.
         
@@ -194,7 +198,7 @@ class Client:
         self.teamname = teamname
         self.init_pose = self.get_init_pose(side, first, goalie)
 
-        self.addr = SIM_CLIENT_ADDR
+        self.addr = (sim_host, int(sim_player_port))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.connect_to_sim(goalie)
 
@@ -270,7 +274,9 @@ class Client:
 
 class Commander:
     """Manages command sending to both simulated and physical robots."""
-    def __init__(self, team_infos: list[TeamInfo], environment: str):
+    def __init__(self, team_infos: list[TeamInfo], environment: str,
+                 sim_host: str = LOCALHOST_IP,
+                 sim_player_port: int = DEFAULT_SIM_PLAYER_PORT):
         """
         Initialize commander for the given teams and environment.
         
@@ -280,6 +286,8 @@ class Commander:
         """
         self.team_infos = team_infos
         self.environment = environment
+        self.sim_host = sim_host
+        self.sim_player_port = int(sim_player_port)
         self.desired_init_poses = []
         self.sample_client = None
 
@@ -306,7 +314,9 @@ class Commander:
                 teamname = team_info.name
                 goalie = (i == goalie_0idx)
 
-                client = Client(teamname, side, i == 0, goalie)
+                client = Client(teamname, side, i == 0, goalie,
+                                sim_host=self.sim_host,
+                                sim_player_port=self.sim_player_port)
                 self.sim_clients[teamname][i] = client
                 if self.sample_client is None:
                     self.sample_client = client    # Save one sample client for reference

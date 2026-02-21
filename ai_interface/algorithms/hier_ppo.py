@@ -83,9 +83,15 @@ class PPOAgent:
         self.rewards.append(reward)
         self.masks.append(mask)
 
-    def select_action(self, state):
+    def sample_action(self, state):
+        """Sample an action without mutating rollout buffers.
+
+        Returns:
+            (action_dict, transition_dict)
+        """
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        high_logits, low_mean, low_std, value = self.model(state)
+        with torch.no_grad():
+            high_logits, low_mean, low_std, value = self.model(state)
         
         # Discrete high-level
         high_dist = Categorical(logits=high_logits)
@@ -111,19 +117,31 @@ class PPOAgent:
                 low_action[0] = torch.abs(low_action[0]) + 1e-6
             # recompute logprob for the modified low_action
             low_logprob = low_dist.log_prob(low_action).sum()
-        
-        # Store in memory (detached tensors on agent device)
-        self.memory.append({
+
+        transition = {
             "state": state.detach(),
             "high_action": high_action.detach(),
             "low_action": low_action.detach(),
             "high_logprob": high_logprob.detach(),
             "low_logprob": low_logprob.detach(),
             "value": value.detach()
-        })
-        
-        return {"high_level": high_action.item(),
-                "low_level": low_action.detach().cpu().numpy()}
+        }
+        action = {
+            "high_level": high_action.item(),
+            "low_level": low_action.detach().cpu().numpy()
+        }
+        return action, transition
+
+    def append_transition(self, transition: dict, reward: float, mask: float):
+        """Append a precomputed transition and its reward/mask."""
+        self.memory.append(transition)
+        self.rewards.append(reward)
+        self.masks.append(mask)
+
+    def select_action(self, state):
+        action, transition = self.sample_action(state)
+        self.memory.append(transition)
+        return action
 
     def compute_advantages(self, rewards, masks, values):
         advantages = []

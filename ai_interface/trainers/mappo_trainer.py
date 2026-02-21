@@ -31,8 +31,15 @@ class MAPPOTrainer(BaseTrainer):
         """Setup the multi-agent soccer environment."""
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
-        
-        self.networker = Networker(team_infos, self.config.get("env_mode", "sim-only"))
+
+        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
+        self.networker = Networker(
+            team_infos,
+            self.config.get("env_mode", "sim-only"),
+            sim_host=sim_host,
+            sim_player_port=sim_player_port,
+            sim_trainer_port=sim_trainer_port,
+        )
         
         self.env = MultiAgentSoccerEnv(
             networker=self.networker,
@@ -41,7 +48,10 @@ class MAPPOTrainer(BaseTrainer):
             obs_dim=self.config.get("obs_dim", 25)
         )
         
-        self.logger.info(f"Multi-agent environment setup - Team: {team_name}, Agents: {self.num_agents}")
+        self.logger.info(
+            "Multi-agent environment setup - Team: %s, Agents: %d, Endpoint: %s:%d/%d",
+            team_name, self.num_agents, sim_host, sim_player_port, sim_trainer_port
+        )
         self.logger.info(f"Action space: 6 discrete actions per agent (APPROACH, SHOOT, PASS, DRIBBLE, CLEAR, REPOSITION)")
         return self.env
     

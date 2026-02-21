@@ -62,7 +62,9 @@ class BaseTrainer(abc.ABC):
         The log file itself is simply called ``train_log.log``.
         """
         # Create a datetime-named sub-directory for this run
-        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Include microseconds to avoid collisions when parallel workers start
+        # within the same second.
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.run_dir = Path(self.log_dir) / self.run_timestamp
         self.run_dir.mkdir(parents=True, exist_ok=True)
         
@@ -184,6 +186,20 @@ class BaseTrainer(abc.ABC):
         """
         p = Path(filename)
         return self.model_dir / f"{p.stem}_ep{tag}{p.suffix}"
+
+    def _sim_endpoint_for_env(self, env_index: int = 0) -> tuple[str, int, int]:
+        """Return simulator endpoint for a specific parallel environment index.
+
+        Port layout:
+        - player port:  base + idx * stride
+        - trainer port: player + 1
+        """
+        sim_host = str(self.config.get("sim_host", "127.0.0.1"))
+        base_port = int(self.config.get("sim_player_port", 6000))
+        stride = max(3, int(self.config.get("sim_port_stride", 10)))
+        player_port = base_port + env_index * stride
+        trainer_port = player_port + 1
+        return sim_host, player_port, trainer_port
 
     # ------------------------------------------------------------------
     # Plotting helpers
