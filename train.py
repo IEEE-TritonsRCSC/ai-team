@@ -23,7 +23,7 @@ from typing import Dict, Any
 
 import torch
 
-from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer, DiscretePPOTrainer, MAPPOTrainer
+from ai_interface.trainers import BaseTrainer, HierarchicalPPOTrainer, SB3PPOTrainer, DiscretePPOTrainer, MAPPOTrainer, QLearningTrainer
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -73,6 +73,24 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "save_interval": args.save_interval,
             "load_model": args.load_model or args.resume_checkpoint
         }
+    elif trainer_type == "qlearning":
+        return {
+            **base_config,
+            "episodes": args.episodes,
+            "max_steps": args.max_steps,
+            "obs_dim": args.obs_dim,
+            "save_path": args.save_path or "models/q_learning.pth",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "lr": args.lr,
+            "gamma": args.gamma,
+            "epsilon_start": args.epsilon_start,
+            "epsilon_end": args.epsilon_end,
+            "epsilon_decay": args.epsilon_decay,
+            "buffer_size": args.buffer_size,
+            "batch_size": args.batch_size,
+            "update_frequency": args.update_frequency,
+        }
     elif trainer_type == "sb3_ppo":
         return {
             **base_config,
@@ -94,6 +112,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> BaseTrainer:
         "discrete_ppo": DiscretePPOTrainer,
         "mappo": MAPPOTrainer,
         "sb3_ppo": SB3PPOTrainer,
+        "qlearning": QLearningTrainer,
     }
     
     if trainer_type not in trainers:
@@ -123,13 +142,14 @@ Examples:
   python train.py --config configs/mappo_config.json
   python train.py --trainer sb3_ppo --timesteps 20000
   python train.py --trainer discrete_ppo --resume_checkpoint models/old_run/policy_ep200.pth --curriculum --start_phase 2
+  python train.py --trainer qlearning --episodes 2000 --lr 1e-3 --epsilon_decay 0.995
         """
     )
     
     # Configuration options
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
-    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo"],
+    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
@@ -175,6 +195,24 @@ Examples:
     parser.add_argument("--start_phase", type=int, default=0,
                         help="Curriculum phase to start from (0-4). "
                              "Use 2 to start from Phase 3 after Phase 1-2 training.")
+    
+    # Q-Learning specific options
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate (qlearning)")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Discount factor (qlearning)")
+    parser.add_argument("--epsilon_start", type=float, default=1.0,
+                        help="Initial exploration rate (qlearning)")
+    parser.add_argument("--epsilon_end", type=float, default=0.01,
+                        help="Final exploration rate (qlearning)")
+    parser.add_argument("--epsilon_decay", type=float, default=0.995,
+                        help="Epsilon decay rate per update (qlearning)")
+    parser.add_argument("--buffer_size", type=int, default=10000,
+                        help="Replay buffer capacity (qlearning)")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Batch size for Q-network updates (qlearning)")
+    parser.add_argument("--update_frequency", type=int, default=4,
+                        help="Update Q-network every N steps (qlearning)")
     
     parser.add_argument("--log_dir", type=str, default="train_logs",
                         help="Directory for training logs")
