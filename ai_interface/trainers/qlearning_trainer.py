@@ -16,8 +16,8 @@ from pathlib import Path
 import json
 
 from .base_trainer import BaseTrainer
-from ai_interface.envs.minimal_soccer_env import MinimalSoccerEnv
-from ai_interface.algorithms.q_learning import QLearningAgent
+from ai_interface.envs.discrete_simple import SimpleDiscreteEnv
+from ai_interface.algorithms.discrete_qlearning import QLearningAgent
 from networking.networker import Networker, TeamInfo
 
 
@@ -45,7 +45,7 @@ class QLearningTrainer(BaseTrainer):
             sim_trainer_port=sim_trainer_port,
         )
         
-        self.env = MinimalSoccerEnv(
+        self.env = SimpleDiscreteEnv(
             networker=self.networker,
             team_name=team_name,
             obs_dim=self.config.get("obs_dim", 8)
