@@ -1,4 +1,4 @@
-"""Minimal gym.Env adapter for the project simulator.
+"""Minimal gym. Env adapter for the project simulator.
 
 This is a thin, test-friendly adapter that shows where to plug the real
 `networker` interaction. It intentionally provides placeholder observation

@@ -6,13 +6,15 @@ This script provides a unified interface for training different RL algorithms
 with various configurations. It supports:
 - Hierarchical PPO
 - Discrete PPO
+- MAPPO (Multi-Agent PPO)
 - Stable Baselines3 PPO
-- Other custom algorithms (extensible)
+- TD3 JAL (Twin Delayed DDPG for Joint-Action Learning)
 
 Usage:
-    python train_unified.py --config configs/hier_ppo_config.json
-    python train_unified.py --trainer hier_ppo --team_config team_config.json
-    python train_unified.py --trainer sb3_ppo --timesteps 20000
+    python train.py --config configs/hier_ppo_config.json
+    python train.py --trainer hier_ppo --team_config team_config.json
+    python train.py --trainer td3_jal --timesteps 400000
+    python train.py --config configs/td3_jal_config.json
 """
 
 import argparse
@@ -24,8 +26,14 @@ import importlib
 
 import torch
 
-if TYPE_CHECKING:
-    from ai_interface.trainers.base_trainer import BaseTrainer
+from ai_interface.trainers import (
+    BaseTrainer, 
+    HierarchicalPPOTrainer, 
+    SB3PPOTrainer, 
+    DiscretePPOTrainer, 
+    MAPPOTrainer,
+    TD3JALTrainer
+)
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -107,6 +115,30 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "load_model": args.load_model or args.resume_checkpoint,
             "model_params": {}
         }
+    elif trainer_type == "td3_jal":
+        return {
+            **base_config,
+            "num_robots": getattr(args, "num_robots", 2),
+            "obs_dim": args.obs_dim,
+            "timesteps": args.timesteps,
+            "learn_batch_timesteps": args.learn_batch_timesteps,
+            "save_path": args.save_path or "models/td3_jal_policy.zip",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model,
+            "model_params": {
+                "learning_rate": 0.001,
+                "buffer_size": 100000,
+                "batch_size": 64,
+                "gamma": 0.9,
+                "tau": 0.01,
+                "policy_delay": 2,
+                "target_policy_noise": 0.2,
+                "action_noise_std": 0.05,
+                "policy_kwargs": {
+                    "net_arch": [64, 48, 32]
+                }
+            }
+        }
     else:
         raise ValueError(f"Unknown trainer type: {trainer_type}")
 
@@ -119,6 +151,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "mappo": ("ai_interface.trainers.mappo_trainer", "MAPPOTrainer"),
         "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
+        "td3_jal": TD3JALTrainer,
     }
     
     if trainer_type not in trainers:
@@ -154,8 +187,8 @@ Examples:
   python train.py --config configs/hier_ppo_config.json
   python train.py --trainer hier_ppo --episodes 1000 --max_steps 200
   python train.py --trainer mappo --num_agents 3 --obs_dim 25 --episodes 3000
-  python train.py --config configs/mappo_config.json
-  python train.py --trainer sb3_ppo --timesteps 20000
+  python train.py --trainer td3_jal --timesteps 400000 --num_robots 2
+  python train.py --config configs/td3_jal_config.json
   python train.py --trainer discrete_ppo --resume_checkpoint models/old_run/policy_ep200.pth --curriculum --start_phase 2
   python train.py --trainer qlearning --episodes 2000 --lr 1e-3 --epsilon_decay 0.995
   python train.py --trainer discrete_ppo --episodes 2000 --num_envs 4 --sim_player_port 6000 --sim_port_stride 10
@@ -165,7 +198,8 @@ Examples:
     # Configuration options
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
-    parser.add_argument("--trainer", type=str, choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo", "qlearning"],
+    parser.add_argument("--trainer", type=str, 
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo", "td3_jal", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
@@ -185,26 +219,30 @@ Examples:
     parser.add_argument("--sim_port_stride", type=int, default=10,
                         help="Port stride between parallel envs (must avoid overlap, recommended >= 3)")
     
-    # Hierarchical PPO specific options
+    # Episode-based trainers (hier_ppo, discrete_ppo, mappo)
     parser.add_argument("--episodes", type=int, default=1000,
-                        help="Number of episodes to train (hier_ppo)")
+                        help="Number of episodes to train (hier_ppo, discrete_ppo, mappo)")
     parser.add_argument("--max_steps", type=int, default=200,
-                        help="Maximum steps per episode (hier_ppo)")
-    parser.add_argument("--obs_dim", type=int, default=10,
-                        help="Observation dimension (hier_ppo, discrete_ppo, mappo)")
+                        help="Maximum steps per episode (hier_ppo, discrete_ppo, mappo)")
+    
+    # Observation/action space
+    parser.add_argument("--obs_dim", type=int, default=18,
+                        help="Observation dimension (default: 18 for TD3 JAL, others may vary)")
     parser.add_argument("--num_agents", type=int, default=3,
                         help="Number of agents per team (mappo)")
+    parser.add_argument("--num_robots", type=int, default=2,
+                        help="Number of robots in JAL (td3_jal)")
     
-    # SB3 PPO specific options
-    parser.add_argument("--timesteps", type=int, default=10000,
-                        help="Total timesteps to train (sb3_ppo)")
+    # Timestep-based trainers (sb3_ppo, td3_jal)
+    parser.add_argument("--timesteps", type=int, default=400000,
+                        help="Total timesteps to train (sb3_ppo, td3_jal)")
     parser.add_argument("--learn_batch_timesteps", type=int, default=2048,
-                        help="Timesteps per learning batch (sb3_ppo)")
+                        help="Timesteps per learning batch (sb3_ppo, td3_jal)")
     
     # Common options
     parser.add_argument("--save_path", type=str, default=None,
                         help="Where to save the trained model")
-    parser.add_argument("--save_interval", type=int, default=100,
+    parser.add_argument("--save_interval", type=int, default=10000,
                         help="Save model every N episodes/timesteps")
     parser.add_argument("--load_model", type=str, default=None,
                         help="Path to load a pre-trained model (optional)")
@@ -278,7 +316,7 @@ Examples:
             print(f"  Original checkpoint will NOT be modified.")
             print(f"  New checkpoints will be saved to a fresh timestamped directory.\n")
         
-        print(f"Starting {trainer_type} training with configuration:")
+        print(f"\nStarting {trainer_type} training with configuration:")
         print(json.dumps(config, indent=2))
         
         # Create trainer
@@ -290,13 +328,17 @@ Examples:
         finally:
             trainer.cleanup()
         
+        print("\n" + "="*60)
         print("Training completed successfully!")
+        print("="*60)
         
     except KeyboardInterrupt:
-        print("\\nTraining interrupted by user")
+        print("\n\nTraining interrupted by user")
         sys.exit(0)
     except Exception as e:
-        print(f"Training failed with error: {e}")
+        print(f"\nTraining failed with error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
