@@ -13,6 +13,7 @@ A Python-based AI framework for controlling robotic soccer teams in both simulat
 - [Usage](#usage)
   - [Basic Usage](#basic-usage)
   - [Command Line Options](#command-line-options)
+  - [Simulator Launcher (Quick)](#simulator-launcher-quick)
 - [Development](#development)
   - [Implementing Custom AI](#implementing-custom-ai)
   - [Game State Structure](#game-state-structure)
@@ -112,6 +113,36 @@ python .
   - `field-practice`: Physical robots with camera
   - `field-tournament`: Tournament mode (own team only)
 
+### Simulator Launcher (Quick)
+
+Use `launch_sims.py` with only two core controls:
+- `--env`: how many sim instances to launch
+- `--monitor`: whether to launch monitor instances (same count as `--env`)
+
+Examples:
+```bash
+# Launch 2 sim instances, no monitor
+python launch_sims.py --env 2
+
+# Launch 2 sim instances + 2 monitor instances
+python launch_sims.py --env 2 --monitor
+
+# Explicit boolean value
+python launch_sims.py --env 2 --monitor true
+python launch_sims.py --env 2 --monitor false
+
+# Positional boolean (same effect)
+python launch_sims.py --env 2 true
+python launch_sims.py --env 2 false
+```
+
+If your executable names are customized, pass them in:
+```bash
+python launch_sims.py --env 2 --monitor \
+  --sim-cmd "rcsserver" \
+  --monitor-cmd "monitor"
+```
+
 ### Parameter Estimation
 
 `ai_interface/utils/param_estimator.py` contains utility that estimates `dash_power_rate`, `player_decay`, `ball_decay`, and `player_speed_max` (server configs used in calculation) by doing real-life experiments.
@@ -192,9 +223,8 @@ The `GameState` object contains:
 ### Networking Protocol
 
 **Simulation Mode**: Communicates with the Simulation Server using UDP sockets on localhost:
-- **Default Client Port**: 6000 (robot commands)
-- **Default Trainer Port**: 6001 (game state monitoring)
-- Ports are configurable from training config/CLI (`sim_player_port`, `sim_port_stride`, `num_envs`).
+- **Client Port**: 6000 (robot commands)
+- **Trainer Port**: 6001 (game state monitoring)
 
 **Camera Mode**: Uses SSL vision protocol via `sslclient`:
 - Receives detection data with ball and robot positions
@@ -221,31 +251,6 @@ The system uses threading to:
 - Process multiple teams concurrently
 - Send commands to multiple robots simultaneously
 - Maintain responsive network communication
-
-## Parallel Training
-
-`train.py` supports running multiple simulator environments in parallel for PPO training.
-
-Start simulators first:
-```bash
-python launch_sims.py --num_envs 4 --sim_player_port 6000 --sim_port_stride 10
-```
-
-If you also want monitor windows (similar to `rcsoccersim`):
-```bash
-python launch_sims.py --num_envs 2 --with_monitor --monitor_bin Downloads/rcssmonitor-19.0.1/src/rcssmonitor
-```
-
-Example:
-```bash
-python train.py --trainer discrete_ppo --episodes 2000 --num_envs 4 --sim_player_port 6000 --sim_port_stride 10
-```
-
-With this setup, env ports become:
-- env0: player `6000`, trainer `6001`
-- env1: player `6010`, trainer `6011`
-- env2: player `6020`, trainer `6021`
-- env3: player `6030`, trainer `6031`
 
 ## License
 
