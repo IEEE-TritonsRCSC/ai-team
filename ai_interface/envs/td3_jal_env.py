@@ -140,6 +140,7 @@ class TD3JALEnv(gym.Env):
             info: Additional information dictionary
         """
         super().reset(seed=seed)
+        self.networker.reset_sim()
         
         # Reset episode tracking
         self.current_step = 0

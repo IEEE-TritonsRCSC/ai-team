@@ -151,7 +151,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "mappo": ("ai_interface.trainers.mappo_trainer", "MAPPOTrainer"),
         "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
-        "td3_jal": TD3JALTrainer,
+        "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
     }
     
     if trainer_type not in trainers:
