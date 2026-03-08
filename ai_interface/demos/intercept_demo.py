@@ -245,7 +245,7 @@ class InterceptDemoAI(SoccerAI):
         slow_threshold = 0.2
         region = self._receiver_region(self_p0)
         has_ball = self.hasBall(dist, abs(heading - math.atan2(to_ball[1], to_ball[0])))
-        
+        """
         # Initialize random shoot angle if not set
         if self.receiver_shoot_angle == 0:
             print("New angle")
@@ -311,10 +311,9 @@ class InterceptDemoAI(SoccerAI):
             self.receiver_decision = decision
             self.receiver_decision_expiring = expiring
             return cmd
-        
+        """
         # 1) Optimal placement at the angular bisector
         # Compute optimal target position using angle bisector
-        goalie_pos = (float(self_p0[0]), float(self_p0[1]))
         goalie_pose = (float(self_p0[0]), float(self_p0[1]), math.degrees(heading))
         print('-----------------------------GOALIE ACTION-----------------------------')
         goalie_cmd = self._goalie.action(
@@ -328,4 +327,4 @@ class InterceptDemoAI(SoccerAI):
 
     def hasBall(self, robot_to_ball_dist: float, angle_diff: float) -> bool:
         angle_diff = min(angle_diff, 2 * math.pi - angle_diff)
-        return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < 0.1 and abs(angle_diff) < math.radians(5)
+        return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < 0.2 and abs(angle_diff) < math.radians(5)
