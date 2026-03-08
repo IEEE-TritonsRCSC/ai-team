@@ -55,7 +55,7 @@ diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
 +
 +    // Facing = Player's facing direction unit vector | F = ( cos(angle_body), sin(angle_body) )
 +    // Difference = Ball - Player | D = B - P
-+    PVector facing = PVector::fromPolar( 1.0, Deg2Rad( M_angle_body ) );
++    PVector facing = PVector::fromPolar( 1.0, M_angle_body );
 +    PVector difference = M_stadium.ball().pos() - pos();
 +    
 +    // (F . D) = |F| * |D| * cos(angle_diff)
