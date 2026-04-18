@@ -148,16 +148,9 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     Returns `kick power rel_angle` when the ball is within kickable_tolerance of the
     agent and facing within angle_tolerance radians; otherwise returns `"failed"`.
     """
-<<<<<<< HEAD
-    self_pose = _as_float_array(self_pose)
-    ball_pose = _as_float_array(ball_pose)
-    target = _as_float_array(target)
-    if np.linalg.norm(ball_pose - self_pose[:2]) > kickable_tolerance:
-=======
     ball_xy = np.array(ball_pose[:2], dtype=float)
     self_xy = np.array(self_pose[:2], dtype=float)
     if np.linalg.norm(ball_xy - self_xy) > kickable_tolerance:
->>>>>>> 30da0dde1cf2f11bec0530605a8b2c7eb10ad499
         return "failed"
 
     angle_to_target = np.arctan2(target[1] - self_xy[1], target[0] - self_xy[0])
@@ -179,12 +172,6 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
         if dribbling:
             return f"turn {angle_diff}"
         else:
-<<<<<<< HEAD
-            return dribble(self_pose, ball_pose) # "failed", "turn {angle_diff}" or "catch 0"
-    else:
-        return f"kick {kick_power} {0}"
-        
-=======
             return f"kick {kick_power:.1f} {0}"
     else:
         ball_xy = np.array(ball_pose[:2], dtype=float)
@@ -195,7 +182,6 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
             return f"kick {kick_power:.1f} {0}"
         else:
             return cmd
->>>>>>> 30da0dde1cf2f11bec0530605a8b2c7eb10ad499
 
 
 def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
@@ -230,15 +216,9 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     when the ball is within kickable_tolerance and aligned within angle_tolerance radians;
     otherwise returns `"failed"`.
     """
-<<<<<<< HEAD
-    self_pose = _as_float_array(self_pose)
-    ball_pose = _as_float_array(ball_pose)
-    if np.linalg.norm(ball_pose-self_pose[:2]) > kickable_tolerance:
-=======
     ball_xy = np.array(ball_pose[:2], dtype=float)
     self_xy = np.array(self_pose[:2], dtype=float)
     if np.linalg.norm(ball_xy - self_xy) > kickable_tolerance:
->>>>>>> 30da0dde1cf2f11bec0530605a8b2c7eb10ad499
         return "failed"
 
     ball_dir = normalize_angle(np.arctan2(ball_xy[1] - self_xy[1], ball_xy[0] - self_xy[0]))
