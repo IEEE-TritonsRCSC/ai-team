@@ -7,6 +7,7 @@ with various configurations. It supports:
 - Hierarchical PPO
 - Discrete PPO
 - MAPPO (Multi-Agent PPO)
+- HSM-MARL (Hierarchical State Machine + MAPPO)
 - Stable Baselines3 PPO
 - TD3 JAL (Twin Delayed DDPG for Joint-Action Learning)
 
@@ -32,7 +33,9 @@ from ai_interface.trainers import (
     SB3PPOTrainer, 
     DiscretePPOTrainer, 
     MAPPOTrainer,
-    TD3JALTrainer
+    TD3JALTrainer,
+    HSMMARLTrainer,
+    HSMSB3PPOTrainer,
 )
 
 
@@ -87,6 +90,53 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "save_interval": args.save_interval,
             "load_model": args.load_model or args.resume_checkpoint
         }
+    elif trainer_type == "hsm_marl":
+        hsm_num_agents = args.num_agents if args.num_agents != 3 else 4
+        return {
+            **base_config,
+            "episodes": args.episodes,
+            "max_steps": args.max_steps,
+            "obs_dim": args.obs_dim,
+            "num_agents": hsm_num_agents,
+            "save_path": args.save_path or "models/hsm_marl_final.pth",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "algorithm": {
+                "learning_rate": 3e-4,
+                "critic_learning_rate": 1e-3,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_eps": 0.2,
+                "entropy_coef": 0.03,
+                "value_coef": 0.5,
+                "max_grad_norm": 0.5,
+                "ppo_epochs": 4,
+                "rollout_length": 2048,
+                "hidden_dims": [128, 128],
+            },
+            "hsm_thresholds": {
+                "possession_distance": 1.35,
+                "defensive_x_boundary": -10.0,
+                "attacking_x_boundary": 10.0,
+                "role_switch_cooldown": 8,
+            },
+            "curriculum": {
+                "stage1": {
+                    "episodes": 300,
+                    "num_agents": 1,
+                    "roles_to_train": ["STRIKER", "SUPPORT", "DEFENDER", "GOALIE"],
+                },
+                "stage2": {
+                    "episodes": 500,
+                    "num_agents": 2,
+                    "forced_roles": {"0": "STRIKER", "1": "SUPPORT"},
+                },
+                "stage3": {
+                    "episodes": 1200,
+                    "num_agents": hsm_num_agents,
+                },
+            },
+        }
     elif trainer_type == "qlearning":
         return {
             **base_config,
@@ -139,6 +189,30 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
                 }
             }
         }
+    elif trainer_type == "hsm_sb3_ppo":
+        return {
+            **base_config,
+            "unum": 1,
+            "obs_dim": args.obs_dim if args.obs_dim != 18 else 28,
+            "max_steps": args.max_steps,
+            "timesteps": args.timesteps,
+            "learn_batch_timesteps": args.learn_batch_timesteps,
+            "save_path": args.save_path or "models/hsm_sb3_ppo_policy.zip",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "model_params": {
+                "learning_rate": 3e-4,
+                "n_steps": 2048,
+                "batch_size": 64,
+                "n_epochs": 10,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "ent_coef": 0.01,
+                "vf_coef": 0.5,
+                "max_grad_norm": 0.5,
+            },
+        }
     else:
         raise ValueError(f"Unknown trainer type: {trainer_type}")
 
@@ -149,6 +223,8 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "hier_ppo": ("ai_interface.trainers.hier_ppo_trainer", "HierarchicalPPOTrainer"),
         "discrete_ppo": ("ai_interface.trainers.discrete_ppo_trainer", "DiscretePPOTrainer"),
         "mappo": ("ai_interface.trainers.mappo_trainer", "MAPPOTrainer"),
+        "hsm_marl": ("ai_interface.trainers.hsm_marl_trainer", "HSMMARLTrainer"),
+        "hsm_sb3_ppo": ("ai_interface.trainers.hsm_sb3_ppo_trainer", "HSMSB3PPOTrainer"),
         "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
         "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
@@ -187,6 +263,8 @@ Examples:
   python train.py --config configs/hier_ppo_config.json
   python train.py --trainer hier_ppo --episodes 1000 --max_steps 200
   python train.py --trainer mappo --num_agents 3 --obs_dim 25 --episodes 3000
+    python train.py --trainer hsm_marl --num_agents 4 --obs_dim 33 --episodes 3000
+    python train.py --trainer hsm_sb3_ppo --timesteps 300000 --obs_dim 28
   python train.py --trainer td3_jal --timesteps 400000 --num_robots 2
   python train.py --config configs/td3_jal_config.json
   python train.py --trainer discrete_ppo --resume_checkpoint models/old_run/policy_ep200.pth --curriculum --start_phase 2
@@ -199,7 +277,7 @@ Examples:
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
     parser.add_argument("--trainer", type=str, 
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo", "td3_jal", "qlearning"],
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "sb3_ppo", "td3_jal", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
