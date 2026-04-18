@@ -17,6 +17,17 @@ def clamp(v: float, lo: float, hi: float) -> float:
     """Clamp a value between bounds."""
     return max(lo, min(hi, v))
 
+def dist_point_to_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    """Distance from point p to segment a->b."""
+    v = b - a
+    vv = float(np.dot(v, v))
+    if vv < 1e-9:
+        return float(np.linalg.norm(p - a))
+    t = float(np.dot(p - a, v) / vv)
+    t = float(np.clip(t, 0.0, 1.0))
+    proj = a + t * v
+    return float(np.linalg.norm(p - proj))
+
 def get_side(position: Tuple[float, ...]) -> str:
     """Get the side of the field from a position. position is (x, y) or (x, y, theta)."""
     if position[0] < 0:

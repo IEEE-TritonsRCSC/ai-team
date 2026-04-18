@@ -192,3 +192,56 @@ class Player:
         robot_to_ball_dist = np.linalg.norm(robot_to_ball_vec)
         return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < KICKABLE_MARGIN and \
             (not check_angle or abs(angle_diff) < math.radians(5))
+
+    def approach_offset(self, target: Tuple[float, float], ball_xy: Tuple[float, float], approach_back_extra: float = 1.2) -> np.ndarray:
+        """Vector from ball to a staging point behind it along the shot line."""
+        bx, by = float(ball_xy[0]), float(ball_xy[1])
+        dir_vec = np.array([float(target[0]) - bx, float(target[1]) - by], dtype=float)
+        norm = float(np.linalg.norm(dir_vec))
+        if norm < 1e-6:
+            dir_vec = np.array([1.0, 0.0], dtype=float)
+            norm = 1.0
+        back = BALL_SIZE + PLAYER_SIZE + KICKABLE_MARGIN / 2 + approach_back_extra
+        return -(dir_vec / norm) * back
+    
+    
+    def contact_point(self, target: Tuple[float, float], ball_xy: Tuple[float, float]) -> np.ndarray:
+        """Point just behind the ball along the shot line for contact."""
+        bx, by = float(ball_xy[0]), float(ball_xy[1])
+        dir_vec = np.array([float(target[0]) - bx, float(target[1]) - by], dtype=float)
+        norm = float(np.linalg.norm(dir_vec))
+        if norm < 1e-6:
+            dir_vec = np.array([1.0, 0.0], dtype=float)
+            norm = 1.0
+        back = BALL_SIZE + PLAYER_SIZE + KICKABLE_MARGIN / 2
+        return np.array([bx, by], dtype=float) - (dir_vec / norm) * back
+
+    def approach_then_contact(self, ball_xy: Tuple[float, float], target_xy: Tuple[float, float], self_pose: Tuple[float, float, float],
+                              game_state, use_deep_approach: bool, approach_back_extra: float, deep_margin: float) -> tuple[Optional[str], bool]:
+        """
+        Stage behind the ball (deep approach), then move to contact point.
+        Returns (cmd, use_deep_approach). cmd is None when already at contact.
+        """
+        deep_speed = 100.0
+        contact_speed = 100.0
+        contact_margin = 0.1
+        bx, by = float(ball_xy[0]), float(ball_xy[1])
+        rx, ry = float(self_pose[0]), float(self_pose[1])
+        tx, ty = float(target_xy[0]), float(target_xy[1])
+
+        approach_p = np.array([bx, by], dtype=float) + self.approach_offset((tx, ty), (bx, by), approach_back_extra=approach_back_extra)
+        if use_deep_approach and math.hypot(float(approach_p[0]) - rx, float(approach_p[1]) - ry) > deep_margin:
+            theta = math.atan2(ty - approach_p[1], tx - approach_p[0])
+            cmd = self.goto(float(approach_p[0]), float(approach_p[1]), self_pose, game_state,
+                            margin=deep_margin, theta=theta, speed=deep_speed)
+            return cmd, use_deep_approach
+
+        use_deep_approach = False
+        contact_p = self.contact_point((tx, ty), (bx, by))
+        if math.hypot(float(contact_p[0]) - rx, float(contact_p[1]) - ry) > contact_margin:
+            theta = math.atan2(ty - contact_p[1], tx - contact_p[0])
+            cmd = self.goto(float(contact_p[0]), float(contact_p[1]), self_pose, game_state,
+                            margin=contact_margin, theta=theta, speed=contact_speed)
+            return cmd, use_deep_approach
+
+        return None, use_deep_approach

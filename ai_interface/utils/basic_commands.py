@@ -148,13 +148,19 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     Returns `kick power rel_angle` when the ball is within kickable_tolerance of the
     agent and facing within angle_tolerance radians; otherwise returns `"failed"`.
     """
+<<<<<<< HEAD
     self_pose = _as_float_array(self_pose)
     ball_pose = _as_float_array(ball_pose)
     target = _as_float_array(target)
     if np.linalg.norm(ball_pose - self_pose[:2]) > kickable_tolerance:
+=======
+    ball_xy = np.array(ball_pose[:2], dtype=float)
+    self_xy = np.array(self_pose[:2], dtype=float)
+    if np.linalg.norm(ball_xy - self_xy) > kickable_tolerance:
+>>>>>>> 30da0dde1cf2f11bec0530605a8b2c7eb10ad499
         return "failed"
 
-    angle_to_target = np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0])
+    angle_to_target = np.arctan2(target[1] - self_xy[1], target[0] - self_xy[0])
     return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling)
     
 def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
@@ -173,10 +179,23 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
         if dribbling:
             return f"turn {angle_diff}"
         else:
+<<<<<<< HEAD
             return dribble(self_pose, ball_pose) # "failed", "turn {angle_diff}" or "catch 0"
     else:
         return f"kick {kick_power} {0}"
         
+=======
+            return f"kick {kick_power:.1f} {0}"
+    else:
+        ball_xy = np.array(ball_pose[:2], dtype=float)
+        target_pos = ball_xy - np.array([math.cos(target_angle), math.sin(target_angle)]) * (PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN * 0.5)
+        print('[Kick] Target position for kicking:', target_pos)
+        cmd = goto(self_pose, target_pos[0], target_pos[1], game_state=game_state, margin=0.1, speed=80.0, theta=target_angle)
+        if "done" in cmd:
+            return f"kick {kick_power:.1f} {0}"
+        else:
+            return cmd
+>>>>>>> 30da0dde1cf2f11bec0530605a8b2c7eb10ad499
 
 
 def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
@@ -211,14 +230,116 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     when the ball is within kickable_tolerance and aligned within angle_tolerance radians;
     otherwise returns `"failed"`.
     """
+<<<<<<< HEAD
     self_pose = _as_float_array(self_pose)
     ball_pose = _as_float_array(ball_pose)
     if np.linalg.norm(ball_pose-self_pose[:2]) > kickable_tolerance:
+=======
+    ball_xy = np.array(ball_pose[:2], dtype=float)
+    self_xy = np.array(self_pose[:2], dtype=float)
+    if np.linalg.norm(ball_xy - self_xy) > kickable_tolerance:
+>>>>>>> 30da0dde1cf2f11bec0530605a8b2c7eb10ad499
         return "failed"
 
-    ball_dir = normalize_angle(np.arctan2(ball_pose[1] - self_pose[1], ball_pose[0] - self_pose[0]))
+    ball_dir = normalize_angle(np.arctan2(ball_xy[1] - self_xy[1], ball_xy[0] - self_xy[0]))
     angle_diff = normalize_angle(ball_dir - self_pose[2])
     if abs(angle_diff) > angle_tolerance:
         return f"turn {angle_diff}"
 
     return f"catch 0"
+
+
+def dribble_to(
+    self_pose: np.ndarray | Tuple | List,
+    ball_pose: np.ndarray | Tuple | List,
+    target: np.ndarray | Tuple | List,
+    dribble_start_pos: Tuple[float, float] | None,
+    max_dribble_dist: float = 1.0,
+    release_distance: float = 0.10,
+    kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
+    angle_tolerance: float = math.radians(5.0),
+    is_dribbling: bool = False,
+) -> tuple[str, Tuple[float, float] | None]:
+    """
+    Dribble the ball toward a target with:
+    - A maximum continuous dribble distance (max_dribble_dist, meters)
+    - A required release distance (release_distance, meters) before starting a new dribble
+
+    Args:
+        self_pose: [x, y, theta] in radians.
+        ball_pose: [x, y].
+        target:   [x, y] dribble target position.
+        dribble_start_pos: (x, y) where the current dribble segment started,
+                           or None if not currently dribbling.
+
+    Returns:
+        (cmd, new_dribble_start_pos)
+        - cmd: single command string (e.g. "catch 0", "turn ...", "dash ...", "failed")
+        - new_dribble_start_pos: updated start position for the current segment,
+                                 or None if not in a dribble segment.
+        - is_dribbling: boolean indicating if the agent is currently dribbling the ball.
+    """
+    robot_xy = np.array(self_pose[:2], dtype=float)
+    ball_xy = np.array(ball_pose[:2], dtype=float)
+    target_xy = np.array(target[:2], dtype=float)
+
+    # If we are too far from the ball, move to a good approach point just behind the ball
+    # (relative to the dribble target) so we are ready to start dribbling.
+    dist_to_ball = float(np.linalg.norm(ball_xy - robot_xy))
+    if dist_to_ball > kickable_tolerance:
+        # Direction from ball to dribble target.
+        to_target = target_xy - ball_xy
+        norm = float(np.linalg.norm(to_target))
+        if norm < 1e-6:
+            angle_to_ball = math.atan2(ball_xy[1] - robot_xy[1], ball_xy[0] - robot_xy[0])
+            dash_power = 40.0
+            return f"dash {dash_power} {angle_to_ball}", dribble_start_pos, False
+
+        to_target_unit = to_target / norm
+        # Stand off just behind the ball so we can dribble through it toward target.
+        stand_off_dist = PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN * 0.5
+        behind_ball = ball_xy - to_target_unit * stand_off_dist
+
+        angle_to_spot = math.atan2(behind_ball[1] - robot_xy[1], behind_ball[0] - robot_xy[0])
+        dash_power = 40.0
+        return f"dash {dash_power} {angle_to_spot}", dribble_start_pos, False
+
+    # If we are in an active dribble segment, enforce the max distance rule.
+    if dribble_start_pos is not None:
+        start_xy = np.array(dribble_start_pos, dtype=float)
+        dribble_dist = float(np.linalg.norm(robot_xy - start_xy))
+
+        if dribble_dist >= max_dribble_dist:
+            if is_dribbling:
+                return "kick 1 0", dribble_start_pos, False # TODO : Lukas can you change the simulator code to disable dribbling instead of me using kick?
+            
+            away_angle = math.atan2(robot_xy[1] - ball_xy[1], robot_xy[0] - ball_xy[0])
+            dash_power = 40.0
+            return f"dash {dash_power} {away_angle}", None, False
+
+        # Still within allowed dribble distance: orient toward target and keep control.
+        angle_to_target = math.atan2(target_xy[1] - robot_xy[1], target_xy[0] - robot_xy[0])
+        angle_diff = normalize_angle(angle_to_target - self_pose[2])
+
+        if abs(angle_diff) > angle_tolerance:
+            # Turn toward where we want to dribble.
+            return turn(self_pose, angle_to_target), dribble_start_pos, is_dribbling
+
+        if is_dribbling:
+            dash_power = 40.0
+            return f"dash {dash_power} {angle_to_target}", dribble_start_pos, True
+
+        return "catch 0", dribble_start_pos, True
+
+    if dist_to_ball < release_distance:
+        away_angle = math.atan2(robot_xy[1] - ball_xy[1], robot_xy[0] - ball_xy[0])
+        dash_power = 40.0
+        return f"dash {dash_power} {away_angle}", None, False
+
+    # We are at least release_distance away; align to the ball and start a new dribble segment.
+    cmd = dribble(self_pose, ball_pose, kickable_tolerance=kickable_tolerance, angle_tolerance=angle_tolerance, is_dribbling=is_dribbling)
+    if cmd == "catch 0":
+        return cmd, (float(robot_xy[0]), float(robot_xy[1])), True
+
+    # Either we need to turn toward the ball first, or dribble failed – propagate.
+    return cmd, None, False

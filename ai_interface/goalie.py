@@ -11,6 +11,7 @@ from ai_interface.constants.field_constants import (
 )
 from ai_interface.constants.player_constants import DASH_POWER_RATE
 from ai_interface.utils.intercept import earliest_intercept_control
+from ai_interface.utils import basic_commands
 from ai_interface.utils.algo_utils import (
     estimate_ball_velocity,
     normalize_angle,
@@ -130,9 +131,13 @@ class Goalie(Player):
 
         side = self.side if self.side is not None else get_side(goalie_pos_2d)
 
+        to_ball_angle = math.atan2(ball_pos[1] - goalie_pose[1],
+                                        ball_pos[0] - goalie_pose[0])
+
         # ========== PRIORITY 1: Ball Possession and Clearing ==========
         if has_ball:
-            teammate_pos = super().find_nearest_teammate(goalie_pos_2d, game_state)
+            #teammate_pos = super().find_nearest_teammate(goalie_pos_2d, game_state)
+            teammate_pos = (0, np.random.randint(-20, 20))
             if teammate_pos is not None:
                 return super().pass_to_teammate(
                     teammate_pos,
@@ -141,25 +146,48 @@ class Goalie(Player):
                 )
             else:
                 return super().kick(
-                    target_angle=0,
+                    target_angle=math.pi,
                     self_pose=goalie_pose_rad,
                     ball_pose=ball_pos,
                     kick_power=100,
-                    allow_dribble=False,
+                    allow_dribble=True,
                     game_state=game_state,
                 )
         
         # ========== PRIORITY 2: Catch Attempt (close to ball) ==========
+        # Only attempt catch when ball is within 5 units of our goal and nearest attacker is >5 units from ball.
+        min_attacker_to_ball = float("inf")
+        if game_state is not None and getattr(game_state, "robot_poses", None):
+            for team_name, team_robots in game_state.robot_poses.items():
+                if team_name == self.teamname or not isinstance(team_robots, list):
+                    continue
+                for robot in team_robots:
+                    if not isinstance(robot, dict) or not robot:
+                        continue
+                    try:
+                        unum = int(next(iter(robot.keys())))
+                        pose = robot.get(unum)
+                        if pose is None or len(pose) < 2:
+                            continue
+                        pos = (float(pose[0]), float(pose[1]))
+                        d = math.hypot(ball_pos[0] - pos[0], ball_pos[1] - pos[1])
+                        min_attacker_to_ball = min(min_attacker_to_ball, d)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+        if min_attacker_to_ball == float("inf"):
+            min_attacker_to_ball = 10.0
+
         if goalie_to_ball_dist < self.catch_distance:
-            to_ball_angle = math.atan2(ball_pos[1] - goalie_pose[1],
-                                      ball_pos[0] - goalie_pose[0])
             angle_diff = normalize_angle(to_ball_angle - math.radians(goalie_pose[2]))
 
             if abs(angle_diff) < self.alignment_angle_threshold:
                 return "catch 0"
+            return basic_commands.turn(goalie_pose_rad, to_ball_angle)
+        
+        if goalie_to_ball_dist <= 5.0 and min_attacker_to_ball > 8.0:
             return super().goto(
                 ball_pos[0], ball_pos[1], goalie_pose_rad, game_state,
-                margin=0.1, theta=to_ball_angle, speed=50.0,
+                margin=0.4, theta=to_ball_angle, speed=50.0,
             )
 
         # ========== PRIORITY 3: Intercept Mode (ball shot toward goal) ==========

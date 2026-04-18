@@ -1,7 +1,21 @@
 diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
 --- rcssserver-19.0.0/src/player.cpp	2024-03-24 19:29:40
-+++ rcssserver-19.0.0/src/player.cpp	2025-12-18 17:31:20
-@@ -1249,8 +1249,6 @@
++++ rcssserver-19.0.0/src/player.cpp	2026-03-04 03:48:22
+@@ -799,6 +799,13 @@
+ 
+             goalieCatch( dir );
+         }
++        else if ( ! std::strncmp( buf, "(drop)", 6 ) )
++        {
++            if ( this == M_stadium.ballCatcher() )
++            {
++                M_stadium.clearBallCatcher();
++            }
++        }
+         else if ( ! std::strncmp( buf, "(move ", 6 ) )
+         {
+             double x, y;
+@@ -1249,8 +1256,6 @@
          M_angle_body = normalize_angle( angleBodyCommitted()
                                          + ( 1.0 + drand( -M_randp, M_randp ) ) * omega );
      }
@@ -10,7 +24,7 @@ diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
  }
  
  // void
-@@ -1535,11 +1533,11 @@
+@@ -1535,11 +1540,11 @@
      //pfr: we should only be able to catch in PlayOn mode
      //tom: actually the goalie can catch the ball in any playmode, but
      //infringements should be awarded.  Maybe later.
@@ -25,7 +39,7 @@ diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
      {
          M_state |= CATCH_FAULT;
          return;
-@@ -1674,6 +1672,7 @@
+@@ -1674,6 +1679,7 @@
          M_vel = PVector();
  
          M_stadium.ballCaught( *this );
@@ -33,6 +47,70 @@ diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
      }
      else
      {
+@@ -2733,6 +2739,25 @@
+ bool
+ Player::ballKickable() const
+ {
++    // ensure that the player is in front of the ball first (5 degree margin)
++
++    // Facing = Player's facing direction unit vector | F = ( cos(angle_body), sin(angle_body) )
++    // Difference = Ball - Player | D = B - P
++    PVector facing = PVector::fromPolar( 1.0, M_angle_body );
++    PVector difference = M_stadium.ball().pos() - pos();
++    
++    // (F . D) = |F| * |D| * cos(angle_diff)
++    // Since |F| = 1, we can simplify this to:
++    // cos(angle_diff) = (F . D) / |D|
++    double dot_product = (facing.x * difference.x) + (facing.y * difference.y);
++    double angle_diff = std::acos( dot_product / difference.r() );
++    angle_diff = Rad2Deg( angle_diff );
++
++    if ( std::fabs( angle_diff ) > 5.0 )
++    {
++        return false;
++    }
++
+     return pos().distance2( M_stadium.ball().pos() ) <= std::pow( kickableArea(), 2 );
+ }
+ 
+diff -u rcssserver-19.0.0/src/rcsoccersim.in rcssserver-19.0.0/src/rcsoccersim.in
+--- rcssserver-19.0.0/src/rcsoccersim.in	2024-02-18 23:29:46
++++ rcssserver-19.0.0/src/rcsoccersim.in	2026-03-01 01:51:10
+@@ -23,6 +23,7 @@
+      echo "  -help                 print this message"
+      echo "  -rcssmonitor          use rcssmonitor"
+      echo "  -monitor MONITOR      specify the monitor command"
++     echo "  -port PORT            specify the port number for the server (default: 6000)"
+     ) 1>&2
+ }
+ 
+@@ -37,6 +38,7 @@
+     exit 1
+ fi
+ 
++MON=`which rcssmonitor 2> /dev/null`
+ if test $# -eq 0; then
+     if test "$RCSSMONITOR"; then
+         MON="$RCSSMONITOR"
+@@ -84,6 +86,18 @@
+                     echo ""
+                     exit 1
+                 fi
++                shift 1
++                ;;
++            -port)
++                PORT="${2}"
++                COACH_PORT=`expr $PORT + 1`
++                OLCOACH_PORT=`expr $PORT + 2`
++
++                SERV="$SERV --server::port=$PORT"
++                SERV="$SERV --server::coach_port=$COACH_PORT"
++                SERV="$SERV --server::olcoach_port=$OLCOACH_PORT"
++
++                MON="$MON --server-port $PORT"
+                 shift 1
+                 ;;
+ 
 diff -u rcssserver-19.0.0/src/referee.cpp rcssserver-19.0.0/src/referee.cpp
 --- rcssserver-19.0.0/src/referee.cpp	2024-02-18 23:29:46
 +++ rcssserver-19.0.0/src/referee.cpp	2025-12-18 17:22:21
@@ -79,7 +157,7 @@ diff -u rcssserver-19.0.0/src/referee.h rcssserver-19.0.0/src/referee.h
  
 diff -u rcssserver-19.0.0/src/serverparam.cpp rcssserver-19.0.0/src/serverparam.cpp
 --- rcssserver-19.0.0/src/serverparam.cpp	2024-03-24 19:29:40
-+++ rcssserver-19.0.0/src/serverparam.cpp	2025-12-19 16:34:44
++++ rcssserver-19.0.0/src/serverparam.cpp	2026-03-01 01:15:33
 @@ -129,18 +129,18 @@
  const int ServerParam::HALF_TIME = 300;
  const int ServerParam::DROP_TIME = 100;
@@ -187,7 +265,6 @@ diff -u rcssserver-19.0.0/src/serverparam.cpp rcssserver-19.0.0/src/serverparam.
      M_old_coach_hear = false;
  
      M_synch_mode = false;
-Only in rcssserver-19.0.0/src: serverparam.o
 diff -u rcssserver-19.0.0/src/stadium.cpp rcssserver-19.0.0/src/stadium.cpp
 --- rcssserver-19.0.0/src/stadium.cpp	2024-03-24 19:29:40
 +++ rcssserver-19.0.0/src/stadium.cpp	2025-12-19 16:20:17
