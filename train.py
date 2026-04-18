@@ -34,7 +34,6 @@ from ai_interface.trainers import (
     DiscretePPOTrainer, 
     MAPPOTrainer,
     TD3JALTrainer,
-    HSMMARLTrainer,
     HSMSB3PPOTrainer,
 )
 
