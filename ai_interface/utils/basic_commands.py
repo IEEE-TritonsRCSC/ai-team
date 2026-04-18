@@ -11,8 +11,16 @@ from constants.field_constants import *
 from .algo_utils import normalize_angle
 
 
+def _as_float_array(value: np.ndarray | Tuple | List) -> np.ndarray:
+    """Normalize vector-like inputs at function boundaries."""
+    return np.asarray(value, dtype=float)
+
+
 def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[float, float]:
     """Return distance from point to segment and normalized projection t."""
+    point = _as_float_array(point)
+    start = _as_float_array(start)
+    end = _as_float_array(end)
     segment = end - start
     seg_len_sq = float(np.dot(segment, segment))
     if seg_len_sq == 0.0:
@@ -29,6 +37,8 @@ def _select_detour(origin: np.ndarray, destination: np.ndarray,
     """
     Pick a single waypoint that skirts around the first blocking obstacle.
     """
+    origin = _as_float_array(origin)
+    destination = _as_float_array(destination)
     path = destination - origin
     if np.linalg.norm(path) < 1e-6:
         return None
@@ -66,14 +76,16 @@ def build_avoid_points(game_state, self_pose,
     """
     Build avoid points for a player, skipping itself.
     """
+    self_pose = _as_float_array(self_pose)
     avoid_points = []
     ball_pos = getattr(game_state, "ball_pos", None)
     if ball_pos is not None:
+        ball_pos = _as_float_array(ball_pos)
         avoid_points.append((ball_pos[0], ball_pos[1], ball_radius))
     for other_team, team_robots in game_state.robot_poses.items():
         for robot in team_robots:
             other_unum = int(next(iter(robot.keys())))
-            pose = robot[other_unum]
+            pose = _as_float_array(robot[other_unum])
             if np.isclose(pose, self_pose).all():
                 continue
             avoid_points.append((pose[0], pose[1], player_radius))
@@ -92,8 +104,9 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
     provided (or can be built from game_state), the path will detour
     around obstacles using a single waypoint.
     """
-    origin = np.array(self_pose[:2], dtype=float)
-    destination = np.array([x, y], dtype=float)
+    self_pose = _as_float_array(self_pose)
+    origin = _as_float_array(self_pose[:2])
+    destination = _as_float_array([x, y])
     avoid_points = build_avoid_points(game_state, self_pose, ball_radius=0.215, player_radius=0.9)
 
     if avoid_points:
@@ -105,7 +118,7 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
                 continue
             assert length == 3, "Each avoid point must be a tuple of (x, y, radius)"
             ox, oy, radius = item[0], item[1], item[2]
-            obstacles.append((np.array([ox, oy], dtype=float), float(radius)))
+            obstacles.append((_as_float_array([ox, oy]), float(radius)))
         waypoint = _select_detour(origin, destination, obstacles, detour_margin)
         if waypoint is not None:
             print('Going to', destination, 'Detouring via', waypoint)
@@ -135,6 +148,9 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     Returns `kick power rel_angle` when the ball is within kickable_tolerance of the
     agent and facing within angle_tolerance radians; otherwise returns `"failed"`.
     """
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
+    target = _as_float_array(target)
     if np.linalg.norm(ball_pose - self_pose[:2]) > kickable_tolerance:
         return "failed"
 
@@ -150,7 +166,8 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
     
     Returns 'kick {kick_power} 0'
     """
-    
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
     angle_diff = normalize_angle(target_angle - self_pose[2])
     if np.abs(angle_diff) > math.radians(5.0):
         if dribbling:
@@ -167,6 +184,9 @@ def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | 
     """
     Convenience wrapper around `shoot` that aims at the provided goal position.
     """
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
+    goal = _as_float_array(goal)
     return shoot(self_pose, ball_pose, goal, kick_power, dribbling=dribbling)
 
 def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
@@ -176,6 +196,9 @@ def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray
 
     teammate_pose is [x, y, theta]; only the [x, y] components are used.
     """
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
+    teammate_pose = _as_float_array(teammate_pose)
     return shoot(self_pose, ball_pose, teammate_pose[:2], kick_power, dribbling=dribbling)
 
 def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
@@ -188,6 +211,8 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     when the ball is within kickable_tolerance and aligned within angle_tolerance radians;
     otherwise returns `"failed"`.
     """
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
     if np.linalg.norm(ball_pose-self_pose[:2]) > kickable_tolerance:
         return "failed"
 
