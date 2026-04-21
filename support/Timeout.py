@@ -1,3 +1,4 @@
+# Assignee: Lukas Cao
 from networking.data_utils import GameState, TeamInfo
 
 class AccessoryAlgo:

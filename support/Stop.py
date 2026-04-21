@@ -1,3 +1,4 @@
+# Assignee: Travis Wu
 from networking.data_utils import GameState, TeamInfo
 
 class AccessoryAlgo:

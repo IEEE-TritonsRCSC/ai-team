@@ -1,3 +1,4 @@
+# Assignee: Adnan Barwaniwala
 from networking.data_utils import GameState, TeamInfo
 
 class AccessoryAlgo:
