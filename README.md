@@ -139,8 +139,8 @@ python launch_sims.py --env 2 false
 If your executable names are customized, pass them in:
 ```bash
 python launch_sims.py --env 2 --monitor \
-  --sim-cmd "rcsserver" \
-  --monitor-cmd "monitor"
+  --sim-cmd "rcssserver" \
+  --monitor-cmd "rcssmonitor"
 ```
 
 ### Parameter Estimation

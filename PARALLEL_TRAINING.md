@@ -69,10 +69,10 @@ python launch_train.py \
 | `--num-envs N` | `1` | Number of parallel simulator environments |
 | `--base-port PORT` | `6000` | Player port for env 0 |
 | `--port-stride N` | `10` | Port gap between consecutive envs (min 3) |
-| `--sim-cmd CMD` | `rcsserver` | Command used to launch a simulator |
-| `--sim-port-flag FLAG` | `--port` | CLI flag passed to the simulator for the port. Set `""` to disable. |
+| `--sim-cmd CMD` | `rcssserver` | Command used to launch a simulator |
+| `--sim-port-flag FLAG` | `server::port=` | CLI flag/prefix passed to the simulator for the player port. With the default, launcher also sets `server::coach_port` and `server::olcoach_port`. |
 | `--monitor` | off | Launch a monitor process alongside each simulator |
-| `--monitor-cmd CMD` | `monitor` | Command used to launch a monitor |
+| `--monitor-cmd CMD` | `rcssmonitor` | Command used to launch a monitor |
 | `--trainer TYPE` | `discrete_ppo` | Trainer type forwarded to `train.py` |
 | `--sim-wait SECS` | `2.0` | Seconds to wait after launching all sims before starting the trainer |
 | `--sim-delay SECS` | `0.2` | Seconds between launching consecutive sim instances |
@@ -110,7 +110,7 @@ trainer_port = player_port + 1
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `Cannot run 'rcsserver'` | Binary not in PATH | Use `--sim-cmd /full/path/to/rcsserver` |
+| `Cannot run 'rcssserver'` | Binary not in PATH | Install `rcssserver` or use `--sim-cmd /full/path/to/rcssserver` |
 | Trainer can't connect to sim | Sims not ready in time | Increase `--sim-wait` |
 | Port conflict error | Stride too small | Increase `--port-stride` (≥ 3) |
 | Monitor doesn't open | Wrong monitor command | Use `--monitor-cmd /path/to/monitor` |

@@ -14,12 +14,13 @@ Examples:
   python launch_train.py --num-envs 4 --trainer discrete_ppo
   python launch_train.py --num-envs 2 --base-port 7000 --monitor
   python launch_train.py --num-envs 3 --trainer qlearning -- --episodes 5000 --lr 1e-3
-  python launch_train.py --num-envs 2 --sim-cmd "rcsserver" --sim-port-flag "--port"
+  python launch_train.py --num-envs 2 --sim-cmd "rcssserver" --sim-port-flag "server::port="
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import shlex
 import subprocess
 import sys
@@ -56,21 +57,23 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
     # Simulator / monitor commands
     parser.add_argument(
-        "--sim-cmd", default="rcsserver",
-        help='Base simulator command (default: "rcsserver")',
+        "--sim-cmd", default="rcssserver",
+        help='Base simulator command (default: "rcssserver")',
     )
     parser.add_argument(
-        "--sim-port-flag", default="--port",
-        help='CLI flag used to pass the player port to the simulator '
-             '(default: "--port"). Set to "" to skip passing the port.',
+        "--sim-port-flag", default="server::port=",
+        help='CLI flag/prefix used to pass the player port to the simulator '
+             '(default: "server::port="). Set to "" to skip passing ports. '
+             'Values ending in "=" are emitted as FLAGPORT; other values are '
+             'emitted as FLAG PORT.',
     )
     parser.add_argument(
         "--monitor", action="store_true", default=False,
         help="Also launch a monitor process for each simulator instance",
     )
     parser.add_argument(
-        "--monitor-cmd", default="monitor",
-        help='Monitor command (default: "monitor")',
+        "--monitor-cmd", default="rcssmonitor",
+        help='Monitor command (default: "rcssmonitor")',
     )
 
     # Trainer forwarding
@@ -120,8 +123,40 @@ def build_sim_command(base_cmd: str, port_flag: str, port: int) -> list[str]:
     if not parts:
         raise ValueError("--sim-cmd must not be empty")
     if port_flag:
-        parts += [port_flag, str(port)]
+        if "{port}" in port_flag:
+            parts.append(port_flag.format(port=port))
+        elif port_flag.endswith("="):
+            parts.append(f"{port_flag}{port}")
+        else:
+            parts += [port_flag, str(port)]
+
+        # rcssserver v19 uses config-style args and needs all server-side
+        # ports shifted per instance to avoid collisions during parallel runs.
+        if port_flag.startswith("server::port"):
+            parts += [
+                f"server::coach_port={port + 1}",
+                f"server::olcoach_port={port + 2}",
+            ]
     return parts
+
+
+def command_missing_message(command: str, arg_name: str) -> str:
+    """Return a helpful message when an external executable cannot be found."""
+    binary = shlex.split(command)[0] if command else command
+    hints = [
+        f"[launcher] Cannot run '{binary}'.",
+        f"[launcher] Install RoboCup Soccer Simulator or pass {arg_name} /full/path/to/{binary}.",
+    ]
+    if binary == "rcssserver" and shutil.which("rcsserver"):
+        hints.append("[launcher] Found 'rcsserver' on PATH; try --sim-cmd rcsserver.")
+    elif binary == "rcsserver":
+        hints.append("[launcher] The standard RoboCup 2D server binary is usually named 'rcssserver'.")
+    if sys.platform == "darwin":
+        hints.append(
+            "[launcher] On macOS, install/build rcsoccersim, then pass the built "
+            "binary path if it is not on PATH."
+        )
+    return "\n".join(hints)
 
 
 def stop_processes(procs: list[subprocess.Popen]) -> None:
@@ -185,7 +220,8 @@ def main() -> int:
 
     print(
         f"[launcher] Starting {args.num_envs} simulator(s) "
-        f"(base-port={args.base_port}, stride={args.port_stride})"
+        f"(base-port={args.base_port}, stride={args.port_stride})",
+        flush=True,
     )
 
     # ------------------------------------------------------------------
@@ -206,11 +242,7 @@ def main() -> int:
             try:
                 sim_proc = subprocess.Popen(sim_parts)
             except FileNotFoundError:
-                print(
-                    f"[launcher] Cannot run '{sim_parts[0]}'. "
-                    "Check --sim-cmd or PATH.",
-                    file=sys.stderr,
-                )
+                print(command_missing_message(args.sim_cmd, "--sim-cmd"), file=sys.stderr)
                 stop_processes(all_procs)
                 return 1
 
@@ -222,14 +254,16 @@ def main() -> int:
                 if not monitor_parts:
                     print("[launcher] --monitor-cmd is empty, skipping monitor", file=sys.stderr)
                 else:
+                    monitor_cmd = monitor_parts + [
+                        "--server-host",
+                        "127.0.0.1",
+                        "--server-port",
+                        str(port),
+                    ]
                     try:
-                        mon_proc = subprocess.Popen(monitor_parts)
+                        mon_proc = subprocess.Popen(monitor_cmd)
                     except FileNotFoundError:
-                        print(
-                            f"[launcher] Cannot run '{monitor_parts[0]}'. "
-                            "Check --monitor-cmd or PATH.",
-                            file=sys.stderr,
-                        )
+                        print(command_missing_message(args.monitor_cmd, "--monitor-cmd"), file=sys.stderr)
                         stop_processes(all_procs)
                         return 1
                     all_procs.append(mon_proc)
