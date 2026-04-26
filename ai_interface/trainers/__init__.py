@@ -32,12 +32,13 @@ def __getattr__(name: str):
     return trainer_cls
 
 __all__ = [
-    "BaseTrainer", 
-    "HierarchicalPPOTrainer", 
-    "SB3PPOTrainer", 
-    "DiscretePPOTrainer", 
+    "BaseTrainer",
+    "DiscretePPOTrainer",
+    "HierarchicalPPOTrainer",
+    "HSMMARLTrainer",
     "MAPPOTrainer",
     "TD3JALTrainer",
     "HSMSB3PPOTrainer",
-    "QLearningTrainer"
+    "SB3PPOTrainer",
+    "QLearningTrainer",
 ]

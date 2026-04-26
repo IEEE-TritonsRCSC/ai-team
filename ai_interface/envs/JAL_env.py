@@ -1,6 +1,5 @@
-"""JAL environment."""
+"""JAL environment.
 
-"""
 Issues to note:
 1. Ball velocity estimation does not account for ball being kicked by a robot, which causes discontinuities. We could add a heuristic to detect when the ball is likely being kicked (e.g. sudden large velocity change near a robot) and reset the velocity estimate in those cases.
 2. Robot velocity estimation is a simple finite difference which can be noisy. We could maintain a short history of robot poses and use a more robust method like least squares to estimate velocity, similar to the ball velocity estimation.
@@ -11,13 +10,14 @@ from __future__ import annotations
 
 from typing import Optional, Tuple, Dict, Any, List
 import logging
+import time
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity
-from ai_interface.utils.basic_commands import goto
+from ai_interface.utils.basic_commands import goto, kick
 from ai_interface.constants.field_constants import BALL_DECAY
 from networking.networker import Networker
 
@@ -32,6 +32,9 @@ class JALTeamEnv(gym.Env):
         non_robot_obs_dim: int = 4,
         max_steps: int = 200,
         debug: bool = False,
+        state_retry_count: int = 10,
+        state_retry_sleep_s: float = 0.02,
+        none_state_warn_every: int = 50,
         some_arg=None
         ):
         
@@ -45,6 +48,9 @@ class JALTeamEnv(gym.Env):
         self.num_robots = len(self.robot_ids)
         self.max_steps = max_steps
         self.debug = debug
+        self.state_retry_count = max(0, int(state_retry_count))
+        self.state_retry_sleep_s = max(0.0, float(state_retry_sleep_s))
+        self.none_state_warn_every = max(1, int(none_state_warn_every))
         
         
         # Create a logger for this environment
@@ -93,6 +99,7 @@ class JALTeamEnv(gym.Env):
         # Statistics
         self.total_rewards = 0.0
         self.episode_actions = []  # Track action distribution
+        self._none_state_counter = 0
         
         self.logger.info(f"Initialized JALTeamEnv for team '{team_name}' with robots {robot_ids}, num_robots={self.num_robots}, obs_dim={self.obs_dim}, action_dim={self.action_space.shape[0]}")
 
@@ -118,6 +125,7 @@ class JALTeamEnv(gym.Env):
         self.episode_num += 1
         self.total_rewards = 0.0
         self.episode_actions = []
+        self._none_state_counter = 0
         
         # Clear ball history so velocity starts fresh each episode
         self.ball_pos_history = []
@@ -126,7 +134,10 @@ class JALTeamEnv(gym.Env):
         self.prev_robot_pose_by_id = {}
 
         # Get initial game state from simulator
-        game_state = self._get_game_state()
+        game_state = self._get_game_state(
+            retries=max(self.state_retry_count, 20),
+            sleep_s=self.state_retry_sleep_s,
+        )
         
         # Build initial observation
         obs = self._game_state_to_obs(game_state)
@@ -162,7 +173,10 @@ class JALTeamEnv(gym.Env):
         self.current_step += 1
 
         # Use current state to decode pose-aware commands (especially goto()).
-        current_game_state = self._get_game_state()
+        current_game_state = self._get_game_state(
+            retries=self.state_retry_count,
+            sleep_s=self.state_retry_sleep_s,
+        )
 
         # Decode action vector into simulator commands
         commands, action_info = self._action_to_commands(action, current_game_state)
@@ -174,7 +188,10 @@ class JALTeamEnv(gym.Env):
         self._send_commands(commands)
         
         # Read next state after sending commands, then build next observation.
-        next_game_state = self._get_game_state()
+        next_game_state = self._get_game_state(
+            retries=self.state_retry_count,
+            sleep_s=self.state_retry_sleep_s,
+        )
         obs = self._game_state_to_obs(next_game_state)
 
         reward = 0.0
@@ -186,19 +203,29 @@ class JALTeamEnv(gym.Env):
         return obs, reward, terminated, truncated, info
     
     
-    def _get_game_state(self) -> Optional[Dict]:
+    def _get_game_state(self, retries: int = 0, sleep_s: float = 0.0) -> Optional[Dict]:
         """
         Get current game state from networker.
         
         Returns:
             Game state dictionary or None if unavailable
         """
-        try:
-            game_state = self.networker.get_game_state()
-            return game_state
-        except Exception as e:
-            self.logger.error(f"Error getting game state: {e}")
-            return None
+        attempts = max(0, int(retries)) + 1
+        delay = max(0.0, float(sleep_s))
+
+        for attempt in range(attempts):
+            try:
+                game_state = self.networker.get_game_state()
+                if game_state is not None:
+                    return game_state
+            except Exception as e:
+                if attempt == attempts - 1:
+                    self.logger.error(f"Error getting game state: {e}")
+
+            if attempt < attempts - 1 and delay > 0.0:
+                time.sleep(delay)
+
+        return None
         
     def _game_state_to_obs(self, game_state) -> np.ndarray:
         """
@@ -221,8 +248,18 @@ class JALTeamEnv(gym.Env):
             Observation vector (obs_dim,)
         """
         if game_state is None:
-            self.logger.warning("Game state is None, returning zero observation")
+            self._none_state_counter += 1
+            if (
+                self._none_state_counter == 1
+                or self._none_state_counter % self.none_state_warn_every == 0
+            ):
+                self.logger.warning(
+                    "Game state is None, returning zero observation "
+                    f"(count={self._none_state_counter})"
+                )
             return np.zeros(self.obs_dim, dtype=np.float32)
+
+        self._none_state_counter = 0
         
         try:
             # --- Ball position (tuple: x, y) ---
@@ -359,7 +396,38 @@ class JALTeamEnv(gym.Env):
             if action_type == "kick":
                 command = "kick 100 0"
             elif action_type == "dribble":
-                command = "dribble"
+                pose = pose_by_robot_id.get(robot_id)
+                if pose is None or game_state is None:
+                    command = "turn 0"
+                else:
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    ball_pose = np.array([
+                        float(game_state.ball_pos[0]),
+                        float(game_state.ball_pos[1]),
+                    ], dtype=np.float32)
+
+                    # Approximate dribble as controlled forward ball carrying:
+                    # if ball is kickable, make a low-power forward kick; otherwise chase ball.
+                    command = kick(
+                        self_pose=self_pose,
+                        ball_pose=ball_pose,
+                        target_angle=float(self_pose[2]),
+                        kick_power=15.0,
+                        dribbling=True,
+                    )
+                    if command == "failed":
+                        command = goto(
+                            self_pose=self_pose,
+                            x=float(ball_pose[0]),
+                            y=float(ball_pose[1]),
+                            game_state=game_state,
+                        )
+                        if command == "done":
+                            command = "turn 0"
             else:
                 pose = pose_by_robot_id.get(robot_id)
                 if pose is None or game_state is None:
@@ -433,9 +501,9 @@ class JALTeamEnv(gym.Env):
         """
         Validate/normalize command strings before sending to simulator.
 
-        Accepted final formats include: "dash p a", "turn a", "kick p a", "dribble".
+        Accepted final formats include: "dash p a", "turn a", "kick p a".
         """
-        valid_prefixes = ("dash ", "turn ", "kick ", "dribble")
+        valid_prefixes = ("dash ", "turn ", "kick ")
         out: List[str] = []
         for cmd in commands:
             clean_cmd = cmd.strip()
