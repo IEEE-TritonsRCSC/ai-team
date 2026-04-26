@@ -66,20 +66,36 @@ class AccessoryAlgo:
 
     def _assign_safe_positions(
         self,
+        ball_pos: tuple[float, float],
         violating_robots: list[tuple[int, tuple[float, float, float]]],
         safe_positions: list[tuple[float, float]],
     ) -> dict[int, tuple[float, float]]:
         """
         Assign each violating robot the closest safe position that is still unclaimed.
         """
+        ball_x, ball_y = ball_pos[:2]
         available_positions = list(safe_positions)
         assignments = {}
 
         for unum, pose in violating_robots:
             if not available_positions:
                 break
+
+            robot_from_ball_x = pose[0] - ball_x
+            robot_from_ball_y = pose[1] - ball_y
+            acute_positions = [
+                pos
+                for pos in available_positions
+                if (
+                    robot_from_ball_x * (pos[0] - ball_x)
+                    + robot_from_ball_y * (pos[1] - ball_y)
+                ) > 0.0
+            ]
+            if not acute_positions:
+                continue
+
             closest_position = min(
-                available_positions,
+                acute_positions,
                 key=lambda pos: math.hypot(pose[0] - pos[0], pose[1] - pos[1]),
             )
             assignments[unum] = closest_position
@@ -105,7 +121,11 @@ class AccessoryAlgo:
             if game_state.ball_pos is not None
             else []
         )
-        position_assignments = self._assign_safe_positions(violating_robots, safe_positions)
+        position_assignments = (
+            self._assign_safe_positions(game_state.ball_pos, violating_robots, safe_positions)
+            if game_state.ball_pos is not None
+            else {}
+        )
 
         team_robots = game_state.robot_poses[teamname]
         if not self.all_dropped:
