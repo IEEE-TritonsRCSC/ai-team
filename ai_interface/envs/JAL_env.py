@@ -1,12 +1,11 @@
-"""JAL environment.
-
-Issues to note:
-1. Ball velocity estimation does not account for ball being kicked by a robot, which causes discontinuities. We could add a heuristic to detect when the ball is likely being kicked (e.g. sudden large velocity change near a robot) and reset the velocity estimate in those cases.
-2. Robot velocity estimation is a simple finite difference which can be noisy. We could maintain a short history of robot poses and use a more robust method like least squares to estimate velocity, similar to the ball velocity estimation.
-3. Past 5 planned actions per robot are intentionally deferred for now. A future update should add a fixed-size action-history encoding to the observation.
-"""
+"""JAL environment."""
 
 from __future__ import annotations
+
+# Issues to note:
+# 1. Ball velocity estimation does not account for ball being kicked by a robot, which causes discontinuities. We could add a heuristic to detect when the ball is likely being kicked (e.g. sudden large velocity change near a robot) and reset the velocity estimate in those cases.
+# 2. Robot velocity estimation is a simple finite difference which can be noisy. We could maintain a short history of robot poses and use a more robust method like least squares to estimate velocity, similar to the ball velocity estimation.
+# 3. Past 5 planned actions per robot are intentionally deferred for now. A future update should add a fixed-size action-history encoding to the observation.
 
 from typing import Optional, Tuple, Dict, Any, List
 import logging
@@ -17,9 +16,10 @@ from gymnasium import spaces
 import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity
-from ai_interface.utils.basic_commands import goto, kick
+from ai_interface.utils.basic_commands import goto
 from ai_interface.constants.field_constants import BALL_DECAY
 from networking.networker import Networker
+from networking.data_utils import GameState
 
 
 class JALTeamEnv(gym.Env):
@@ -28,13 +28,14 @@ class JALTeamEnv(gym.Env):
         networker: Networker,  
         team_name: str,
         robot_ids: Optional[List[int]] = None,
-        obs_dim_per_robot: int = 5,
+        obs_dim_per_robot: int = 8,
         non_robot_obs_dim: int = 4,
         max_steps: int = 200,
         debug: bool = False,
         state_retry_count: int = 10,
         state_retry_sleep_s: float = 0.02,
         none_state_warn_every: int = 50,
+        position_noise_std: float = 0.05,
         some_arg=None
         ):
         
@@ -51,16 +52,17 @@ class JALTeamEnv(gym.Env):
         self.state_retry_count = max(0, int(state_retry_count))
         self.state_retry_sleep_s = max(0.0, float(state_retry_sleep_s))
         self.none_state_warn_every = max(1, int(none_state_warn_every))
+        self.position_noise_std = float(position_noise_std)
         
         
         # Create a logger for this environment
         self.logger = logging.getLogger(f"JALTeamEnv[{team_name}]")
         if self.debug:
             self.logger.setLevel(logging.DEBUG)
-            
+
         # Observation design:
         # global: [ball_x, ball_y, ball_vx, ball_vy] (4)
-        # per robot: [robot_x, robot_y, robot_theta, robot_vx, robot_vy] (5)
+        # per robot: [robot_x, robot_y, robot_theta, robot_vx, robot_vy, is_dribbling, start_dribble_x, start_dribble_y] (8)
         self.obs_dim_per_robot = obs_dim_per_robot
         self.non_robot_obs_dim = non_robot_obs_dim
         self.obs_dim = obs_dim_per_robot * self.num_robots + non_robot_obs_dim
@@ -70,9 +72,11 @@ class JALTeamEnv(gym.Env):
             shape=(self.obs_dim,), 
             dtype=np.float32
             )
+        self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
+        self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
         
-        # Action design per robot (6D): [goto_logit, kick_logit, dribble_logit, goto_x, goto_y, goto_theta]
-        self.action_dim_per_robot = 6
+        # Action design per robot (8D): [goto_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
+        self.action_dim_per_robot = 8
         self.action_space = spaces.Box(
             low=-1.0, 
             high=1.0, 
@@ -203,7 +207,7 @@ class JALTeamEnv(gym.Env):
         return obs, reward, terminated, truncated, info
     
     
-    def _get_game_state(self, retries: int = 0, sleep_s: float = 0.0) -> Optional[Dict]:
+    def _get_game_state(self, retries: int = 0, sleep_s: float = 0.0) -> Optional[GameState]:
         """
         Get current game state from networker.
         
@@ -226,6 +230,59 @@ class JALTeamEnv(gym.Env):
                 time.sleep(delay)
 
         return None
+
+    def _preprocess_game_state(self, game_state: GameState) -> GameState:
+        """
+        Add observation noise to positional fields before the state is consumed.
+
+        Noise is applied to x/y positions only. Robot headings are intentionally
+        left unchanged.
+        """
+        if game_state is None or self.position_noise_std <= 0.0:
+            return game_state
+
+        try:
+            ball_pos = game_state.ball_pos
+            noisy_ball_pos = ball_pos
+            if ball_pos is not None and len(ball_pos) >= 2:
+                ball_noise = self.np_random.normal(0.0, self.position_noise_std, size=2)
+                noisy_ball_pos = (
+                    float(ball_pos[0]) + float(ball_noise[0]),
+                    float(ball_pos[1]) + float(ball_noise[1]),
+                    *ball_pos[2:],
+                )
+
+            robot_poses = game_state.robot_poses
+            noisy_robot_poses = {}
+            for team_name, team_pose_entries in robot_poses.items():
+                noisy_entries = []
+                for entry in team_pose_entries:
+                    if not isinstance(entry, dict):
+                        noisy_entries.append(entry)
+                        continue
+
+                    noisy_entry = {}
+                    for robot_id, pose in entry.items():
+                        if pose is None or len(pose) < 2:
+                            noisy_entry[robot_id] = pose
+                            continue
+
+                        pose_noise = self.np_random.normal(0.0, self.position_noise_std, size=2)
+                        noisy_entry[robot_id] = (
+                            float(pose[0]) + float(pose_noise[0]),
+                            float(pose[1]) + float(pose_noise[1]),
+                            *pose[2:],
+                        )
+                    noisy_entries.append(noisy_entry)
+                noisy_robot_poses[team_name] = noisy_entries
+
+            return game_state._replace(
+                ball_pos=noisy_ball_pos,
+                robot_poses=noisy_robot_poses,
+            )
+        except Exception as e:
+            self.logger.error(f"Error preprocessing game state: {e}")
+            return game_state
         
     def _game_state_to_obs(self, game_state) -> np.ndarray:
         """
@@ -234,8 +291,8 @@ class JALTeamEnv(gym.Env):
         Flat list format:
         - Global (4):
             - [ball_x, ball_y, ball_vx, ball_vy]
-        - Per robot in self.robot_ids order (5 each):
-            - [robot_x, robot_y, robot_theta, robot_vx, robot_vy]
+        - Per robot in self.robot_ids order (8 each):
+            - [robot_x, robot_y, robot_theta, robot_vx, robot_vy, is_dribbling, start_dribble_x, start_dribble_y]
         
         Ball velocity is estimated using estimate_ball_velocity() from algo_utils,
         which uses a position history and the known ball decay constant for better
@@ -262,6 +319,8 @@ class JALTeamEnv(gym.Env):
         self._none_state_counter = 0
         
         try:
+            game_state = self._preprocess_game_state(game_state)
+
             # --- Ball position (tuple: x, y) ---
             ball_pos = game_state.ball_pos
             ball_x, ball_y = ball_pos[0], ball_pos[1]
@@ -300,12 +359,20 @@ class JALTeamEnv(gym.Env):
                 pose = pose_by_robot_id.get(robot_id)
 
                 if pose is None:
-                    obs_values.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+                    obs_values.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0])  # Default values for missing robot
                     continue
 
                 robot_x = float(pose[0])
                 robot_y = float(pose[1])
                 robot_theta = float(np.deg2rad(pose[2]))
+
+                robot_ball_distance = float(np.hypot(robot_x - ball_x, robot_y - ball_y))
+                self.is_dribbling[robot_id] = robot_ball_distance <= 1.115 + 0.05
+
+                if self.is_dribbling[robot_id] and self.start_dribble_pos[robot_id] == [-1.0, -1.0]:
+                    self.start_dribble_pos[robot_id] = [robot_x, robot_y]
+                elif not self.is_dribbling[robot_id]:
+                    self.start_dribble_pos[robot_id] = [-1.0, -1.0]
 
                 current_pose_xy = np.array([robot_x, robot_y], dtype=np.float32)
                 prev_pose_xy = self.prev_robot_pose_by_id.get(robot_id)
@@ -316,9 +383,12 @@ class JALTeamEnv(gym.Env):
                     robot_vx = float(current_pose_xy[0] - prev_pose_xy[0])
                     robot_vy = float(current_pose_xy[1] - prev_pose_xy[1])
 
+                is_dribbling = self.is_dribbling.get(robot_id, False)
+                start_dribble_pos = self.start_dribble_pos.get(robot_id, [-1.0, -1.0])
+
                 self.prev_robot_pose_by_id[robot_id] = current_pose_xy
 
-                obs_values.extend([robot_x, robot_y, robot_theta, robot_vx, robot_vy])
+                obs_values.extend([robot_x, robot_y, robot_theta, robot_vx, robot_vy, float(is_dribbling), float(start_dribble_pos[0]), float(start_dribble_pos[1])])
 
             obs = np.array(obs_values, dtype=np.float32)
 
@@ -328,24 +398,26 @@ class JALTeamEnv(gym.Env):
                     obs = obs[:self.obs_dim]
                 else:
                     obs = np.pad(obs, (0, self.obs_dim - obs.shape[0]))
-            
+
             return obs
             
         except Exception as e:
             self.logger.error(f"Error building observation: {e}")
             return np.zeros(self.obs_dim, dtype=np.float32)
 
-    def _action_to_commands(self, action: np.ndarray, game_state: Optional[Dict]) -> Tuple[List[str], Dict[str, Any]]:
+    def _action_to_commands(self, action: np.ndarray, game_state: Optional[GameState]) -> Tuple[List[str], Dict[str, Any]]:
         """
         Convert TD3 action vector to simulator command strings.
         
-        Action vector format (6*number of robots) Dimensions:
+        Action vector format (8*number of robots) Dimensions:
         [0]: goto_logit
-        [1]: kick_logit
-        [2]: dribble_logit
-        [3]: goto_x_raw  (range: [-1, 1])
-        [4]: goto_y_raw  (range: [-1, 1])
-        [5]: goto_theta_raw  (range: [-1, 1])
+        [1]: turn_logit
+        [2]: kick_logit
+        [3]: start_dribble_logit
+        [4]: stop_dribble_logit
+        [5]: goto_x_raw  (range: [-1, 1])
+        [6]: goto_y_raw  (range: [-1, 1])
+        [7]: turn_theta_raw  (range: [-1, 1])
         
         Args:
             action: Action vector from TD3 policy
@@ -372,13 +444,15 @@ class JALTeamEnv(gym.Env):
         for i, robot_id in enumerate(self.robot_ids):
             base = i * self.action_dim_per_robot
             goto_logit = float(action_arr[base + 0])
-            kick_logit = float(action_arr[base + 1])
-            dribble_logit = float(action_arr[base + 2])
-            goto_x_raw = float(action_arr[base + 3])
-            goto_y_raw = float(action_arr[base + 4])
-            goto_theta_raw = float(action_arr[base + 5])
+            turn_logit = float(action_arr[base + 1])
+            kick_logit = float(action_arr[base + 2])
+            start_dribble_logit = float(action_arr[base + 3])
+            stop_dribble_logit = float(action_arr[base + 4])
+            goto_x_raw = float(action_arr[base + 5])
+            goto_y_raw = float(action_arr[base + 6])
+            turn_theta_raw = float(action_arr[base + 7])
 
-            logits = np.array([goto_logit, kick_logit, dribble_logit], dtype=np.float32)
+            logits = np.array([goto_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit], dtype=np.float32)
 
             # Numerical stability: subtract max before exp
             logits_shifted = logits - np.max(logits)
@@ -386,48 +460,21 @@ class JALTeamEnv(gym.Env):
             probs = exp_logits / np.sum(exp_logits)
 
             action_idx = int(np.argmax(probs))
-            action_types = ["goto", "kick", "dribble"]
+            action_types = ["goto", "turn", "kick", "start_dribble", "stop_dribble"]
             action_type = action_types[action_idx]
 
             goto_x = float(goto_x_raw * self.field_half_width)
             goto_y = float(goto_y_raw * self.field_half_height)
-            goto_theta = float(goto_theta_raw * np.pi)
+            turn_theta = float(turn_theta_raw * np.pi)
 
             if action_type == "kick":
                 command = "kick 100 0"
-            elif action_type == "dribble":
-                pose = pose_by_robot_id.get(robot_id)
-                if pose is None or game_state is None:
-                    command = "turn 0"
-                else:
-                    self_pose = np.array([
-                        float(pose[0]),
-                        float(pose[1]),
-                        float(np.deg2rad(pose[2])),
-                    ], dtype=np.float32)
-                    ball_pose = np.array([
-                        float(game_state.ball_pos[0]),
-                        float(game_state.ball_pos[1]),
-                    ], dtype=np.float32)
-
-                    # Approximate dribble as controlled forward ball carrying:
-                    # if ball is kickable, make a low-power forward kick; otherwise chase ball.
-                    command = kick(
-                        self_pose=self_pose,
-                        ball_pose=ball_pose,
-                        target_angle=float(self_pose[2]),
-                        kick_power=15.0,
-                        dribbling=True,
-                    )
-                    if command == "failed":
-                        command = goto(
-                            self_pose=self_pose,
-                            x=float(ball_pose[0]),
-                            y=float(ball_pose[1]),
-                            game_state=game_state,
-                        )
-                        if command == "done":
-                            command = "turn 0"
+            elif action_type == "start_dribble":
+                command = "catch 0"  # Start dribble
+            elif action_type == "stop_dribble":
+                command = "drop"  # Stop dribble
+            elif action_type == "turn":
+                command = f"turn {turn_theta:.2f}"
             else:
                 pose = pose_by_robot_id.get(robot_id)
                 if pose is None or game_state is None:
@@ -443,7 +490,6 @@ class JALTeamEnv(gym.Env):
                         x=goto_x,
                         y=goto_y,
                         game_state=game_state,
-                        theta=goto_theta,
                     )
                     if command == "done":
                         command = "turn 0"
@@ -458,7 +504,7 @@ class JALTeamEnv(gym.Env):
                     "logits": logits.tolist(),
                     "goto_x": goto_x,
                     "goto_y": goto_y,
-                    "goto_theta": goto_theta,
+                    "turn_theta": turn_theta,
                     "command": command,
                 }
             )
@@ -501,9 +547,9 @@ class JALTeamEnv(gym.Env):
         """
         Validate/normalize command strings before sending to simulator.
 
-        Accepted final formats include: "dash p a", "turn a", "kick p a".
+        Accepted final formats include: "dash p a", "turn a", "kick p a", "catch", "drop".
         """
-        valid_prefixes = ("dash ", "turn ", "kick ")
+        valid_prefixes = ("dash ", "turn ", "kick ", "catch", "drop")
         out: List[str] = []
         for cmd in commands:
             clean_cmd = cmd.strip()
