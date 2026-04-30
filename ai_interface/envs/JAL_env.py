@@ -17,7 +17,9 @@ import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity
 from ai_interface.utils.basic_commands import goto
-from ai_interface.constants.field_constants import BALL_DECAY
+from ai_interface.constants.field_constants import *
+from ai_interface.constants.player_constants import *
+from ai_interface.envs.reward import RewardInputs, evaluate_reward, extract_opponent_positions
 from networking.networker import Networker
 from networking.data_utils import GameState
 
@@ -96,9 +98,12 @@ class JALTeamEnv(gym.Env):
         self.field_half_width = 45.0
         self.field_half_height = 30.0
 
+        self.kickable_dist = KICKABLE_MARGIN + BALL_SIZE / 2 + PLAYER_SIZE / 2
 
         # Per-robot pose history for velocity estimation
         self.prev_robot_pose_by_id: Dict[int, np.ndarray] = {}
+        self.prev_reward_ball_dist_by_id: Dict[int, float] = {}
+        self.prev_reward_ball_to_goal_dist: Optional[float] = None
 
         # Statistics
         self.total_rewards = 0.0
@@ -136,6 +141,8 @@ class JALTeamEnv(gym.Env):
 
         # Clear robot pose memory
         self.prev_robot_pose_by_id = {}
+        self.prev_reward_ball_dist_by_id = {}
+        self.prev_reward_ball_to_goal_dist = None
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -198,11 +205,14 @@ class JALTeamEnv(gym.Env):
         )
         obs = self._game_state_to_obs(next_game_state)
 
-        reward = 0.0
+        reward = self._calculate_reward(next_game_state)
+        self.total_rewards += reward
         terminated = False
         truncated = self.current_step >= self.max_steps
         info = {
             "action_info": action_info,
+            "reward": reward,
+            "total_reward": self.total_rewards,
         }
         return obs, reward, terminated, truncated, info
     
@@ -520,6 +530,97 @@ class JALTeamEnv(gym.Env):
         }
 
         return commands, action_info
+
+    def build_reward_inputs(
+        self,
+        current_game_state: GameState,
+        robot_id: Optional[int] = None,
+        state: Optional[str] = None,
+        prev_ball_dist: Optional[float] = None,
+        prev_ball_to_goal_dist: Optional[float] = None,
+    ) -> RewardInputs:
+        """Build a shared `RewardInputs` object from the current game state."""
+
+        if current_game_state is None or current_game_state.ball_pos is None:
+            raise ValueError("current_game_state with ball_pos is required")
+
+        if robot_id is None:
+            if not self.robot_ids:
+                raise ValueError("robot_id is required when no robots are configured")
+            robot_id = self.robot_ids[0]
+
+        pose_by_robot_id: Dict[int, Any] = {}
+        team_pose_entries = current_game_state.robot_poses.get(self.team_name, [])
+        for entry in team_pose_entries:
+            if isinstance(entry, dict):
+                pose_by_robot_id.update(entry)
+
+        pose = pose_by_robot_id.get(robot_id)
+        if pose is None:
+            raise ValueError(f"Robot pose for robot_id={robot_id} is unavailable")
+
+        ball_x, ball_y = float(current_game_state.ball_pos[0]), float(current_game_state.ball_pos[1])
+        robot_x, robot_y = float(pose[0]), float(pose[1])
+        robot_theta = float(np.deg2rad(pose[2]))
+        ball_dist = float(np.hypot(ball_x - robot_x, ball_y - robot_y))
+        has_ball = bool(ball_dist <= self.kickable_dist)
+        reward_state = state if state is not None else self._default_reward_state(has_ball)
+
+        return RewardInputs(
+            ball_pos=(ball_x, ball_y),
+            self_pose_rad=(robot_x, robot_y, robot_theta),
+            ball_dist=ball_dist,
+            has_ball=has_ball,
+            kickable_dist=self.kickable_dist,
+            state=reward_state,
+            opponent_positions=extract_opponent_positions(
+                robot_poses=getattr(current_game_state, "robot_poses", {}),
+                team_name=self.team_name,
+            ),
+            prev_ball_dist=prev_ball_dist,
+            prev_ball_to_goal_dist=prev_ball_to_goal_dist,
+        )
+
+    @staticmethod
+    def _default_reward_state(has_ball: bool) -> str:
+        """Infer a default reward state when no explicit state label is provided."""
+
+        if has_ball:
+            return "secure_possession"
+        return "chase_ball"
+
+    def _calculate_reward(self, current_game_state: Optional[GameState]) -> float:
+        """Calculate the shared team reward from the latest game state."""
+
+        if current_game_state is None:
+            return 0.0
+
+        rewards: List[float] = []
+        next_ball_to_goal_dist: Optional[float] = None
+
+        for robot_id in self.robot_ids:
+            try:
+                reward_inputs = self.build_reward_inputs(
+                    current_game_state=current_game_state,
+                    robot_id=robot_id,
+                    prev_ball_dist=self.prev_reward_ball_dist_by_id.get(robot_id),
+                    prev_ball_to_goal_dist=self.prev_reward_ball_to_goal_dist,
+                )
+            except ValueError:
+                continue
+
+            reward_result = evaluate_reward(reward_inputs)
+            rewards.append(float(reward_result.reward))
+            self.prev_reward_ball_dist_by_id[robot_id] = reward_result.intermediates.ball_dist
+            next_ball_to_goal_dist = reward_result.intermediates.ball_to_goal_dist
+
+        if next_ball_to_goal_dist is not None:
+            self.prev_reward_ball_to_goal_dist = next_ball_to_goal_dist
+
+        if not rewards:
+            return 0.0
+
+        return float(np.mean(rewards))
 
     def _send_commands(self, commands: List[str]):
         """

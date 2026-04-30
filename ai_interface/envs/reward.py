@@ -1,4 +1,4 @@
-"""General reward helpers for the single-agent HSM setup."""
+"""General reward helpers for single-agent environments."""
 
 from __future__ import annotations
 
@@ -9,12 +9,11 @@ import math
 import numpy as np
 
 from ai_interface.constants.field_constants import FIELD_X, FIELD_Y
-from ai_interface.hsm.single_agent_fsm import FSMIntent, FSMState
 
 
 @dataclass(frozen=True)
-class HSMRewardConfig:
-    """Weights and thresholds used by the HSM reward function."""
+class RewardConfig:
+    """Weights and thresholds used by the shared reward function."""
 
     invalid_context_reward: float = -0.1
     approach_clip: float = 0.5
@@ -28,7 +27,6 @@ class HSMRewardConfig:
     opponent_near_ball_threshold: float = 5.0
     shoot_state_bonus: float = 0.25
     dribble_state_bonus: float = 0.15
-    force_shoot_without_ball_penalty: float = 0.2
     goal_reward: float = 70.0
     robot_out_of_bounds_penalty: float = 3.0
     ball_out_of_bounds_penalty: float = 1.5
@@ -37,23 +35,22 @@ class HSMRewardConfig:
 
 
 @dataclass(frozen=True)
-class HSMRewardInputs:
-    """State needed to evaluate the HSM reward independently of any env."""
+class RewardInputs:
+    """State needed to evaluate the shared reward independently of any env."""
 
     ball_pos: Tuple[float, float]
     self_pose_rad: Tuple[float, float, float]
     ball_dist: float
     has_ball: bool
     kickable_dist: float
-    action: int
-    state: FSMState
+    state: str
     opponent_positions: Tuple[Tuple[float, float], ...] = ()
     prev_ball_dist: Optional[float] = None
     prev_ball_to_goal_dist: Optional[float] = None
 
 
 @dataclass(frozen=True)
-class HSMRewardIntermediates:
+class RewardIntermediates:
     """Intermediate values used to assemble the scalar reward."""
 
     ball_dist: float
@@ -66,21 +63,20 @@ class HSMRewardIntermediates:
     opponent_near_ball: bool
     in_shoot_state: bool
     in_dribble_state: bool
-    force_shoot_without_ball: bool
     goal_scored: bool
     robot_out_of_bounds: bool
     ball_out_of_bounds: bool
 
 
 @dataclass(frozen=True)
-class HSMRewardResult:
+class RewardResult:
     """Reward output plus terminal flags and intermediate values."""
 
     reward: float
     goal_scored: bool
     robot_out_of_bounds: bool
     ball_out_of_bounds: bool
-    intermediates: HSMRewardIntermediates
+    intermediates: RewardIntermediates
 
 
 def extract_opponent_positions(
@@ -99,14 +95,14 @@ def extract_opponent_positions(
     return tuple(positions)
 
 
-def calculate_hsm_reward_intermediates(
-    inputs: HSMRewardInputs,
-    config: Optional[HSMRewardConfig] = None,
-) -> HSMRewardIntermediates:
+def calculate_reward_intermediates(
+    inputs: RewardInputs,
+    config: Optional[RewardConfig] = None,
+) -> RewardIntermediates:
     """Calculate the per-step intermediate reward terms."""
 
     if config is None:
-        config = HSMRewardConfig()
+        config = RewardConfig()
 
     bx, by = inputs.ball_pos
     rx, ry, _ = inputs.self_pose_rad
@@ -138,7 +134,7 @@ def calculate_hsm_reward_intermediates(
     robot_out_of_bounds = bool(abs(rx) > FIELD_X[1] or abs(ry) > FIELD_Y[1])
     ball_out_of_bounds = bool(abs(by) > FIELD_Y[1] or bx < FIELD_X[0])
 
-    return HSMRewardIntermediates(
+    return RewardIntermediates(
         ball_dist=ball_dist,
         ball_to_goal_dist=ball_to_goal_dist,
         approach=approach,
@@ -150,23 +146,22 @@ def calculate_hsm_reward_intermediates(
             nearest_opponent_ball_dist is not None
             and nearest_opponent_ball_dist < config.opponent_near_ball_threshold
         ),
-        in_shoot_state=bool(inputs.state == FSMState.SHOOT_ON_GOAL),
-        in_dribble_state=bool(inputs.state == FSMState.DRIBBLE_TO_GOAL),
-        force_shoot_without_ball=bool(int(inputs.action) == FSMIntent.FORCE_SHOOT and not inputs.has_ball),
+        in_shoot_state=bool(inputs.state == "shoot_on_goal"),
+        in_dribble_state=bool(inputs.state == "dribble_to_goal"),
         goal_scored=goal_scored,
         robot_out_of_bounds=robot_out_of_bounds,
         ball_out_of_bounds=ball_out_of_bounds,
     )
 
 
-def calculate_hsm_reward(
-    intermediates: HSMRewardIntermediates,
-    config: Optional[HSMRewardConfig] = None,
+def calculate_reward(
+    intermediates: RewardIntermediates,
+    config: Optional[RewardConfig] = None,
 ) -> float:
     """Convert intermediate reward terms into the final scalar reward."""
 
     if config is None:
-        config = HSMRewardConfig()
+        config = RewardConfig()
 
     reward = 0.0
 
@@ -188,9 +183,6 @@ def calculate_hsm_reward(
     if intermediates.in_dribble_state:
         reward += config.dribble_state_bonus
 
-    if intermediates.force_shoot_without_ball:
-        reward -= config.force_shoot_without_ball_penalty
-
     if intermediates.goal_scored:
         reward += config.goal_reward
     if intermediates.robot_out_of_bounds:
@@ -202,18 +194,18 @@ def calculate_hsm_reward(
     return float(reward)
 
 
-def evaluate_hsm_reward(
-    inputs: HSMRewardInputs,
-    config: Optional[HSMRewardConfig] = None,
-) -> HSMRewardResult:
-    """Evaluate the HSM reward from plain inputs."""
+def evaluate_reward(
+    inputs: RewardInputs,
+    config: Optional[RewardConfig] = None,
+) -> RewardResult:
+    """Evaluate the shared reward from plain inputs."""
 
     if config is None:
-        config = HSMRewardConfig()
+        config = RewardConfig()
 
-    intermediates = calculate_hsm_reward_intermediates(inputs=inputs, config=config)
-    reward = calculate_hsm_reward(intermediates=intermediates, config=config)
-    return HSMRewardResult(
+    intermediates = calculate_reward_intermediates(inputs=inputs, config=config)
+    reward = calculate_reward(intermediates=intermediates, config=config)
+    return RewardResult(
         reward=reward,
         goal_scored=intermediates.goal_scored,
         robot_out_of_bounds=intermediates.robot_out_of_bounds,
