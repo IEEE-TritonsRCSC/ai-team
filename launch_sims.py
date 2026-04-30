@@ -4,12 +4,13 @@
 Examples:
   python launch_sims.py --env 2
   python launch_sims.py --env 2 --monitor
-  python launch_sims.py --env 2 --monitor --sim-cmd "rcsserver" --monitor-cmd "monitor"
+  python launch_sims.py --env 2 --monitor --sim-cmd "rcssserver" --monitor-cmd "rcssmonitor"
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import shlex
 import subprocess
 import sys
@@ -33,13 +34,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sim-cmd",
-        default="rcsserver",
-        help='Command used to launch one simulator instance (default: "rcsserver")',
+        default="rcssserver",
+        help='Command used to launch one simulator instance (default: "rcssserver")',
+    )
+    parser.add_argument(
+        "--base-port",
+        type=int,
+        default=6000,
+        help="Player port for env 0 (default: 6000)",
+    )
+    parser.add_argument(
+        "--port-stride",
+        type=int,
+        default=10,
+        help="Port gap between consecutive envs (default: 10)",
     )
     parser.add_argument(
         "--monitor-cmd",
-        default="monitor",
-        help='Command used to launch one monitor instance (default: "monitor")',
+        default="rcssmonitor",
+        help='Command used to launch one monitor instance (default: "rcssmonitor")',
     )
     parser.add_argument(
         "monitor_value",
@@ -66,6 +79,32 @@ def split_command(command: str) -> list[str]:
     return parts
 
 
+def build_sim_command(base_cmd: list[str], port: int) -> list[str]:
+    return base_cmd + [
+        f"server::port={port}",
+        f"server::coach_port={port + 1}",
+        f"server::olcoach_port={port + 2}",
+    ]
+
+
+def command_missing_message(command: str, arg_name: str) -> str:
+    binary = shlex.split(command)[0] if command else command
+    hints = [
+        f"Cannot run '{binary}'.",
+        f"Install RoboCup Soccer Simulator or pass {arg_name} /full/path/to/{binary}.",
+    ]
+    if binary == "rcssserver" and shutil.which("rcsserver"):
+        hints.append("Found 'rcsserver' on PATH; try --sim-cmd rcsserver.")
+    elif binary == "rcsserver":
+        hints.append("The standard RoboCup 2D server binary is usually named 'rcssserver'.")
+    if sys.platform == "darwin":
+        hints.append(
+            "On macOS, install/build rcsoccersim, then pass the built binary path "
+            "if it is not on PATH."
+        )
+    return "\n".join(hints)
+
+
 def stop_processes(procs: list[subprocess.Popen]) -> None:
     for proc in procs:
         if proc.poll() is None:
@@ -82,6 +121,9 @@ def main() -> int:
     args = parse_args()
     if args.env < 1:
         print("--env must be >= 1", file=sys.stderr)
+        return 1
+    if args.port_stride < 3:
+        print("--port-stride must be >= 3 to avoid sim port conflicts", file=sys.stderr)
         return 1
 
     try:
@@ -102,33 +144,36 @@ def main() -> int:
     print(
         f"Launching {args.env} sim process(es)"
         + (f" and {args.env} monitor process(es)" if launch_monitor else "")
-        + "..."
+        + "...",
+        flush=True,
     )
 
     try:
         for env_idx in range(args.env):
+            port = args.base_port + env_idx * args.port_stride
+            instance_sim_cmd = build_sim_command(sim_cmd, port)
             try:
-                sim_proc = subprocess.Popen(sim_cmd)
+                sim_proc = subprocess.Popen(instance_sim_cmd)
             except FileNotFoundError:
-                print(
-                    f"Cannot run '{sim_cmd[0]}'. Make sure it is in PATH or set --sim-cmd.",
-                    file=sys.stderr,
-                )
+                print(command_missing_message(args.sim_cmd, "--sim-cmd"), file=sys.stderr)
                 stop_processes(procs)
                 return 1
 
             procs.append(sim_proc)
-            print(f"[env {env_idx}] sim pid={sim_proc.pid}")
+            print(f"[env {env_idx}] sim pid={sim_proc.pid} port={port}")
             time.sleep(0.1)
 
             if launch_monitor:
+                instance_monitor_cmd = monitor_cmd + [
+                    "--server-host",
+                    "127.0.0.1",
+                    "--server-port",
+                    str(port),
+                ]
                 try:
-                    monitor_proc = subprocess.Popen(monitor_cmd)
+                    monitor_proc = subprocess.Popen(instance_monitor_cmd)
                 except FileNotFoundError:
-                    print(
-                        f"Cannot run '{monitor_cmd[0]}'. Make sure it is in PATH or set --monitor-cmd.",
-                        file=sys.stderr,
-                    )
+                    print(command_missing_message(args.monitor_cmd, "--monitor-cmd"), file=sys.stderr)
                     stop_processes(procs)
                     return 1
                 procs.append(monitor_proc)

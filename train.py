@@ -27,15 +27,8 @@ import importlib
 
 import torch
 
-from ai_interface.trainers import (
-    BaseTrainer, 
-    HierarchicalPPOTrainer, 
-    SB3PPOTrainer, 
-    DiscretePPOTrainer, 
-    MAPPOTrainer,
-    TD3JALTrainer,
-    HSMSB3PPOTrainer,
-)
+if TYPE_CHECKING:
+    from ai_interface.trainers import BaseTrainer
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
