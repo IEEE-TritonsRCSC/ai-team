@@ -140,7 +140,8 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
 def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
           target: np.ndarray | Tuple | List, kick_power: float = 80.0,
           kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
-          angle_tolerance: float = math.radians(5.0), dribbling=False) -> str:
+          angle_tolerance: float = math.radians(5.0), dribbling=False,
+          game_state=None) -> str:
     """
     Create a `kick` command toward a target if the ball is kickable and aligned.
 
@@ -154,15 +155,17 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
         return "failed"
 
     angle_to_target = np.arctan2(target[1] - self_xy[1], target[0] - self_xy[0])
-    return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling)
-    
-def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
-         target_angle: float, kick_power: float = 80.0, dribbling=False, ) -> str:
+    return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling,
+                game_state=game_state)
+
+def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
+         target_angle: float, kick_power: float = 80.0, dribbling=False,
+         game_state=None) -> str:
     """
     Creates 'kick' or 'turn' commands to aim and kick the ball towards a specific global angle
-    
+
     self_pose is [x, y, theta] in radians; target_angle is in radians;
-    
+
     Returns 'kick {kick_power} 0'
     """
     self_pose = _as_float_array(self_pose)
@@ -177,11 +180,12 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
         ball_xy = np.array(ball_pose[:2], dtype=float)
         target_pos = ball_xy - np.array([math.cos(target_angle), math.sin(target_angle)]) * (PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN * 0.5)
         print('[Kick] Target position for kicking:', target_pos)
-        cmd = goto(self_pose, target_pos[0], target_pos[1], game_state=game_state, margin=0.1, speed=80.0, theta=target_angle)
-        if "done" in cmd:
-            return f"kick {kick_power:.1f} {0}"
-        else:
+        if game_state is not None:
+            cmd = goto(self_pose, target_pos[0], target_pos[1], game_state, margin=0.1, speed=80.0, theta=target_angle)
+            if "done" in cmd:
+                return f"kick {kick_power:.1f} {0}"
             return cmd
+        return f"kick {kick_power:.1f} {0}"
 
 
 def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
