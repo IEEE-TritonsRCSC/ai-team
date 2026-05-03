@@ -1,0 +1,22 @@
+diff -u rcssmonitor-19.0.1/rcss/rcg/simdjson/simdjson.h rcssmonitor-19.0.1/rcss/rcg/simdjson/simdjson.h
+--- rcssmonitor-19.0.1/rcss/rcg/simdjson/simdjson.h	2024-03-25 20:14:24
++++ rcssmonitor-19.0.1/rcss/rcg/simdjson/simdjson.h	2025-12-19 01:08:52
+@@ -6260,15 +6260,15 @@
+   simdjson_inline void one_char(char c);
+ 
+   simdjson_inline void call_print_newline() {
+-      this->print_newline();
++      // this->print_newline();
+   }
+ 
+   simdjson_inline void call_print_indents(size_t depth) {
+-      this->print_indents(depth);
++      // this->print_indents(depth);
+   }
+ 
+   simdjson_inline void call_print_space() {
+-      this->print_space();
++      // this->print_space();
+   }
+ 
+ protected:

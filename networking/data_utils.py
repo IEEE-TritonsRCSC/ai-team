@@ -17,15 +17,15 @@ SIM_COUNT_REGEX = r"\(see_global (\d+) (.*?)(?=\s\(\(b)"
 # Matches " ((b) <data>)" and captures ball position data between 
 # ((b) and  " ((p" markers
 SIM_BALL_POS_REGEX = r"\s\(\(b\) (.*?)(?=\s\(\(p)"
-# Matches " ((p "<team>" <uniform_num>) <pose_data>)" capturing team name, 
-# uniform number (1-11), and pose coordinates
-SIM_ROBOT_POSE_REGEX = r"\s\(\(p \"(\w*)\" (1[0-1]|[1-9])\) ([^\)]+)\)"
+# Matches " ((p "<team>" <uniform_num> [role]) <pose_data>)" capturing team name,
+# uniform number (1-11), and pose coordinates (role like 'goalie' is optional)
+SIM_ROBOT_POSE_REGEX = r"\s\(\(p \"(\w*)\" (1[0-1]|[1-9])(?: \w+)?\) ([^\)]+)\)"
 
 GameState = namedtuple(
-    "GameState", ["count", "timestamp", "ball_pos", "robot_poses"]
+    "GameState", ["count", "timestamp", "ball_pos", "robot_poses", "playmode"]
 )
 
-TeamInfo = namedtuple("TeamInfo", ["name", "n_players"])
+TeamInfo = namedtuple("TeamInfo", ["name", "n_players", "goalie_id"])
 
 class Deserializer:
     """Deserializes game data from various sources into GameState objects."""
@@ -37,6 +37,7 @@ class Deserializer:
             team_infos: List of team information including names and player counts
         """
         self.team_names = [team_info.name for team_info in team_infos]
+        self.ball_last_pos = (0, 0)
 
     def sim_deserialize(self, data: bytes) -> GameState:
         """
@@ -71,7 +72,7 @@ class Deserializer:
         if robot_poses is None:
             return None
 
-        return GameState(count, timestamp, ball_pos, robot_poses)
+        return GameState(count, timestamp, ball_pos, robot_poses, None)
 
     def sim_get_ball_pos(self, message: str) -> tuple:
         """
@@ -134,12 +135,13 @@ class Deserializer:
     def cam_get_ball_pos(self, ball_data) -> tuple:
         """
         Extract ball position from camera detection data.
+        If ball is not detected, predict position based on history
         
         Args:
             ball_data: List of detected ball objects with confidence and position
             
         Returns:
-            Tuple of (x, y) position of highest confidence ball, or None if no balls
+            Tuple of (x, y) position of highest confidence ball, or predicted position if not detected
         """
         highest_confident_ball = None
         highest_confidence = 0.0
@@ -150,7 +152,14 @@ class Deserializer:
                 highest_confident_ball = ball
 
         if highest_confident_ball is not None:
-            return (highest_confident_ball.x, highest_confident_ball.y)
+            ball_pos = (highest_confident_ball.x, highest_confident_ball.y)
+            self.ball_last_pos = ball_pos
+            return ball_pos
+        
+        # Ball not detected, return last known position
+        if self.ball_last_pos is not None:
+            return self.ball_last_pos
+        
         return None
 
     def cam_get_robot_poses(self, robot_data) -> dict[str, list]:
@@ -184,22 +193,28 @@ class Serializer:
     """Serializes commands into formats suitable for different targets."""
     def _convert_command_for_simulator(self, action: str, convert_index: int) -> str:
         """
-        Convert robot angle commands (rad/s) to simulator commands (degrees).
+        Converts commands with different types of angle representations
+        consisting of radians to simulator commands consisting of degrees.
         
         Args:
             action: Robot command string
-            convert_index: Index of the rad/s value to convert
+            convert_index: Index of the value containing radians in the command
             
         Returns:
-            Simulator command string with degrees
+            Simulator command string containing degrees
         """
         parts = action.split()
         head = " ".join(parts[:convert_index])
-        tail = " ".join(parts[convert_index + 1:])
+        tail = " ".join(parts[convert_index + 1:]) if len(parts) > convert_index + 1 else ""
 
-        rad_per_sec = float(parts[convert_index])
-        degrees_per_sec = math.degrees(rad_per_sec)
-        degrees =  degrees_per_sec * SIM_TIMESTEP
+        if len(parts) <= convert_index:
+            return action
+
+        rad_part = float(parts[convert_index])
+        if head.startswith("turn"):
+            rad_part *= SIM_TIMESTEP    # turn commands are in rad/s
+
+        degrees = math.degrees(rad_part)
         normalized_degrees = ((degrees + 180) % 360) - 180
 
         return f"{head} {normalized_degrees} {tail}".strip()
@@ -219,10 +234,14 @@ class Serializer:
             if action is None:
                 continue
 
-            # Convert rad/s to degrees for simulator
-            if action.startswith("turn "):
+            if action.startswith("turn "):    # Convert rad/s to degrees/s for simulator
                 action = self._convert_command_for_simulator(action, 1)
-            elif action.startswith("dash "):
+            elif action.startswith("dash "):    # Convert rad to degrees for simulator
+                action = self._convert_command_for_simulator(action, 2)
+            elif action.startswith("skick "):    # Remove the s prefix for simulator
+                action = action[1:]
+                action = self._convert_command_for_simulator(action, 2)
+            elif action.startswith("kick "):    # Convert rad to degrees for simulator
                 action = self._convert_command_for_simulator(action, 2)
 
             messages[i] = b"(" + action.encode() + b")\0"
@@ -247,5 +266,6 @@ class Serializer:
                 message += f"{robot_id} {action}\n"
             robot_id += 1
         
+        message += "\0"    # Null terminator for robot communication
         return message.encode()
 
