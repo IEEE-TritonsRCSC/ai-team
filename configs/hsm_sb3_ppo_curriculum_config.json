@@ -1,0 +1,44 @@
+{
+  "trainer_type": "hsm_sb3_ppo_curriculum",
+  "team_config": "team_config.json",
+  "env_mode": "sim-only",
+  "team_name": "TritonBots",
+  "curriculum": {
+    "stage1": {
+      "description": "Single robot role 1 (e.g., attacker)",
+      "unum": 1,
+      "timesteps": 200000,
+      "opponent_difficulty": "none"
+    },
+    "stage2": {
+      "description": "Single robot role 2 (e.g., defender)",
+      "unum": 2,
+      "timesteps": 200000,
+      "opponent_difficulty": "none"
+    },
+    "stage3": {
+      "description": "Single robot against scripted opponent",
+      "unum": 1,
+      "timesteps": 200000,
+      "opponent_difficulty": "scripted"
+    }
+  },
+  "obs_dim": 28,
+  "max_steps": 220,
+  "learn_batch_timesteps": 4096,
+  "save_interval": 50000,
+  "save_path": "models/hsm_sb3_ppo_curriculum",
+  "load_model": null,
+  "model_params": {
+    "learning_rate": 3e-4,
+    "n_steps": 2048,
+    "batch_size": 64,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5
+  }
+}

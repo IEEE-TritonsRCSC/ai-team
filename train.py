@@ -205,6 +205,58 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
                 "max_grad_norm": 0.5,
             },
         }
+    elif trainer_type == "hsm_sb3_ppo_curriculum":
+        return {
+            **base_config,
+            "obs_dim": args.obs_dim if args.obs_dim != 18 else 28,
+            "max_steps": args.max_steps,
+            "learn_batch_timesteps": args.learn_batch_timesteps,
+            "save_path": args.save_path or "models/hsm_sb3_ppo_curriculum",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "model_params": {
+                "learning_rate": 3e-4,
+                "n_steps": 2048,
+                "batch_size": 64,
+                "n_epochs": 10,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "ent_coef": 0.01,
+                "vf_coef": 0.5,
+                "max_grad_norm": 0.5,
+            },
+        }
+    elif trainer_type == "td3_jal_curriculum":
+        return {
+            **base_config,
+            "obs_dim_per_robot": 8,
+            "non_robot_obs_dim": 4,
+            "max_steps": args.max_steps,
+            "learn_batch_timesteps": args.learn_batch_timesteps,
+            "save_path": args.save_path or "models/td3_jal_curriculum",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model,
+            "model_params": {
+                "learning_rate": 0.001,
+                "buffer_size": 100000,
+                "batch_size": 64,
+                "gamma": 0.9,
+                "tau": 0.01,
+                "policy_delay": 2,
+                "target_policy_noise": 0.2,
+                "action_noise_std": 0.05,
+                "policy_kwargs": {
+                    "net_arch": [64, 48, 32]
+                }
+            },
+            "network_params": {
+                "network_type": "expandable_attention",
+                "feature_dim": 64,
+                "num_heads": 4,
+                "max_robots": 3
+            },
+        }
     else:
         raise ValueError(f"Unknown trainer type: {trainer_type}")
 
@@ -217,9 +269,11 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "mappo": ("ai_interface.trainers.mappo_trainer", "MAPPOTrainer"),
         "hsm_marl": ("ai_interface.trainers.hsm_marl_trainer", "HSMMARLTrainer"),
         "hsm_sb3_ppo": ("ai_interface.trainers.hsm_sb3_ppo_trainer", "HSMSB3PPOTrainer"),
+        "hsm_sb3_ppo_curriculum": ("ai_interface.trainers.hsm_sb3_ppo_curriculum_trainer", "HSMSB3PPOCurriculumTrainer"),
         "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
         "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
+        "td3_jal_curriculum": ("ai_interface.trainers.td3_jal_curriculum_trainer", "TD3JALCurriculumTrainer"),
     }
     
     if trainer_type not in trainers:
@@ -269,7 +323,7 @@ Examples:
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
     parser.add_argument("--trainer", type=str, 
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "sb3_ppo", "td3_jal", "qlearning"],
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "td3_jal", "td3_jal_curriculum", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options

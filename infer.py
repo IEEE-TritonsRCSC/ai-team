@@ -168,6 +168,50 @@ def _run_sb3_ppo(args, networker: Networker, team_name: str):
     print(f"SB3 PPO inference complete — {args.steps} steps.")
 
 
+def _run_td3_jal(args, networker: Networker, team_name: str):
+    """Run inference with TD3 JAL (centralized team policy)."""
+    from ai_interface.algorithms.td3_jal import TD3JALAlgorithm
+    from ai_interface.envs.JAL_env import JALTeamEnv
+
+    device = _resolve_device()
+    num_robots = int(args.num_robots)
+    robot_ids = list(range(1, num_robots + 1))
+
+    env = JALTeamEnv(
+        networker=networker,
+        team_name=team_name,
+        robot_ids=robot_ids,
+        obs_dim_per_robot=int(args.obs_dim_per_robot),
+        non_robot_obs_dim=int(args.non_robot_obs_dim),
+        max_steps=int(args.steps_per_episode),
+        debug=bool(args.debug_infer),
+    )
+
+    model = TD3JALAlgorithm.load(args.model_path, env=env, device=str(device))
+    model.model.set_parameters(model.model.get_parameters())  # Ensure model is ready
+
+    obs, _ = env.reset()
+    total_reward = 0.0
+    episode_count = 0
+
+    for step in range(int(args.steps)):
+        # Deterministic inference: use mean from policy (no exploration noise)
+        action, _state = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+
+        if terminated or truncated:
+            print(
+                f"Episode {episode_count + 1}: Reward={total_reward:.2f}, "
+                f"Steps={step + 1}"
+            )
+            episode_count += 1
+            total_reward = 0.0
+            obs, _ = env.reset()
+
+    print(f"TD3 JAL inference complete — {episode_count} episodes, {args.steps} total steps.")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -177,6 +221,7 @@ _TRAINER_RUNNERS = {
     "discrete_ppo": _run_discrete_ppo,
     "discreteq_learning": _run_discreteq_learning,
     "sb3_ppo": _run_sb3_ppo,
+    "td3_jal": _run_td3_jal,
 }
 
 
@@ -198,11 +243,21 @@ def main():
     parser.add_argument("--team", type=str, default="TritonBots",
                         help="Team name to control")
     parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to saved model (.pth for hier/discrete PPO, .zip for SB3)")
+                        help="Path to saved model (.pth for hier/discrete PPO, .zip for SB3/TD3)")
     parser.add_argument("--obs_dim", type=int, default=18,
                         help="Observation dimension (used by hier_ppo and discrete_ppo)")
     parser.add_argument("--steps", type=int, default=1000,
                         help="Number of inference steps to run")
+    parser.add_argument("--num_robots", type=int, default=1,
+                        help="Number of robots (for td3_jal)")
+    parser.add_argument("--obs_dim_per_robot", type=int, default=8,
+                        help="Observation dimension per robot (for td3_jal)")
+    parser.add_argument("--non_robot_obs_dim", type=int, default=4,
+                        help="Non-robot (global) observation dimension (for td3_jal)")
+    parser.add_argument("--steps_per_episode", type=int, default=200,
+                        help="Max steps per episode (for td3_jal)")
+    parser.add_argument("--debug_infer", action="store_true",
+                        help="Enable debug logging during inference")
 
     args = parser.parse_args()
 
