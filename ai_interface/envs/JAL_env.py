@@ -15,7 +15,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from ai_interface.utils.algo_utils import estimate_ball_velocity
+from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
 from ai_interface.utils.basic_commands import goto
 from ai_interface.constants.field_constants import *
 from ai_interface.constants.player_constants import *
@@ -38,6 +38,7 @@ class JALTeamEnv(gym.Env):
         state_retry_sleep_s: float = 0.02,
         none_state_warn_every: int = 50,
         position_noise_std: float = 0.05,
+        invalid_action_penalty: float = 0.2,
         some_arg=None
         ):
         
@@ -55,6 +56,7 @@ class JALTeamEnv(gym.Env):
         self.state_retry_sleep_s = max(0.0, float(state_retry_sleep_s))
         self.none_state_warn_every = max(1, int(none_state_warn_every))
         self.position_noise_std = float(position_noise_std)
+        self.invalid_action_penalty = max(0.0, float(invalid_action_penalty))
         
         
         # Create a logger for this environment
@@ -206,6 +208,9 @@ class JALTeamEnv(gym.Env):
         obs = self._game_state_to_obs(next_game_state)
 
         reward = self._calculate_reward(next_game_state)
+        invalid_action_count = int(action_info.get("invalid_action_count", 0))
+        if invalid_action_count > 0 and self.invalid_action_penalty > 0.0:
+            reward -= self.invalid_action_penalty * invalid_action_count
         self.total_rewards += reward
         terminated = False
         truncated = self.current_step >= self.max_steps
@@ -213,6 +218,7 @@ class JALTeamEnv(gym.Env):
             "action_info": action_info,
             "reward": reward,
             "total_reward": self.total_rewards,
+            "invalid_action_count": invalid_action_count,
         }
         return obs, reward, terminated, truncated, info
     
@@ -450,6 +456,8 @@ class JALTeamEnv(gym.Env):
 
         commands: List[str] = []
         per_robot_info: List[Dict[str, Any]] = []
+        invalid_action_count = 0
+        ball_pos = game_state.ball_pos if game_state is not None else None
 
         for i, robot_id in enumerate(self.robot_ids):
             base = i * self.action_dim_per_robot
@@ -477,16 +485,41 @@ class JALTeamEnv(gym.Env):
             goto_y = float(goto_y_raw * self.field_half_height)
             turn_theta = float(turn_theta_raw * np.pi)
 
+            pose = pose_by_robot_id.get(robot_id)
+            has_ball_now = False
+            if pose is not None and ball_pos is not None and len(ball_pos) >= 2:
+                has_ball_now = has_ball(
+                    self_pos_xy=pose,
+                    ball_pos_xy=ball_pos,
+                    kickable_dist=self.kickable_dist,
+                )
+
+            invalid_action_requested = (
+                (action_type == "kick" and not has_ball_now)
+                or (action_type == "start_dribble" and not has_ball_now)
+                or (action_type == "stop_dribble" and not has_ball_now)
+            )
+            if invalid_action_requested:
+                invalid_action_count += 1
+
             if action_type == "kick":
-                command = "kick 100 0"
+                if not has_ball_now:
+                    command = "turn 0"
+                else:
+                    command = "kick 100 0"
             elif action_type == "start_dribble":
-                command = "catch 0"  # Start dribble
+                if not has_ball_now:
+                    command = "turn 0"
+                else:
+                    command = "catch 0"  # Start dribble
             elif action_type == "stop_dribble":
-                command = "drop"  # Stop dribble
+                if not has_ball_now:
+                    command = "turn 0"
+                else:
+                    command = "drop"  # Stop dribble
             elif action_type == "turn":
                 command = f"turn {turn_theta:.2f}"
             else:
-                pose = pose_by_robot_id.get(robot_id)
                 if pose is None or game_state is None:
                     command = "turn 0"
                 else:
@@ -515,6 +548,8 @@ class JALTeamEnv(gym.Env):
                     "goto_x": goto_x,
                     "goto_y": goto_y,
                     "turn_theta": turn_theta,
+                    "has_ball_now": has_ball_now,
+                    "invalid_action_requested": invalid_action_requested,
                     "command": command,
                 }
             )
@@ -527,6 +562,7 @@ class JALTeamEnv(gym.Env):
         action_info: Dict[str, Any] = {
             "action_type": "multi" if self.num_robots > 1 else per_robot_info[0]["action_type"],
             "per_robot": per_robot_info,
+            "invalid_action_count": invalid_action_count,
         }
 
         return commands, action_info

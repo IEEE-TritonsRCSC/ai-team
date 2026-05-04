@@ -59,3 +59,15 @@ def estimate_ball_velocity(positions, alpha):
         v_next = (alpha**(k-1)) * v0_est
     
     return v_next.reshape(-1)
+
+def has_ball(self_pos_xy, ball_pos_xy, kickable_dist: float) -> bool:
+    """Return True if robot is within kickable distance of the ball."""
+    if self_pos_xy is None or ball_pos_xy is None:
+        return False
+
+    if len(self_pos_xy) < 2 or len(ball_pos_xy) < 2:
+        return False
+
+    dx = float(self_pos_xy[0]) - float(ball_pos_xy[0])
+    dy = float(self_pos_xy[1]) - float(ball_pos_xy[1])
+    return bool(np.hypot(dx, dy) <= float(kickable_dist))
