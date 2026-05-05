@@ -13,10 +13,12 @@ from typing import Any, Dict, Optional, Sequence
 import gymnasium as gym
 import torch
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 
 from ai_interface.algorithms.base import AlgorithmBase
 from ai_interface.algorithms.robot_attention import (
     MultiRobotFeatureExtractor,
+    RobotAttentionActorCriticPolicy,
     SB3MultiRobotFeatureExtractor,
 )
 from ai_interface.envs.RobotAttentionEnv import RobotAttentionEnv
@@ -41,6 +43,7 @@ class RobotAttentionTrainer(BaseTrainer):
         self.env = None
         self.model = None
         self.team_infos: list[TeamInfo] = []
+        self.wandb_run = None
         self.device = device if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -165,7 +168,10 @@ class RobotAttentionTrainer(BaseTrainer):
         if is_algo_base:
             self.model = model_class(env, model_params)
         else:
-            self.model = model_class("MlpPolicy", env, **model_params)
+            self.model = model_class(RobotAttentionActorCriticPolicy, env, **model_params)
+
+        if self.config.get("load_model"):
+            self.load_model(self.config["load_model"])
 
         self._load_pretrained_modules()
         self._attach_opponent_model()
@@ -182,9 +188,6 @@ class RobotAttentionTrainer(BaseTrainer):
             self.action_head_path,
         )
 
-        if self.config.get("load_model"):
-            self.load_model(self.config["load_model"])
-
     def train(self):
         """Execute the SB3 PPO training loop."""
 
@@ -193,46 +196,21 @@ class RobotAttentionTrainer(BaseTrainer):
         if self.model is None:
             self.setup_model(self.env)
 
-        print("Starting training with config:", self.config)  # Debug print for config visibility
-
         total_timesteps = int(self.config.get("timesteps", 10000))
-        learn_batch_timesteps = int(self.config.get("learn_batch_timesteps", 2048))
-        save_interval = int(self.config.get("save_interval", 5000))
+        callback = self._build_learn_callback()
 
         self.logger.info(
             "Starting robot-attention training for %d total timesteps",
             total_timesteps,
         )
+        self.model.learn(total_timesteps=total_timesteps, callback=callback)
+        self.training_metrics["total_timesteps"] = total_timesteps
 
-        remaining = total_timesteps
-        timesteps_trained = 0
-
-        while remaining > 0:
-            chunk = min(learn_batch_timesteps, remaining)
-            self.model.learn(total_timesteps=chunk)
-
-            remaining -= chunk
-            timesteps_trained += chunk
-            self.training_metrics["total_timesteps"] = timesteps_trained
-
-            self.logger.info(
-                "Trained %d/%d timesteps", timesteps_trained, total_timesteps
-            )
-
-            if timesteps_trained % save_interval == 0 or remaining == 0:
-                save_name = Path(
-                    self.config.get("save_path", "models/robot_attention_policy.zip")
-                ).name
-                if remaining > 0:
-                    checkpoint_path = self._get_checkpoint_path(
-                        save_name, timesteps_trained
-                    )
-                    self.save_model(str(checkpoint_path))
-                    self.logger.info("Model checkpoint saved to %s", checkpoint_path)
-                else:
-                    final_path = self.model_dir / save_name
-                    self.save_model(str(final_path))
-                    self.logger.info("Final model saved to %s", final_path)
+        final_path = self.model_dir / Path(
+            self.config.get("save_path", "models/robot_attention_policy.zip")
+        ).name
+        self.save_model(str(final_path))
+        self.logger.info("Final model saved to %s", final_path)
 
     def save_model(self, path: str):
         """Save the trained model."""
@@ -275,6 +253,13 @@ class RobotAttentionTrainer(BaseTrainer):
         """Cleanup resources after training."""
 
         super().cleanup()
+        if self.wandb_run is not None:
+            try:
+                self.wandb_run.finish()
+            except Exception as e:
+                self.logger.error(f"Error during wandb shutdown: {e}")
+            finally:
+                self.wandb_run = None
         if self.networker:
             try:
                 self.networker.shutdown()
@@ -292,15 +277,25 @@ class RobotAttentionTrainer(BaseTrainer):
             raise RuntimeError("Model does not expose a policy module")
 
         if self.encoder_path:
+            encoder_module = getattr(policy, "features_extractor", None)
+            if hasattr(encoder_module, "backbone"):
+                encoder_module = encoder_module.backbone
+            if encoder_module is None:
+                raise RuntimeError("Policy does not expose a features extractor module")
             self._load_module_state_dict(
-                module=policy.feature_extractor,
+                module=encoder_module,
                 checkpoint_path=self.encoder_path,
                 module_name="feature_extractor",
             )
 
         if self.action_head_path:
+            action_head_module = getattr(getattr(policy, "mlp_extractor", None), "policy_net", None)
+            if action_head_module is None:
+                action_head_module = getattr(policy, "action_net", None)
+            if action_head_module is None:
+                raise RuntimeError("Policy does not expose an action head module")
             self._load_module_state_dict(
-                module=policy.action_net,
+                module=action_head_module,
                 checkpoint_path=self.action_head_path,
                 module_name="action_net",
             )
@@ -355,3 +350,71 @@ class RobotAttentionTrainer(BaseTrainer):
 
         self.env.opponent_model = self.model
         self.env.opponent_name = self.team_infos[1].name
+
+    def _build_learn_callback(self):
+        """Build SB3 callbacks for checkpointing and optional W&B logging."""
+
+        callbacks = []
+        save_interval = int(self.config.get("save_interval", 5000))
+        save_name = Path(
+            self.config.get("save_path", "models/robot_attention_policy.zip")
+        ).name
+
+        if save_interval > 0:
+            callbacks.append(
+                CheckpointCallback(
+                    save_freq=save_interval,
+                    save_path=str(self.model_dir),
+                    name_prefix=Path(save_name).stem,
+                )
+            )
+
+        wandb_callback = self._build_wandb_callback(save_interval)
+        if wandb_callback is not None:
+            callbacks.append(wandb_callback)
+
+        if not callbacks:
+            return None
+        if len(callbacks) == 1:
+            return callbacks[0]
+        return CallbackList(callbacks)
+
+    def _build_wandb_callback(self, save_interval: int):
+        """Create an optional W&B callback when enabled by config."""
+
+        wandb_config = self.config.get("wandb")
+        if not wandb_config:
+            return None
+
+        if isinstance(wandb_config, bool):
+            wandb_config = {"enabled": wandb_config}
+
+        if not wandb_config.get("enabled", False):
+            return None
+
+        try:
+            import wandb
+            from wandb.integration.sb3 import WandbCallback
+        except Exception as e:
+            self.logger.warning("W&B requested but unavailable: %s", e)
+            return None
+
+        if self.wandb_run is None:
+            self.wandb_run = wandb.init(
+                project=wandb_config.get("project", "robot-attention"),
+                name=wandb_config.get("name", self.run_timestamp),
+                entity=wandb_config.get("entity"),
+                tags=wandb_config.get("tags"),
+                group=wandb_config.get("group"),
+                sync_tensorboard=bool(wandb_config.get("sync_tensorboard", True)),
+                monitor_gym=bool(wandb_config.get("monitor_gym", False)),
+                save_code=bool(wandb_config.get("save_code", False)),
+                config=self.config,
+            )
+
+        return WandbCallback(
+            gradient_save_freq=int(wandb_config.get("gradient_save_freq", 0)),
+            model_save_path=str(self.model_dir),
+            model_save_freq=max(0, int(wandb_config.get("model_save_freq", save_interval))),
+            verbose=int(wandb_config.get("verbose", 0)),
+        )

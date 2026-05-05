@@ -1,0 +1,25 @@
+{
+  "robot_attention_config": "configs/robot_attention_config.json",
+  "data_dir": "data/helios-05032026",
+  "team_prefix": "t1",
+  "output_dir": "models/robot_attention_pretrain",
+  "epochs": 50,
+  "batch_size": 128,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.00001,
+  "scheduler": {
+    "type": "cosine",
+    "eta_min": 0.0
+  },
+  "param_loss_weight": 1.0,
+  "load_path": null,
+  "train_split": 0.95,
+  "seed": 42,
+  "num_workers": 0,
+  "max_files": 0,
+  "wandb": {
+    "enabled": true,
+    "project": "robocup",
+    "name": null
+  }
+}
