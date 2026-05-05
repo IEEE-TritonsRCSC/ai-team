@@ -1,0 +1,42 @@
+{
+  "trainer_type": "robot_attention",
+  "team_config": "team_config.json",
+  "env_mode": "sim-only",
+  "team_name": "TritonBots",
+  "num_envs": 1,
+  "sim_host": "127.0.0.1",
+  "sim_player_port": 6000,
+  "sim_port_stride": 10,
+  "num_robots": 6,
+  "max_steps": 200,
+  "config": true,
+  "timesteps": 400000,
+  "learn_batch_timesteps": 2048,
+  "save_path": "models/robot_attention_policy.zip",
+  "save_interval": 10000,
+  "load_model": null,
+  "feature_extractor_params": {
+    "hidden_dim": 64,
+    "num_heads": 4,
+    "num_attention_layers": 1,
+    "time_window": 20
+  },
+  "model_params": {
+    "learning_rate": 0.0003,
+    "n_steps": 2048,
+    "batch_size": 64,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "policy_kwargs": {
+      "net_arch": {
+        "pi": [64, 32],
+        "vf": [64, 32]
+      }
+    }
+  }
+}
