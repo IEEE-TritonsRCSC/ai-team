@@ -12,6 +12,7 @@ _TRAINER_EXPORTS = {
     "DiscretePPOTrainer": (".discrete_ppo_trainer", "DiscretePPOTrainer"),
     "MAPPOTrainer": (".mappo_trainer", "MAPPOTrainer"),
     "TD3JALTrainer": (".td3_jal_trainer", "TD3JALTrainer"),
+    "RobotAttentionTrainer": (".robot_attention_trainer", "RobotAttentionTrainer"),
     "HSMMARLTrainer": (".hsm_marl_trainer", "HSMMARLTrainer"),
     "HSMSB3PPOTrainer": (".hsm_sb3_ppo_trainer", "HSMSB3PPOTrainer"),
     "QLearningTrainer": (".qlearning_trainer", "QLearningTrainer"),
@@ -41,4 +42,5 @@ __all__ = [
     "HSMSB3PPOTrainer",
     "SB3PPOTrainer",
     "QLearningTrainer",
+    "RobotAttentionTrainer",
 ]

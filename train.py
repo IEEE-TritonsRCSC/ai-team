@@ -157,6 +157,41 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "load_model": args.load_model or args.resume_checkpoint,
             "model_params": {}
         }
+    elif trainer_type == "robot_attention":
+        return {
+            **base_config,
+            "num_robots": getattr(args, "num_robots", 6),
+            "max_steps": args.max_steps,
+            "timesteps": args.timesteps,
+            "learn_batch_timesteps": args.learn_batch_timesteps,
+            "save_path": args.save_path or "models/robot_attention_policy.zip",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "feature_extractor_params": {
+                "hidden_dim": 64,
+                "num_heads": 4,
+                "num_attention_layers": 1,
+                "time_window": 20,
+            },
+            "model_params": {
+                "learning_rate": 3e-4,
+                "n_steps": 2048,
+                "batch_size": 64,
+                "n_epochs": 10,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "ent_coef": 0.01,
+                "vf_coef": 0.5,
+                "max_grad_norm": 0.5,
+                "policy_kwargs": {
+                    "net_arch": {
+                        "pi": [64, 32],
+                        "vf": [64, 32]
+                    }
+                }
+            }
+        }
     elif trainer_type == "td3_jal":
         return {
             **base_config,
@@ -271,6 +306,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "hsm_sb3_ppo": ("ai_interface.trainers.hsm_sb3_ppo_trainer", "HSMSB3PPOTrainer"),
         "hsm_sb3_ppo_curriculum": ("ai_interface.trainers.hsm_sb3_ppo_curriculum_trainer", "HSMSB3PPOCurriculumTrainer"),
         "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
+        "robot_attention": ("ai_interface.trainers.robot_attention_trainer", "RobotAttentionTrainer"),
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
         "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
         "td3_jal_curriculum": ("ai_interface.trainers.td3_jal_curriculum_trainer", "TD3JALCurriculumTrainer"),
@@ -312,6 +348,7 @@ Examples:
     python train.py --trainer hsm_marl --num_agents 4 --obs_dim 33 --episodes 3000
     python train.py --trainer hsm_sb3_ppo --timesteps 300000 --obs_dim 28
   python train.py --trainer td3_jal --timesteps 400000 --num_robots 2
+  python train.py --trainer robot_attention --timesteps 400000 --num_robots 6
   python train.py --config configs/td3_jal_config.json
   python train.py --trainer discrete_ppo --resume_checkpoint models/old_run/policy_ep200.pth --curriculum --start_phase 2
   python train.py --trainer qlearning --episodes 2000 --lr 1e-3 --epsilon_decay 0.995
@@ -323,7 +360,7 @@ Examples:
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
     parser.add_argument("--trainer", type=str, 
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "td3_jal", "td3_jal_curriculum", "qlearning"],
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
@@ -357,11 +394,11 @@ Examples:
     parser.add_argument("--num_robots", type=int, default=2,
                         help="Number of robots in JAL (td3_jal)")
     
-    # Timestep-based trainers (sb3_ppo, td3_jal)
+    # Timestep-based trainers (sb3_ppo, robot_attention, td3_jal)
     parser.add_argument("--timesteps", type=int, default=400000,
-                        help="Total timesteps to train (sb3_ppo, td3_jal)")
+                        help="Total timesteps to train (sb3_ppo, robot_attention, td3_jal)")
     parser.add_argument("--learn_batch_timesteps", type=int, default=2048,
-                        help="Timesteps per learning batch (sb3_ppo, td3_jal)")
+                        help="Timesteps per learning batch (sb3_ppo, robot_attention, td3_jal)")
     
     # Common options
     parser.add_argument("--save_path", type=str, default=None,
