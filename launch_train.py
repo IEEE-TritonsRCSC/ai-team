@@ -79,7 +79,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     # Trainer forwarding
     parser.add_argument(
         "--trainer",
-        choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo", "td3_jal", "qlearning"],
+        choices=["hier_ppo", "discrete_ppo", "mappo", "sb3_ppo", "robot_attention", "td3_jal", "qlearning"],
         default="discrete_ppo",
         help="Trainer type forwarded to train.py (default: discrete_ppo)",
     )
