@@ -310,6 +310,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
         "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
         "td3_jal_curriculum": ("ai_interface.trainers.td3_jal_curriculum_trainer", "TD3JALCurriculumTrainer"),
+        "td3_jal_her": ("ai_interface.trainers.td3_jal_her_trainer", "TD3JALHERTrainer"),
     }
     
     if trainer_type not in trainers:
@@ -359,8 +360,8 @@ Examples:
     # Configuration options
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
-    parser.add_argument("--trainer", type=str, 
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "qlearning"],
+    parser.add_argument("--trainer", type=str,
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
