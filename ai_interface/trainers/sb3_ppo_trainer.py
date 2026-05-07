@@ -4,14 +4,15 @@ Stable Baselines3 PPO Trainer implementation.
 This trainer wraps the existing SB3 trainer with the new base trainer interface.
 """
 import gymnasium as gym
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from pathlib import Path
 import torch
 
 from .base_trainer import BaseTrainer
+from .parallel_envs import make_networked_env_factory, make_vec_env
 from ai_interface.envs.sim_env import SimulatorEnv
 from ai_interface.algorithms.base import AlgorithmBase
-from networking.networker import Networker, TeamInfo
+from networking.networker import TeamInfo
 from stable_baselines3 import PPO
 
 
@@ -24,6 +25,7 @@ class SB3PPOTrainer(BaseTrainer):
         self.env = None
         self.model = None
         self.device = device
+        self.num_envs = 1
     
     def setup_environment(self) -> gym.Env:
         """Setup the simulator environment."""
@@ -31,21 +33,41 @@ class SB3PPOTrainer(BaseTrainer):
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
 
-        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
-        self.networker = Networker(
-            team_infos,
-            self.config.get("env_mode", "sim-only"),
-            sim_host=sim_host,
-            sim_player_port=sim_player_port,
-            sim_trainer_port=sim_trainer_port,
+        self.num_envs = max(1, int(self.config.get("num_envs", 1)))
+        env_mode = self.config.get("env_mode", "sim-only")
+        env_fns = []
+
+        for env_idx in range(self.num_envs):
+            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(env_idx)
+            env_fns.append(
+                make_networked_env_factory(
+                    SimulatorEnv,
+                    team_infos,
+                    env_mode,
+                    team_name,
+                    sim_host,
+                    sim_player_port,
+                    sim_trainer_port,
+                    monitor=True,
+                )
+            )
+            self.logger.info(
+                "Env %d connected to %s:%d/%d",
+                env_idx,
+                sim_host,
+                sim_player_port,
+                sim_trainer_port,
+            )
+
+        self.env = make_vec_env(
+            env_fns,
+            backend=self.config.get("parallel_backend", "subproc"),
+            start_method=self.config.get("vec_env_start_method"),
         )
-        
-        # Create environment
-        self.env = SimulatorEnv(networker=self.networker, team_name=team_name)
-        
+
         self.logger.info(
-            "Environment setup complete - Team: %s, Endpoint: %s:%d/%d",
-            team_name, sim_host, sim_player_port, sim_trainer_port
+            "Environment setup complete - Team: %s, Parallel envs: %d",
+            team_name, self.num_envs
         )
         return self.env
     
@@ -98,7 +120,7 @@ class SB3PPOTrainer(BaseTrainer):
             chunk = min(learn_batch_timesteps, remaining)
             
             # Train for this chunk
-            self.model.learn(total_timesteps=chunk)
+            self.model.learn(total_timesteps=chunk, reset_num_timesteps=False)
             
             remaining -= chunk
             timesteps_trained += chunk
@@ -160,6 +182,11 @@ class SB3PPOTrainer(BaseTrainer):
     def cleanup(self):
         """Cleanup resources after training."""
         super().cleanup()
+        if self.env is not None and hasattr(self.env, "close"):
+            try:
+                self.env.close()
+            except Exception as e:
+                self.logger.error(f"Error during env shutdown: {e}")
         if self.networker:
             try:
                 self.networker.shutdown()

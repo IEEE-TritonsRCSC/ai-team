@@ -183,9 +183,11 @@ class MAPPOAgent:
         
         return advantages
     
-    def update(self):
+    def update(self, force: bool = False):
         """Run MAPPO update for all agents."""
-        if len(self.memory) < BATCH_SIZE:
+        if not self.memory:
+            return {}
+        if not force and len(self.memory) < BATCH_SIZE:
             return {}
         
         rewards = self.rewards
@@ -230,7 +232,7 @@ class MAPPOAgent:
         
         # Global tensors
         global_obs = torch.stack(global_obs_list).to(self.device)
-        old_values = torch.stack(old_values_list).squeeze().to(self.device)
+        old_values = torch.stack(old_values_list).view(-1).to(self.device)
         
         # Compute advantages
         advantages = torch.FloatTensor(
@@ -254,7 +256,7 @@ class MAPPOAgent:
             # ============================================================
             # Update Centralized Critic
             # ============================================================
-            values = self.critic(global_obs).squeeze()
+            values = self.critic(global_obs).view(-1)
             critic_loss = (returns - values).pow(2).mean()
             
             self.critic_optimizer.zero_grad()

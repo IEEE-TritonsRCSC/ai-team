@@ -74,25 +74,31 @@ class SimulatorEnv(gym.Env):
         game_state = self.networker.get_game_state()
         obs = self._game_state_to_obs(game_state)
 
-        # Placeholder reward/done values — implement meaningful signals
+        # Placeholder reward/termination values — implement meaningful signals
         reward = 0.0
-        done = False
+        terminated = False
+        truncated = False
         info = {}
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
-    def reset(self):
-        # If your commander supports an explicit simulator reset, call it here.
-        # Example: getattr(self.networker.commander, "reset_sim", lambda: None)()
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
         try:
-            reset_fn = getattr(self.networker.commander, "reset_sim", None)
+            reset_fn = getattr(self.networker, "reset_sim", None)
             if callable(reset_fn):
                 reset_fn()
         except Exception:
             pass
 
         game_state = self.networker.get_game_state()
-        return self._game_state_to_obs(game_state)
+        return self._game_state_to_obs(game_state), {}
 
     def render(self, mode="human"):
         # Optional: implement visualization hooks
         pass
+
+    def close(self):
+        try:
+            self.networker.shutdown()
+        except Exception:
+            pass

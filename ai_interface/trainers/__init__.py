@@ -39,6 +39,7 @@ __all__ = [
     "HSMMARLTrainer",
     "MAPPOTrainer",
     "TD3JALTrainer",
+    "HSMMARLTrainer",
     "HSMSB3PPOTrainer",
     "SB3PPOTrainer",
     "QLearningTrainer",

@@ -37,16 +37,21 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def value_or_default(value, default):
+    """Return parser value when present, otherwise the documented default."""
+    return default if value is None else value
+
+
 def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[str, Any]:
     """Create default configuration based on trainer type and command line arguments."""
     base_config = {
         "team_config": args.team_config,
         "env_mode": args.env,
         "team_name": args.team,
-        "num_envs": args.num_envs,
-        "sim_host": args.sim_host,
-        "sim_player_port": args.sim_player_port,
-        "sim_port_stride": args.sim_port_stride,
+        "num_envs": value_or_default(args.num_envs, 1),
+        "sim_host": value_or_default(args.sim_host, "127.0.0.1"),
+        "sim_player_port": value_or_default(args.sim_player_port, 6000),
+        "sim_port_stride": value_or_default(args.sim_port_stride, 10),
     }
     
     if trainer_type == "hier_ppo":
@@ -372,14 +377,14 @@ Examples:
     ], default="sim-only", help="Environment mode for Networker")
     parser.add_argument("--team", type=str, default=None,
                         help="Team name to control")
-    parser.add_argument("--num_envs", type=int, default=1,
-                        help="Number of parallel simulator environments to use")
-    parser.add_argument("--sim_host", type=str, default="127.0.0.1",
-                        help="Simulator host for sim-only/sim-mixed")
-    parser.add_argument("--sim_player_port", type=int, default=6000,
-                        help="Base simulator player port (env0). Trainer port uses player_port+1")
-    parser.add_argument("--sim_port_stride", type=int, default=10,
-                        help="Port stride between parallel envs (must avoid overlap, recommended >= 3)")
+    parser.add_argument("--num_envs", type=int, default=None,
+                        help="Number of parallel simulator environments to use (default: 1)")
+    parser.add_argument("--sim_host", type=str, default=None,
+                        help="Simulator host for sim-only/sim-mixed (default: 127.0.0.1)")
+    parser.add_argument("--sim_player_port", type=int, default=None,
+                        help="Base simulator player port (env0; default: 6000). Trainer port uses player_port+1")
+    parser.add_argument("--sim_port_stride", type=int, default=None,
+                        help="Port stride between parallel envs (default: 10, recommended >= 3)")
     
     # Episode-based trainers (hier_ppo, discrete_ppo, mappo)
     parser.add_argument("--episodes", type=int, default=1000,
@@ -449,11 +454,25 @@ Examples:
             print(f"Loading configuration from {args.config}")
             config = load_config(args.config)
             trainer_type = config.get("trainer_type", args.trainer)
-            # Backfill runtime defaults for older config files.
-            config.setdefault("num_envs", args.num_envs)
-            config.setdefault("sim_host", args.sim_host)
-            config.setdefault("sim_player_port", args.sim_player_port)
-            config.setdefault("sim_port_stride", args.sim_port_stride)
+            # Backfill runtime defaults for older config files, while allowing
+            # launcher/CLI runtime values to override stale config values.
+            runtime_overrides = {
+                "num_envs": args.num_envs,
+                "sim_host": args.sim_host,
+                "sim_player_port": args.sim_player_port,
+                "sim_port_stride": args.sim_port_stride,
+            }
+            runtime_defaults = {
+                "num_envs": 1,
+                "sim_host": "127.0.0.1",
+                "sim_player_port": 6000,
+                "sim_port_stride": 10,
+            }
+            for key, value in runtime_overrides.items():
+                if value is not None:
+                    config[key] = value
+                else:
+                    config.setdefault(key, runtime_defaults[key])
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
@@ -462,6 +481,8 @@ Examples:
         num_envs = int(config.get("num_envs", 1))
         sim_port_stride = int(config.get("sim_port_stride", 10))
         env_mode = config.get("env_mode", "sim-only")
+        if num_envs < 1:
+            raise ValueError("num_envs must be >= 1")
         if num_envs > 1 and env_mode not in ["sim-only", "sim-mixed"]:
             raise ValueError("Parallel simulator training requires env_mode to be sim-only or sim-mixed")
         if sim_port_stride < 3:
