@@ -17,6 +17,15 @@ def clamp(v: float, lo: float, hi: float) -> float:
     """Clamp a value between bounds."""
     return max(lo, min(hi, v))
 
+def distance(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+    """Euclidean distance between two 2D positions."""
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+def face_ball_angle(pose: Tuple[float, ...], ball_pos: Tuple[float, ...]) -> float:
+    """Heading angle from a robot pose toward the ball."""
+    return math.atan2(ball_pos[1] - pose[1], ball_pos[0] - pose[0])
+
+
 def dist_point_to_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
     """Distance from point p to segment a->b."""
     v = b - a
