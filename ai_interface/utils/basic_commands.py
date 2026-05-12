@@ -94,20 +94,24 @@ def build_avoid_points(game_state, self_pose,
 
 def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
          margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
-         detour_margin: float = 1.5, is_goalie: bool = False) -> str:
+         detour_margin: float = 1.5, is_goalie: bool = False,
+         obstacle_avoidance: bool = True) -> str:
     """
     Create a `dash` or `turn` command to move toward a destination.
 
     self_pose is [x, y, theta] in radians. If the agent is within `margin` of (x, y),
     it optionally turns to heading `theta`; otherwise it dashes toward (x, y) with a
-    speed capped by `speed` and scaled by remaining distance. If `avoid_points` are
-    provided (or can be built from game_state), the path will detour
-    around obstacles using a single waypoint.
+    speed capped by `speed` and scaled by remaining distance. When `obstacle_avoidance`
+    is True, avoid points built from game_state steer the path with a single detour waypoint.
     """
     self_pose = _as_float_array(self_pose)
     origin = _as_float_array(self_pose[:2])
     destination = _as_float_array([x, y])
-    avoid_points = build_avoid_points(game_state, self_pose, ball_radius=0.215, player_radius=0.9)
+    avoid_points = []
+    if obstacle_avoidance:
+        avoid_points = build_avoid_points(
+            game_state, self_pose, ball_radius=0.215, player_radius=0.9
+        )
 
     if avoid_points:
         obstacles = []
@@ -135,6 +139,29 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
     if not is_goalie:
         speed = min(speed, max(distance * (1 / PLAYER_DECAY - 1) / dt, 20))
     return f"dash {speed} {angle}"
+
+
+def approach_ball(self_pose: np.ndarray | Tuple | List, game_state,
+                  margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
+                  is_goalie: bool = False) -> str:
+    """
+    Dash or turn toward the ball from ``game_state.ball_pos`` without obstacle avoidance.
+    """
+    ball_pos = getattr(game_state, "ball_pos", None)
+    if ball_pos is None:
+        raise ValueError("approach_ball requires game_state.ball_pos")
+    ball_pos = _as_float_array(ball_pos)
+    return goto(
+        self_pose,
+        float(ball_pos[0]),
+        float(ball_pos[1]),
+        game_state,
+        margin=margin,
+        theta=theta,
+        speed=speed,
+        is_goalie=is_goalie,
+        obstacle_avoidance=False,
+    )
 
 
 def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
