@@ -135,7 +135,7 @@ class DiscretePPOAgent:
         states = torch.stack([m['state'] for m in self.memory]).to(self.device)
         actions = torch.stack([m['action'] for m in self.memory]).to(self.device)
         old_logprobs = torch.stack([m['logprob'] for m in self.memory]).to(self.device)
-        old_values = torch.stack([m['value'] for m in self.memory]).squeeze().to(self.device)
+        old_values = torch.stack([m['value'] for m in self.memory]).view(-1).to(self.device)
         
         # Compute advantages
         advantages = torch.FloatTensor(
@@ -178,7 +178,7 @@ class DiscretePPOAgent:
             
             # Value loss with clipping (prevents value explosion)
             # Clip the value predictions to stay near old values
-            values_pred = values.squeeze()
+            values_pred = values.view(-1)
             values_clipped = old_values + torch.clamp(
                 values_pred - old_values,
                 -EPS_CLIP,

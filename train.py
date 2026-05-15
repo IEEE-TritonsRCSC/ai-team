@@ -37,16 +37,21 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def value_or_default(value, default):
+    """Return parser value when present, otherwise the documented default."""
+    return default if value is None else value
+
+
 def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[str, Any]:
     """Create default configuration based on trainer type and command line arguments."""
     base_config = {
         "team_config": args.team_config,
         "env_mode": args.env,
         "team_name": args.team,
-        "num_envs": args.num_envs,
-        "sim_host": args.sim_host,
-        "sim_player_port": args.sim_player_port,
-        "sim_port_stride": args.sim_port_stride,
+        "num_envs": value_or_default(args.num_envs, 1),
+        "sim_host": value_or_default(args.sim_host, "127.0.0.1"),
+        "sim_player_port": value_or_default(args.sim_player_port, 6000),
+        "sim_port_stride": value_or_default(args.sim_port_stride, 10),
     }
     
     if trainer_type == "hier_ppo":
@@ -156,6 +161,41 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "save_interval": args.save_interval,
             "load_model": args.load_model or args.resume_checkpoint,
             "model_params": {}
+        }
+    elif trainer_type == "robot_attention":
+        return {
+            **base_config,
+            "num_robots": getattr(args, "num_robots", 6),
+            "max_steps": args.max_steps,
+            "timesteps": args.timesteps,
+            "learn_batch_timesteps": args.learn_batch_timesteps,
+            "save_path": args.save_path or "models/robot_attention_policy.zip",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "feature_extractor_params": {
+                "hidden_dim": 64,
+                "num_heads": 4,
+                "num_attention_layers": 1,
+                "time_window": 20,
+            },
+            "model_params": {
+                "learning_rate": 3e-4,
+                "n_steps": 2048,
+                "batch_size": 64,
+                "n_epochs": 10,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "ent_coef": 0.01,
+                "vf_coef": 0.5,
+                "max_grad_norm": 0.5,
+                "policy_kwargs": {
+                    "net_arch": {
+                        "pi": [64, 32],
+                        "vf": [64, 32]
+                    }
+                }
+            }
         }
     elif trainer_type == "td3_jal":
         return {
@@ -271,9 +311,11 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "hsm_sb3_ppo": ("ai_interface.trainers.hsm_sb3_ppo_trainer", "HSMSB3PPOTrainer"),
         "hsm_sb3_ppo_curriculum": ("ai_interface.trainers.hsm_sb3_ppo_curriculum_trainer", "HSMSB3PPOCurriculumTrainer"),
         "sb3_ppo": ("ai_interface.trainers.sb3_ppo_trainer", "SB3PPOTrainer"),
+        "robot_attention": ("ai_interface.trainers.robot_attention_trainer", "RobotAttentionTrainer"),
         "qlearning": ("ai_interface.trainers.qlearning_trainer", "QLearningTrainer"),
         "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
         "td3_jal_curriculum": ("ai_interface.trainers.td3_jal_curriculum_trainer", "TD3JALCurriculumTrainer"),
+        "td3_jal_her": ("ai_interface.trainers.td3_jal_her_trainer", "TD3JALHERTrainer"),
     }
     
     if trainer_type not in trainers:
@@ -312,6 +354,7 @@ Examples:
     python train.py --trainer hsm_marl --num_agents 4 --obs_dim 33 --episodes 3000
     python train.py --trainer hsm_sb3_ppo --timesteps 300000 --obs_dim 28
   python train.py --trainer td3_jal --timesteps 400000 --num_robots 2
+  python train.py --trainer robot_attention --timesteps 400000 --num_robots 6
   python train.py --config configs/td3_jal_config.json
   python train.py --trainer discrete_ppo --resume_checkpoint models/old_run/policy_ep200.pth --curriculum --start_phase 2
   python train.py --trainer qlearning --episodes 2000 --lr 1e-3 --epsilon_decay 0.995
@@ -322,8 +365,8 @@ Examples:
     # Configuration options
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
-    parser.add_argument("--trainer", type=str, 
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "td3_jal", "td3_jal_curriculum", "qlearning"],
+    parser.add_argument("--trainer", type=str,
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
@@ -334,14 +377,14 @@ Examples:
     ], default="sim-only", help="Environment mode for Networker")
     parser.add_argument("--team", type=str, default=None,
                         help="Team name to control")
-    parser.add_argument("--num_envs", type=int, default=1,
-                        help="Number of parallel simulator environments to use")
-    parser.add_argument("--sim_host", type=str, default="127.0.0.1",
-                        help="Simulator host for sim-only/sim-mixed")
-    parser.add_argument("--sim_player_port", type=int, default=6000,
-                        help="Base simulator player port (env0). Trainer port uses player_port+1")
-    parser.add_argument("--sim_port_stride", type=int, default=10,
-                        help="Port stride between parallel envs (must avoid overlap, recommended >= 3)")
+    parser.add_argument("--num_envs", type=int, default=None,
+                        help="Number of parallel simulator environments to use (default: 1)")
+    parser.add_argument("--sim_host", type=str, default=None,
+                        help="Simulator host for sim-only/sim-mixed (default: 127.0.0.1)")
+    parser.add_argument("--sim_player_port", type=int, default=None,
+                        help="Base simulator player port (env0; default: 6000). Trainer port uses player_port+1")
+    parser.add_argument("--sim_port_stride", type=int, default=None,
+                        help="Port stride between parallel envs (default: 10, recommended >= 3)")
     
     # Episode-based trainers (hier_ppo, discrete_ppo, mappo)
     parser.add_argument("--episodes", type=int, default=1000,
@@ -357,11 +400,11 @@ Examples:
     parser.add_argument("--num_robots", type=int, default=2,
                         help="Number of robots in JAL (td3_jal)")
     
-    # Timestep-based trainers (sb3_ppo, td3_jal)
+    # Timestep-based trainers (sb3_ppo, robot_attention, td3_jal)
     parser.add_argument("--timesteps", type=int, default=400000,
-                        help="Total timesteps to train (sb3_ppo, td3_jal)")
+                        help="Total timesteps to train (sb3_ppo, robot_attention, td3_jal)")
     parser.add_argument("--learn_batch_timesteps", type=int, default=2048,
-                        help="Timesteps per learning batch (sb3_ppo, td3_jal)")
+                        help="Timesteps per learning batch (sb3_ppo, robot_attention, td3_jal)")
     
     # Common options
     parser.add_argument("--save_path", type=str, default=None,
@@ -411,11 +454,25 @@ Examples:
             print(f"Loading configuration from {args.config}")
             config = load_config(args.config)
             trainer_type = config.get("trainer_type", args.trainer)
-            # Backfill runtime defaults for older config files.
-            config.setdefault("num_envs", args.num_envs)
-            config.setdefault("sim_host", args.sim_host)
-            config.setdefault("sim_player_port", args.sim_player_port)
-            config.setdefault("sim_port_stride", args.sim_port_stride)
+            # Backfill runtime defaults for older config files, while allowing
+            # launcher/CLI runtime values to override stale config values.
+            runtime_overrides = {
+                "num_envs": args.num_envs,
+                "sim_host": args.sim_host,
+                "sim_player_port": args.sim_player_port,
+                "sim_port_stride": args.sim_port_stride,
+            }
+            runtime_defaults = {
+                "num_envs": 1,
+                "sim_host": "127.0.0.1",
+                "sim_player_port": 6000,
+                "sim_port_stride": 10,
+            }
+            for key, value in runtime_overrides.items():
+                if value is not None:
+                    config[key] = value
+                else:
+                    config.setdefault(key, runtime_defaults[key])
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
@@ -424,6 +481,8 @@ Examples:
         num_envs = int(config.get("num_envs", 1))
         sim_port_stride = int(config.get("sim_port_stride", 10))
         env_mode = config.get("env_mode", "sim-only")
+        if num_envs < 1:
+            raise ValueError("num_envs must be >= 1")
         if num_envs > 1 and env_mode not in ["sim-only", "sim-mixed"]:
             raise ValueError("Parallel simulator training requires env_mode to be sim-only or sim-mixed")
         if sim_port_stride < 3:

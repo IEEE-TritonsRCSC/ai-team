@@ -268,3 +268,9 @@ class HSMSingleAgentEnv(gym.Env):
         self.prev_ball_to_goal_dist = ball_to_goal_dist
 
         return float(reward), bool(goal_scored), bool(robot_oob), bool(ball_oob)
+
+    def close(self):
+        try:
+            self.networker.shutdown()
+        except Exception:
+            pass
