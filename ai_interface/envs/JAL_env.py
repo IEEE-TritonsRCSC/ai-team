@@ -25,6 +25,8 @@ from networking.data_utils import GameState
 
 
 class JALTeamEnv(gym.Env):
+    ACTION_TYPES = ["goto", "turn", "kick", "start_dribble", "stop_dribble"]
+
     def __init__(
         self, 
         networker: Networker,  
@@ -39,6 +41,7 @@ class JALTeamEnv(gym.Env):
         none_state_warn_every: int = 50,
         position_noise_std: float = 0.05,
         invalid_action_penalty: float = 0.2,
+        state_dependent_action_selection: bool = False,
         some_arg=None
         ):
         
@@ -57,6 +60,7 @@ class JALTeamEnv(gym.Env):
         self.none_state_warn_every = max(1, int(none_state_warn_every))
         self.position_noise_std = float(position_noise_std)
         self.invalid_action_penalty = max(0.0, float(invalid_action_penalty))
+        self.state_dependent_action_selection = bool(state_dependent_action_selection)
         
         
         # Create a logger for this environment
@@ -113,6 +117,27 @@ class JALTeamEnv(gym.Env):
         self._none_state_counter = 0
         
         self.logger.info(f"Initialized JALTeamEnv for team '{team_name}' with robots {robot_ids}, num_robots={self.num_robots}, obs_dim={self.obs_dim}, action_dim={self.action_space.shape[0]}")
+
+    def _select_action_index(
+        self,
+        logits: np.ndarray,
+        has_ball_now: bool,
+    ) -> Tuple[int, np.ndarray]:
+        """Select the highest-probability action while masking invalid ball-state actions."""
+        if has_ball_now:
+            allowed_indices = np.array([0, 1, 2, 3, 4], dtype=np.int64)
+        else:
+            allowed_indices = np.array([0, 1], dtype=np.int64)
+
+        allowed_logits = logits[allowed_indices]
+        allowed_logits_shifted = allowed_logits - np.max(allowed_logits)
+        allowed_exp_logits = np.exp(allowed_logits_shifted)
+        allowed_probs = allowed_exp_logits / np.sum(allowed_exp_logits)
+
+        probs = np.zeros_like(logits, dtype=np.float32)
+        probs[allowed_indices] = allowed_probs
+        action_idx = int(allowed_indices[int(np.argmax(allowed_probs))])
+        return action_idx, probs
 
     def reset(
         self,
@@ -472,19 +497,6 @@ class JALTeamEnv(gym.Env):
 
             logits = np.array([goto_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit], dtype=np.float32)
 
-            # Numerical stability: subtract max before exp
-            logits_shifted = logits - np.max(logits)
-            exp_logits = np.exp(logits_shifted)
-            probs = exp_logits / np.sum(exp_logits)
-
-            action_idx = int(np.argmax(probs))
-            action_types = ["goto", "turn", "kick", "start_dribble", "stop_dribble"]
-            action_type = action_types[action_idx]
-
-            goto_x = float(goto_x_raw * self.field_half_width)
-            goto_y = float(goto_y_raw * self.field_half_height)
-            turn_theta = float(turn_theta_raw * np.pi)
-
             pose = pose_by_robot_id.get(robot_id)
             has_ball_now = False
             if pose is not None and ball_pos is not None and len(ball_pos) >= 2:
@@ -493,6 +505,21 @@ class JALTeamEnv(gym.Env):
                     ball_pos_xy=ball_pos,
                     kickable_dist=self.kickable_dist,
                 )
+
+            if self.state_dependent_action_selection:
+                action_idx, probs = self._select_action_index(logits, has_ball_now)
+            else:
+                # Numerical stability: subtract max before exp
+                logits_shifted = logits - np.max(logits)
+                exp_logits = np.exp(logits_shifted)
+                probs = exp_logits / np.sum(exp_logits)
+                action_idx = int(np.argmax(probs))
+
+            action_type = self.ACTION_TYPES[action_idx]
+
+            goto_x = float(goto_x_raw * self.field_half_width)
+            goto_y = float(goto_y_raw * self.field_half_height)
+            turn_theta = float(turn_theta_raw * np.pi)
 
             invalid_action_requested = (
                 (action_type == "kick" and not has_ball_now)

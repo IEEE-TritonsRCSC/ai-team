@@ -47,6 +47,8 @@ class TD3JALCurriculumTrainer(BaseTrainer):
             sim_player_port=sim_player_port,
             sim_trainer_port=sim_trainer_port,
         )
+        # Wrap Networker.get_game_state to log TimeOver via trainer logger
+        self._wrap_networker_timeover_logger(self.networker)
 
         self.env = JALTeamEnv(
             networker=self.networker,
@@ -56,6 +58,9 @@ class TD3JALCurriculumTrainer(BaseTrainer):
             non_robot_obs_dim=int(self.config.get("non_robot_obs_dim", 4)),
             max_steps=int(self.config.get("max_steps", 200)),
             debug=bool(self.config.get("debug", False)),
+            state_dependent_action_selection=bool(
+                self.config.get("state_dependent_action_selection", True)
+            ),
         )
 
         self.logger.info(
