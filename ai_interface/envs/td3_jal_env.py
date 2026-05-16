@@ -608,5 +608,9 @@ class TD3JALEnv(gym.Env):
     
     def close(self):
         """Clean up resources."""
+        try:
+            self.networker.shutdown()
+        except Exception:
+            pass
         if self.debug:
             self.logger.debug("Environment closed")

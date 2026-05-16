@@ -41,6 +41,9 @@ python launch_train.py --trainer discrete_ppo
 python launch_train.py --num-envs 4 --trainer discrete_ppo
 ```
 
+The launcher supports every active training entry point:
+`hier_ppo`, `discrete_ppo`, `mappo`, `hsm_marl`, `hsm_sb3_ppo`, `sb3_ppo`, `td3_jal`, and `qlearning`.
+
 ### 4 simulators + monitors
 
 ```bash
@@ -95,7 +98,7 @@ Use `launch_sims.py` or `train.py` individually when you need fine-grained contr
 
 ## How `train.py` Connects to Multiple Simulators
 
-`train.py` (and the underlying trainers) already support `--num_envs`, `--sim_player_port`, and `--sim_port_stride`. Each trainer creates one `Networker` per environment and calculates its ports via `BaseTrainer._sim_endpoint_for_env`:
+`train.py` (and the underlying trainers) support `--num_envs`, `--sim_player_port`, and `--sim_port_stride`. Each trainer creates one simulator-backed environment per index and calculates its ports via `BaseTrainer._sim_endpoint_for_env`:
 
 ```
 player_port = base_port + env_index * stride
@@ -103,6 +106,8 @@ trainer_port = player_port + 1
 ```
 
 `launch_train.py` passes matching values so both sides agree on every port.
+
+Custom PPO/MAPPO/Q-learning trainers step those environments with a thread pool. SB3-based trainers use vectorized environments, with subprocess workers by default when `num_envs > 1`.
 
 ---
 

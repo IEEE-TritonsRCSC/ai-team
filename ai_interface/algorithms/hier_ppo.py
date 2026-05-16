@@ -164,7 +164,7 @@ class PPOAgent:
         low_actions = torch.stack([m['low_action'] for m in self.memory]).to(self.device)
         old_high_logprobs = torch.stack([m['high_logprob'] for m in self.memory]).to(self.device)
         old_low_logprobs = torch.stack([m['low_logprob'] for m in self.memory]).to(self.device)
-        old_values = torch.stack([m['value'] for m in self.memory]).squeeze().to(self.device)
+        old_values = torch.stack([m['value'] for m in self.memory]).view(-1).to(self.device)
 
         # Compute advantages
         advantages = torch.FloatTensor(self.compute_advantages(rewards, masks, old_values.detach().cpu().tolist())).to(self.device)
@@ -212,7 +212,7 @@ class PPOAgent:
             entropy_bonus = ENTROPY_COEFF * (high_entropy + low_entropy)
             
             # Value loss
-            value_loss = (returns - values.squeeze()).pow(2).mean()
+            value_loss = (returns - values.view(-1)).pow(2).mean()
             
             # Total loss  (subtract entropy bonus because we maximise entropy)
             total_loss = policy_loss + 0.5 * value_loss - entropy_bonus

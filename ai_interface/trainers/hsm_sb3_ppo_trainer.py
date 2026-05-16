@@ -10,9 +10,9 @@ import gymnasium as gym
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.monitor import Monitor
 
 from .base_trainer import BaseTrainer
+from .parallel_envs import make_networked_env_factory, make_vec_env
 from ai_interface.envs.hsm_sb3_env import HSMSingleAgentEnv
 from networking.networker import Networker, TeamInfo
 
@@ -46,40 +46,58 @@ class HSMSB3PPOTrainer(BaseTrainer):
         super().__init__(config, log_dir, algorithm_name="hsm_sb3_ppo")
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.networker: Networker | None = None
-        self.env: HSMSingleAgentEnv | None = None
+        self.env: gym.Env | None = None
         self.model: PPO | None = None
         self._callback: _SB3LoggingCallback | None = None
+        self.num_envs = 1
 
     def setup_environment(self) -> gym.Env:
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
 
-        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
-        self.networker = Networker(
-            team_infos,
-            self.config.get("env_mode", "sim-only"),
-            sim_host=sim_host,
-            sim_player_port=sim_player_port,
-            sim_trainer_port=sim_trainer_port,
-        )
+        self.num_envs = max(1, int(self.config.get("num_envs", 1)))
+        env_mode = self.config.get("env_mode", "sim-only")
+        env_kwargs = {
+            "obs_dim": int(self.config.get("obs_dim", 28)),
+            "max_steps": int(self.config.get("max_steps", 220)),
+            "unum": int(self.config.get("unum", 1)),
+            "debug": bool(self.config.get("debug_env", False)),
+        }
+        env_fns = []
 
-        self.env = HSMSingleAgentEnv(
-            networker=self.networker,
-            team_name=team_name,
-            obs_dim=int(self.config.get("obs_dim", 28)),
-            max_steps=int(self.config.get("max_steps", 220)),
-            unum=int(self.config.get("unum", 1)),
-            debug=bool(self.config.get("debug_env", False)),
+        for env_idx in range(self.num_envs):
+            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(env_idx)
+            env_fns.append(
+                make_networked_env_factory(
+                    HSMSingleAgentEnv,
+                    team_infos,
+                    env_mode,
+                    team_name,
+                    sim_host,
+                    sim_player_port,
+                    sim_trainer_port,
+                    env_kwargs=env_kwargs,
+                    monitor=True,
+                )
+            )
+            self.logger.info(
+                "Env %d connected to %s:%d/%d",
+                env_idx,
+                sim_host,
+                sim_player_port,
+                sim_trainer_port,
+            )
+
+        self.env = make_vec_env(
+            env_fns,
+            backend=self.config.get("parallel_backend", "subproc"),
+            start_method=self.config.get("vec_env_start_method"),
         )
-        # Monitor injects episode reward/length into info for callback logging.
-        self.env = Monitor(self.env)
         self.logger.info(
-            "HSM-SB3 environment setup complete - team=%s unum=%d endpoint=%s:%d/%d",
+            "HSM-SB3 environment setup complete - team=%s unum=%d parallel_envs=%d",
             team_name,
             int(self.config.get("unum", 1)),
-            sim_host,
-            sim_player_port,
-            sim_trainer_port,
+            self.num_envs,
         )
         return self.env
 
@@ -208,6 +226,11 @@ class HSMSB3PPOTrainer(BaseTrainer):
 
     def cleanup(self):
         super().cleanup()
+        if self.env is not None and hasattr(self.env, "close"):
+            try:
+                self.env.close()
+            except Exception as e:
+                self.logger.error("Error during env shutdown: %s", e)
         if self.networker:
             try:
                 self.networker.shutdown()

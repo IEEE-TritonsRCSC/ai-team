@@ -1,0 +1,51 @@
+{
+  "trainer_type": "td3_jal_her",
+  "team_config": "team_config.json",
+  "env_mode": "sim-only",
+  "team_name": "TritonBots",
+  "curriculum": {
+    "stage1": {
+      "description": "Single robot (1v0) HER training",
+      "num_robots": 1,
+      "timesteps": 200000,
+      "robot_ids": [1]
+    },
+    "stage2": {
+      "description": "Two robots (2v0) HER training",
+      "num_robots": 2,
+      "timesteps": 200000,
+      "robot_ids": [1, 2]
+    },
+    "stage3": {
+      "description": "Three robots (3v0) HER training",
+      "num_robots": 3,
+      "timesteps": 200000,
+      "robot_ids": [1, 2, 3]
+    }
+  },
+  "obs_dim_per_robot": 8,
+  "non_robot_obs_dim": 4,
+  "max_steps": 200,
+  "her_distance_threshold": 0.1,
+  "learn_batch_timesteps": 2048,
+  "save_interval": 10000,
+  "save_path": "models/td3_jal_her",
+  "load_model": null,
+  "model_params": {
+    "learning_rate": 0.001,
+    "buffer_size": 100000,
+    "batch_size": 64,
+    "gamma": 0.9,
+    "tau": 0.01,
+    "policy_delay": 2,
+    "target_policy_noise": 0.2,
+    "target_noise_clip": 0.5,
+    "action_noise_std": 0.05,
+    "learning_starts": 1000,
+    "her_n_sampled_goal": 4,
+    "her_goal_selection_strategy": "future",
+    "policy_kwargs": {
+      "net_arch": [256, 256]
+    }
+  }
+}

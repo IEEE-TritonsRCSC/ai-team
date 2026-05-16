@@ -9,6 +9,7 @@ import torch
 from typing import Dict, Any
 from pathlib import Path
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from .base_trainer import BaseTrainer
 from ai_interface.envs.mappo_env import MultiAgentSoccerEnv
@@ -19,12 +20,21 @@ from networking.networker import Networker, TeamInfo
 class MAPPOTrainer(BaseTrainer):
     """Trainer for multi-agent PPO (MAPPO) algorithm."""
     
-    def __init__(self, config: Dict[str, Any], log_dir: str = None, device=None):
-        super().__init__(config, log_dir, algorithm_name="mappo")
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        log_dir: str = None,
+        device=None,
+        algorithm_name: str = "mappo",
+    ):
+        super().__init__(config, log_dir, algorithm_name=algorithm_name)
         self.networker = None
+        self.networkers = []
         self.env = None
+        self.envs = []
         self.agent = None
         self.num_agents = config.get("num_agents", 3)
+        self.num_envs = 1
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def setup_environment(self) -> gym.Env:
@@ -32,25 +42,40 @@ class MAPPOTrainer(BaseTrainer):
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
 
-        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
-        self.networker = Networker(
-            team_infos,
-            self.config.get("env_mode", "sim-only"),
-            sim_host=sim_host,
-            sim_player_port=sim_player_port,
-            sim_trainer_port=sim_trainer_port,
-        )
-        
-        self.env = MultiAgentSoccerEnv(
-            networker=self.networker,
-            team_name=team_name,
-            num_agents=self.num_agents,
-            obs_dim=self.config.get("obs_dim", 25)
-        )
-        
+        self.num_envs = max(1, int(self.config.get("num_envs", 1)))
+        self.networkers = []
+        self.envs = []
+
+        for env_idx in range(self.num_envs):
+            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(env_idx)
+            networker = Networker(
+                team_infos,
+                self.config.get("env_mode", "sim-only"),
+                sim_host=sim_host,
+                sim_player_port=sim_player_port,
+                sim_trainer_port=sim_trainer_port,
+            )
+            env = MultiAgentSoccerEnv(
+                networker=networker,
+                team_name=team_name,
+                num_agents=self.num_agents,
+                obs_dim=self.config.get("obs_dim", 25)
+            )
+            self.networkers.append(networker)
+            self.envs.append(env)
+            self.logger.info(
+                "Env %d connected to %s:%d/%d",
+                env_idx,
+                sim_host,
+                sim_player_port,
+                sim_trainer_port,
+            )
+
+        self.networker = self.networkers[0]
+        self.env = self.envs[0]
         self.logger.info(
-            "Multi-agent environment setup - Team: %s, Agents: %d, Endpoint: %s:%d/%d",
-            team_name, self.num_agents, sim_host, sim_player_port, sim_trainer_port
+            "Multi-agent environment setup - Team: %s, Agents: %d, Parallel envs: %d",
+            team_name, self.num_agents, self.num_envs
         )
         self.logger.info(f"Action space: 6 discrete actions per agent (APPROACH, SHOOT, PASS, DRIBBLE, CLEAR, REPOSITION)")
         return self.env
@@ -96,85 +121,160 @@ class MAPPOTrainer(BaseTrainer):
         action_counts = {i: {j: 0 for j in range(6)} for i in range(self.num_agents)}
         action_names = ["APPROACH", "SHOOT", "PASS", "DRIBBLE", "CLEAR", "REPOSITION"]
         
-        for episode in range(episodes):
-            observations = self.env.reset()
-            episode_reward = 0
-            
-            for step in range(max_steps):
-                # All agents select actions
-                actions = self.agent.select_actions(observations)
-                
-                # Track action distribution
-                for agent_idx, action in enumerate(actions):
-                    action_counts[agent_idx][action] += 1
-                
-                # Environment step (all agents act simultaneously)
-                next_observations, reward, done, info = self.env.step(actions)
-                
-                # Store shared team reward
-                self.agent.store_reward_mask(reward, 1.0 - float(done))
-                
-                episode_reward += reward
-                observations = next_observations
-                total_steps_since_update += 1
-                
-                if done:
-                    break
-            
-            # Log episode
-            goal_str = " GOAL!" if info.get("goal_scored") else ""
+        def _maybe_update():
+            nonlocal n_updates, total_steps_since_update
+            if not self.agent.batch_ready:
+                return
+            losses = self.agent.update()
+            if not losses:
+                return
+            n_updates += 1
+
             self.logger.info(
-                f"Episode {episode + 1}: Reward={episode_reward:.2f}, "
-                f"Length={step + 1}{goal_str}"
+                f"MAPPO update #{n_updates} after {total_steps_since_update} steps - "
+                f"Actor: {losses['actor_loss']:.4f}, "
+                f"Critic: {losses['critic_loss']:.4f}, "
+                f"Entropy: {losses['entropy']:.4f}"
             )
-            self.log_episode(episode + 1, episode_reward, step + 1)
-            
-            # Log action distribution every 10 episodes
-            if (episode + 1) % 10 == 0:
-                for agent_idx in range(self.num_agents):
-                    total = sum(action_counts[agent_idx].values())
-                    if total > 0:
-                        dist = {
-                            action_names[j]: f"{100*count/total:.1f}%"
-                            for j, count in action_counts[agent_idx].items()
-                        }
-                        self.logger.info(f"Agent {agent_idx} actions: {dist}")
-                
-                # Reset counts
-                action_counts = {i: {j: 0 for j in range(6)} for i in range(self.num_agents)}
-            
-            # MAPPO update
-            if self.agent.batch_ready:
-                losses = self.agent.update()
-                n_updates += 1
-                
+            total_steps_since_update = 0
+
+            self.log_metrics({
+                "update": n_updates,
+                "actor_loss": losses['actor_loss'],
+                "critic_loss": losses['critic_loss'],
+                "entropy": losses['entropy']
+            })
+
+        def _log_action_distribution():
+            nonlocal action_counts
+            for agent_idx in range(self.num_agents):
+                total = sum(action_counts[agent_idx].values())
+                if total > 0:
+                    dist = {
+                        action_names[j]: f"{100*count/total:.1f}%"
+                        for j, count in action_counts[agent_idx].items()
+                    }
+                    self.logger.info(f"Agent {agent_idx} actions: {dist}")
+            action_counts = {i: {j: 0 for j in range(6)} for i in range(self.num_agents)}
+
+        def _save_checkpoint(episode_num: int):
+            save_name = Path(self.config.get("save_path", "models/mappo_team.pth")).name
+            checkpoint_path = self._get_checkpoint_path(save_name, episode_num)
+            self.save_model(str(checkpoint_path))
+            self.logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+        if self.num_envs <= 1:
+            for episode in range(episodes):
+                observations = self.env.reset()
+                episode_reward = 0
+                info = {}
+
+                for step in range(max_steps):
+                    # All agents select actions
+                    actions = self.agent.select_actions(observations)
+
+                    # Track action distribution
+                    for agent_idx, action in enumerate(actions):
+                        action_counts[agent_idx][action] += 1
+
+                    # Environment step (all agents act simultaneously)
+                    next_observations, reward, done, info = self.env.step(actions)
+
+                    # Store shared team reward
+                    self.agent.store_reward_mask(reward, 1.0 - float(done))
+
+                    episode_reward += reward
+                    observations = next_observations
+                    total_steps_since_update += 1
+
+                    if done:
+                        break
+
+                    _maybe_update()
+
+                # Log episode
+                goal_str = " GOAL!" if info.get("goal_scored") else ""
                 self.logger.info(
-                    f"MAPPO update #{n_updates} after {total_steps_since_update} steps - "
-                    f"Actor: {losses['actor_loss']:.4f}, "
-                    f"Critic: {losses['critic_loss']:.4f}, "
-                    f"Entropy: {losses['entropy']:.4f}"
+                    f"Episode {episode + 1}: Reward={episode_reward:.2f}, "
+                    f"Length={step + 1}{goal_str}"
                 )
-                total_steps_since_update = 0
-                
-                self.log_metrics({
-                    "update": n_updates,
-                    "actor_loss": losses['actor_loss'],
-                    "critic_loss": losses['critic_loss'],
-                    "entropy": losses['entropy']
-                })
-            
-            # Save periodically
-            if (episode + 1) % save_interval == 0:
-                save_name = Path(self.config.get("save_path", "models/mappo_team.pth")).name
-                checkpoint_path = self._get_checkpoint_path(save_name, episode + 1)
-                self.save_model(str(checkpoint_path))
-                self.logger.info(f"Checkpoint saved: {checkpoint_path}")
+                self.log_episode(episode + 1, episode_reward, step + 1)
+
+                # Log action distribution every 10 episodes
+                if (episode + 1) % 10 == 0:
+                    _log_action_distribution()
+
+                _maybe_update()
+
+                # Save periodically
+                if (episode + 1) % save_interval == 0:
+                    _save_checkpoint(episode + 1)
+        else:
+            self.logger.info(f"Parallel rollout enabled with {self.num_envs} simulator instances")
+            episode_counter = 0
+
+            with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
+                while episode_counter < episodes:
+                    batch_envs = min(self.num_envs, episodes - episode_counter)
+                    observations = [self.envs[i].reset() for i in range(batch_envs)]
+                    episode_rewards = [0.0 for _ in range(batch_envs)]
+                    episode_lengths = [0 for _ in range(batch_envs)]
+                    done_flags = [False for _ in range(batch_envs)]
+                    infos = [{} for _ in range(batch_envs)]
+
+                    for _ in range(max_steps):
+                        active_envs = [i for i in range(batch_envs) if not done_flags[i]]
+                        if not active_envs:
+                            break
+
+                        actions_by_env = [None for _ in range(batch_envs)]
+                        for env_idx in active_envs:
+                            actions = self.agent.select_actions(observations[env_idx])
+                            actions_by_env[env_idx] = actions
+                            for agent_idx, action in enumerate(actions):
+                                action_counts[agent_idx][action] += 1
+
+                        futures = {
+                            env_idx: executor.submit(self.envs[env_idx].step, actions_by_env[env_idx])
+                            for env_idx in active_envs
+                        }
+
+                        for env_idx in active_envs:
+                            next_observations, reward, done, info = futures[env_idx].result()
+                            self.agent.store_reward_mask(reward, 1.0 - float(done))
+                            episode_rewards[env_idx] += reward
+                            episode_lengths[env_idx] += 1
+                            observations[env_idx] = next_observations
+                            done_flags[env_idx] = bool(done)
+                            infos[env_idx] = info
+                            total_steps_since_update += 1
+
+                        _maybe_update()
+
+                    for env_idx in range(batch_envs):
+                        episode_counter += 1
+                        goal_str = " GOAL!" if infos[env_idx].get("goal_scored") else ""
+                        length = max(1, episode_lengths[env_idx])
+                        self.logger.info(
+                            f"Episode {episode_counter}: Reward={episode_rewards[env_idx]:.2f}, "
+                            f"Length={length}{goal_str}"
+                        )
+                        self.log_episode(episode_counter, episode_rewards[env_idx], length)
+
+                        if episode_counter % 10 == 0:
+                            _log_action_distribution()
+
+                        if episode_counter % save_interval == 0:
+                            _save_checkpoint(episode_counter)
         
         # Final update and save
         if len(self.agent.memory) > 0:
-            losses = self.agent.update()
-            n_updates += 1
-            self.logger.info(f"Final update #{n_updates}")
+            losses = self.agent.update(force=True)
+            if losses:
+                n_updates += 1
+                self.logger.info(f"Final update #{n_updates}")
+            else:
+                self.logger.info("No remaining transitions to flush.")
         
         final_save_name = Path(self.config.get("save_path", "models/mappo_team.pth")).name
         final_save_path = self.model_dir / final_save_name
@@ -202,10 +302,18 @@ class MAPPOTrainer(BaseTrainer):
     def cleanup(self):
         """Cleanup resources."""
         super().cleanup()
-        if self.networker:
+        networkers = self.networkers or ([self.networker] if self.networker else [])
+        seen = set()
+        for networker in networkers:
+            if networker is None:
+                continue
+            key = id(networker)
+            if key in seen:
+                continue
+            seen.add(key)
             try:
-                if hasattr(self.networker, "shutdown"):
-                    self.networker.shutdown()
+                if hasattr(networker, "shutdown"):
+                    networker.shutdown()
             except Exception as e:
                 self.logger.error(f"Error during shutdown: {e}")
     

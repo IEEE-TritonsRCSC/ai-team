@@ -13,8 +13,8 @@ import torch
 from ai_interface.algorithms.td3_jal import TD3JALAlgorithm
 from ai_interface.envs.JAL_env import JALTeamEnv
 from ai_interface.trainers.base_trainer import BaseTrainer
-from networking.networker import Networker, TeamInfo
-
+from ai_interface.trainers.parallel_envs import make_networked_env_factory, make_vec_env
+from networking.networker import TeamInfo
 
 class TD3JALTrainer(BaseTrainer):
     """Trainer for TD3 with team-level Joint-Action Learning (JAL)."""
@@ -25,8 +25,9 @@ class TD3JALTrainer(BaseTrainer):
         self.env = None
         self.model = None
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_envs = 1
 
-        self.action_dim_per_robot = 6  # [goto_logit, kick_logit, dribble_logit, goto_x, goto_y, goto_theta]
+        self.action_dim_per_robot = 8  # Mirrors JALTeamEnv.action_dim_per_robot.
         self.num_robots = int(config.get("num_robots", 1))
         self.total_action_dim = self.num_robots * self.action_dim_per_robot
         self.logger.info(
@@ -40,41 +41,66 @@ class TD3JALTrainer(BaseTrainer):
         team_infos = self._load_team_config(self.config["team_config"])
         team_name = self.config.get("team_name") or team_infos[0].name
 
-        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
-        self.networker = Networker(
-            team_infos,
-            self.config.get("env_mode", "sim-only"),
-            sim_host=sim_host,
-            sim_player_port=sim_player_port,
-            sim_trainer_port=sim_trainer_port,
-        )
-
+        self.num_envs = max(1, int(self.config.get("num_envs", 1)))
+        env_mode = self.config.get("env_mode", "sim-only")
         robot_ids = self.config.get("robot_ids")
         if robot_ids is None:
             robot_ids = list(range(1, int(self.config.get("num_robots", 1)) + 1))
 
-        self.env = JALTeamEnv(
-            networker=self.networker,
-            team_name=team_name,
-            robot_ids=robot_ids,
-            obs_dim_per_robot=int(self.config.get("obs_dim_per_robot", 5)),
-            non_robot_obs_dim=int(self.config.get("non_robot_obs_dim", 4)),
-            max_steps=int(self.config.get("max_steps", 200)),
-            debug=bool(self.config.get("debug", False)),
+        env_kwargs = {
+            "robot_ids": robot_ids,
+            "obs_dim_per_robot": int(self.config.get("obs_dim_per_robot", 8)),
+            "non_robot_obs_dim": int(self.config.get("non_robot_obs_dim", 4)),
+            "max_steps": int(self.config.get("max_steps", 200)),
+            "debug": bool(self.config.get("debug", self.config.get("debug_env", False))),
+            "state_retry_count": int(self.config.get("state_retry_count", 10)),
+            "state_retry_sleep_s": float(self.config.get("state_retry_sleep_s", 0.02)),
+            "none_state_warn_every": int(self.config.get("none_state_warn_every", 50)),
+            "position_noise_std": float(self.config.get("position_noise_std", 0.05)),
+            "invalid_action_penalty": float(self.config.get("invalid_action_penalty", 0.2)),
+        }
+        env_fns = []
+
+        for env_idx in range(self.num_envs):
+            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(env_idx)
+            env_fns.append(
+                make_networked_env_factory(
+                    JALTeamEnv,
+                    team_infos,
+                    env_mode,
+                    team_name,
+                    sim_host,
+                    sim_player_port,
+                    sim_trainer_port,
+                    env_kwargs=env_kwargs,
+                    monitor=True,
+                )
+            )
+            self.logger.info(
+                "Env %d connected to %s:%d/%d",
+                env_idx,
+                sim_host,
+                sim_player_port,
+                sim_trainer_port,
+            )
+
+        self.env = make_vec_env(
+            env_fns,
+            backend=self.config.get("parallel_backend", "subproc"),
+            start_method=self.config.get("vec_env_start_method"),
         )
 
         self.num_robots = len(robot_ids)
-        self.total_action_dim = self.num_robots * self.action_dim_per_robot
+        self.action_dim_per_robot = int(self.env.action_space.shape[0]) // max(1, self.num_robots)
+        self.total_action_dim = int(self.env.action_space.shape[0])
 
         self.logger.info(
-            "JALTeamEnv created - Team: %s, robots=%s, obs_dim=%d, action_dim=%d, Endpoint: %s:%d/%d",
+            "JALTeamEnv created - Team: %s, robots=%s, obs_dim=%d, action_dim=%d, parallel_envs=%d",
             team_name,
             robot_ids,
             int(self.env.observation_space.shape[0]),
             int(self.env.action_space.shape[0]),
-            sim_host,
-            sim_player_port,
-            sim_trainer_port,
+            self.num_envs,
         )
         return self.env
 
@@ -93,7 +119,10 @@ class TD3JALTrainer(BaseTrainer):
         target_noise_clip = model_params.get("target_noise_clip", 0.5)
         action_noise_std = model_params.get("action_noise_std", 0.05)
         network_type = model_params.get("network_type", "mlp")
-        network_kwargs = model_params.get("network_kwargs", {})
+        network_kwargs = dict(model_params.get("network_kwargs", {}))
+        network_kwargs.setdefault("num_robots", self.num_robots)
+        network_kwargs.setdefault("per_robot_dim", int(self.config.get("obs_dim_per_robot", 8)))
+        network_kwargs.setdefault("global_dim", int(self.config.get("non_robot_obs_dim", 4)))
         policy_kwargs = model_params.get("policy_kwargs", {"net_arch": [64, 48, 32]})
 
         self.logger.info("TD3 Hyperparameters:")
@@ -226,6 +255,11 @@ class TD3JALTrainer(BaseTrainer):
     def cleanup(self):
         """Cleanup resources after training."""
         super().cleanup()
+        if self.env is not None and hasattr(self.env, "close"):
+            try:
+                self.env.close()
+            except Exception as e:
+                self.logger.error(f"Error during env shutdown: {e}")
         if self.networker:
             try:
                 if hasattr(self.networker, "shutdown") and callable(self.networker.shutdown):
