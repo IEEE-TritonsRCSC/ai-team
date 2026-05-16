@@ -15,7 +15,6 @@ Examples:
   python launch_train.py --num-envs 2 --base-port 7000 --monitor
   python launch_train.py --num-envs 3 --trainer qlearning -- --episodes 5000 --lr 1e-3
   python launch_train.py --num-envs 2 --sim-cmd "rcssserver" --sim-port-flag "server::port="
-  python launch_train.py --num-envs 1 --trainer robot_attention --predict --config configs/robot_attention_config.json
   python launch_train.py --num-envs 2 --env sim-embedded --trainer discrete_ppo
 """
 
@@ -105,12 +104,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         ],
         default="discrete_ppo",
         help="Trainer type forwarded to train.py (default: discrete_ppo)",
-    )
-    parser.add_argument(
-        "--predict",
-        action="store_true",
-        default=False,
-        help="Run train.py in infinite inference mode instead of training",
     )
     parser.add_argument(
         "--python", default=sys.executable,
@@ -337,9 +330,6 @@ def main() -> int:
         "--sim_player_port", str(args.base_port),
         "--sim_port_stride", str(args.port_stride),
     ] + extra_train_args  # pass any remaining args straight through
-
-    if args.predict:
-        train_cmd.append("--predict")
 
     print(f"[launcher] Starting trainer: {' '.join(train_cmd)}")
 

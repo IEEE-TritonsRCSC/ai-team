@@ -419,8 +419,6 @@ Examples:
                         help="Save model every N episodes/timesteps")
     parser.add_argument("--load_model", type=str, default=None,
                         help="Path to load a pre-trained model (optional)")
-    parser.add_argument("--predict", action="store_true", default=False,
-                        help="Run infinite inference instead of training")
     parser.add_argument("--resume_checkpoint", type=str, default=None,
                         help="Path to a checkpoint to resume training from. "
                              "The original checkpoint is never modified; new "
@@ -491,7 +489,6 @@ Examples:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
             config = create_default_config(trainer_type, args)
-            config["predict_only"] = bool(args.predict)
 
         num_envs = int(config.get("num_envs", 1))
         sim_port_stride = int(config.get("sim_port_stride", 10))
@@ -520,12 +517,9 @@ Examples:
         # Create trainer
         trainer = get_trainer(trainer_type, config)
         
-        # Execute training or inference
+        # Execute training
         try:
-            if config.get("predict_only", False):
-                trainer.predict()
-            else:
-                trainer.train()
+            trainer.train()
         finally:
             trainer.cleanup()
 
