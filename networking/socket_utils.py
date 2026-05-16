@@ -14,6 +14,11 @@ from typing import Optional
 import sslclient
 from .data_utils import GameState, TeamInfo, Deserializer
 
+try:
+    import rcssserver_embedded as embedded_sim
+except ImportError:
+    embedded_sim = None
+
 # Network constants for listening to simulator data
 BUFFER_SIZE = 1536
 LOCALHOST_IP = "127.0.0.1"
@@ -26,11 +31,256 @@ PLAYMODE_REGEX = r"\(hear \d+ referee (\w+)\)"
 COMMAND_IP = "239.42.42.42"
 COMMAND_PORT = 10000
 
+UDP_SIM_ENVIRONMENTS = {"sim-only", "sim-mixed"}
+EMBEDDED_SIM_ENVIRONMENTS = {"sim-embedded"}
+SIM_ENVIRONMENTS = UDP_SIM_ENVIRONMENTS | EMBEDDED_SIM_ENVIRONMENTS
+ROBOT_ENVIRONMENTS = {"sim-mixed", "field-practice", "field-tournament"}
+
+
+def _uses_udp_simulator(environment: str) -> bool:
+    return environment in UDP_SIM_ENVIRONMENTS
+
+
+def _uses_embedded_simulator(environment: str) -> bool:
+    return environment in EMBEDDED_SIM_ENVIRONMENTS
+
+
+def _uses_simulator(environment: str) -> bool:
+    return environment in SIM_ENVIRONMENTS
+
+
+def _uses_robot_multicast(environment: str) -> bool:
+    return environment in ROBOT_ENVIRONMENTS
+
+
+def _compute_init_pose(side: str, first: bool, goalie: bool):
+    """Compute the initial spawn pose for a simulator-side player."""
+    x, y = random.uniform(15, 30), random.uniform(-25, 25)
+    theta = random.uniform(-180, 180)
+
+    if side == "left":
+        x = -x
+        if first:
+            x, y, theta = (-10, 0, 0.0)
+        if goalie:
+            x, y, theta = -41.4, 0.0, 0.0
+    else:
+        if first:
+            x, y, theta = (20, 10, 180.0)
+        if goalie:
+            x, y, theta = (41.4, 0.0, 180.0)
+
+    return (x, y, theta)
+
+
+class EmbeddedSimulatorBackend:
+    """Shared synchronous simulator backend used by Listener and Commander."""
+
+    def __init__(self, team_infos: list[TeamInfo]):
+        if embedded_sim is None:
+            raise ImportError(
+                "sim-embedded mode requires the rcssserver_embedded module. "
+                "Use the rcai conda environment when running this mode."
+            )
+
+        self.team_infos = team_infos
+        self._lock = threading.Lock()
+        self._pending_commands = []
+        self.desired_init_poses = []
+        self.side_by_team = {}
+        self.team_by_side = {}
+        self._sim = None
+        self._last_state = None
+        self._initialize_simulator()
+
+    def _initialize_simulator(self):
+        sim = embedded_sim.EmbeddedSimulator()
+        sim.init()
+
+        left_team, right_team = self.team_infos
+        sim.set_team_name(embedded_sim.Side.LEFT, left_team.name)
+        sim.set_team_name(embedded_sim.Side.RIGHT, right_team.name)
+
+        self.side_by_team = {
+            left_team.name: embedded_sim.Side.LEFT,
+            right_team.name: embedded_sim.Side.RIGHT,
+        }
+        self.team_by_side = {
+            embedded_sim.Side.LEFT.name: left_team.name,
+            embedded_sim.Side.RIGHT.name: right_team.name,
+        }
+
+        desired_init_poses = []
+        for team_info, side_name, side_enum in (
+            (left_team, "left", embedded_sim.Side.LEFT),
+            (right_team, "right", embedded_sim.Side.RIGHT),
+        ):
+            goalie_0idx = team_info.goalie_id - 1
+            for i in range(team_info.n_players):
+                goalie = i == goalie_0idx
+                init_pose = _compute_init_pose(side_name, i == 0, goalie)
+                sim.enable_player(side_enum, i + 1, goalie)
+                desired_init_poses.append(
+                    (
+                        f"(player {team_info.name} {i+1}{' goalie' if goalie else ''})",
+                        init_pose,
+                    )
+                )
+
+        sim.start_match()
+
+        self._sim = sim
+        self._pending_commands.clear()
+        self.desired_init_poses[:] = desired_init_poses
+        self._last_state = self._sim.snapshot()
+
+    def _iter_player_slots(self):
+        """Yield (side_enum, unum, init_pose) for each enabled player slot."""
+        pose_index = 0
+        for team_info, side_enum in (
+            (self.team_infos[0], embedded_sim.Side.LEFT),
+            (self.team_infos[1], embedded_sim.Side.RIGHT),
+        ):
+            for unum in range(1, team_info.n_players + 1):
+                _obj_name, init_pose = self.desired_init_poses[pose_index]
+                pose_index += 1
+                yield side_enum, unum, init_pose
+
+    def _normalize_command(self, command) -> str:
+        if isinstance(command, bytes):
+            command_text = command.decode()
+        else:
+            command_text = str(command)
+        command_text = command_text.rstrip("\0").strip()
+        if command_text and not command_text.startswith("("):
+            command_text = f"({command_text})"
+        return command_text
+
+    def queue_commands(self, teamname: str, commands: list[bytes]):
+        """Buffer commands to apply on the next synchronous simulator step."""
+        side = self.side_by_team[teamname]
+        queued = []
+        for unum, command in enumerate(commands, start=1):
+            if command is None:
+                continue
+            command_text = self._normalize_command(command)
+            if not command_text:
+                continue
+            queued.append(embedded_sim.PlayerCommand(side, unum, command_text))
+
+        with self._lock:
+            self._pending_commands.extend(queued)
+
+    def _playmode_to_string(self, playmode) -> Optional[str]:
+        if playmode is None:
+            return None
+
+        name = getattr(playmode, "name", None)
+        if not name:
+            text = str(playmode)
+            name = text.split(".")[-1]
+        if name.startswith("PM_"):
+            name = name[3:]
+
+        name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+        name = re.sub(r"__+", "_", name).lower()
+        if name.endswith("_left"):
+            return f"{name[:-5]}_l"
+        if name.endswith("_right"):
+            return f"{name[:-6]}_r"
+        return name
+
+    def _side_to_teamname(self, side) -> Optional[str]:
+        side_name = getattr(side, "name", None)
+        if not side_name:
+            side_name = str(side).split(".")[-1]
+        return self.team_by_side.get(side_name)
+
+    def _to_game_state(self, state) -> GameState:
+        robot_entries = {team_info.name: [] for team_info in self.team_infos}
+
+        for player in getattr(state, "players", []) or []:
+            if not getattr(player, "enabled", False):
+                continue
+
+            teamname = self._side_to_teamname(player.side)
+            if teamname is None:
+                continue
+
+            pose = (
+                float(player.pos.x),
+                float(player.pos.y),
+                float(player.body_angle),
+            )
+            robot_entries[teamname].append((int(player.unum), pose))
+
+        robot_poses = {}
+        for teamname, entries in robot_entries.items():
+            entries.sort(key=lambda item: item[0])
+            robot_poses[teamname] = [{unum: pose} for unum, pose in entries]
+
+        ball = getattr(state, "ball", None)
+        ball_pos = None
+        if ball is not None and getattr(ball, "pos", None) is not None:
+            ball_pos = (float(ball.pos.x), float(ball.pos.y))
+
+        return GameState(
+            int(getattr(state, "time", 0)),
+            time.time(),
+            ball_pos,
+            robot_poses,
+            self._playmode_to_string(getattr(state, "playmode", None)),
+        )
+
+    def watch_game(self) -> GameState:
+        """Advance the simulator once if commands are pending; otherwise snapshot."""
+        with self._lock:
+            if self._pending_commands:
+                commands = list(self._pending_commands)
+                self._pending_commands.clear()
+                self._last_state = self._sim.step(commands)
+            elif self._last_state is None:
+                self._last_state = self._sim.snapshot()
+            else:
+                self._last_state = self._sim.snapshot()
+
+            return self._to_game_state(self._last_state)
+
+    def reset(self) -> bool:
+        """Soft-reset players without recreating the embedded server.
+
+        Reinitializing the native simulator every episode causes repeated
+        server-side player-type logs and transient socket bind failures inside
+        the embedded module. The embedded API available here does not expose a
+        trainer-style reset, so we reposition players with `(move x y)` commands
+        and keep the existing simulator instance alive.
+        """
+        with self._lock:
+            commands = [
+                embedded_sim.PlayerCommand(
+                    side_enum,
+                    unum,
+                    f"(move {init_pose[0]} {init_pose[1]})",
+                )
+                for side_enum, unum, init_pose in self._iter_player_slots()
+            ]
+            self._pending_commands.clear()
+            self._last_state = self._sim.step(commands)
+        return True
+
+    def shutdown(self):
+        """Release buffered commands and the simulator reference."""
+        with self._lock:
+            self._pending_commands.clear()
+            self._last_state = None
+            self._sim = None
+
 class Listener:
     """Listens for game state updates from simulators or cameras."""
     def __init__(self, team_infos: list[TeamInfo], environment: str,
                  desired_init_poses: list, sim_host: str = LOCALHOST_IP,
-                 sim_trainer_port: int = DEFAULT_SIM_TRAINER_PORT):
+                 sim_trainer_port: int = DEFAULT_SIM_TRAINER_PORT,
+                 embedded_backend: Optional[EmbeddedSimulatorBackend] = None):
         """
         Initialize listener for the specified environment.
         
@@ -41,13 +291,17 @@ class Listener:
         """
         self.parser = Deserializer(team_infos)
 
-        if environment in ["sim-only", "sim-mixed"]:
+        if _uses_udp_simulator(environment):
             self.source = "simulator"
             self.addr = (sim_host, int(sim_trainer_port))
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(0.2)    # Non-blocking with timeout
             self.desired_init_poses = desired_init_poses
             self.connect_to_sim(desired_init_poses)
+        elif _uses_embedded_simulator(environment):
+            self.source = "embedded"
+            self.embedded_backend = embedded_backend or EmbeddedSimulatorBackend(team_infos)
+            self.desired_init_poses = self.embedded_backend.desired_init_poses
         else:
             self.source = "camera"
             self.vision_client = sslclient.client()
@@ -70,6 +324,8 @@ class Listener:
                 return game_state
             else:
                 return None
+        elif self.source == "embedded":
+            return self.embedded_backend.watch_game()
         else:
             data = self.vision_client.receive()
             if data.HasField("detection"):
@@ -136,6 +392,9 @@ class Listener:
 
     def reset_sim(self, desired_init_poses: Optional[list] = None) -> bool:
         """Reset simulator playmode and restore initial poses through trainer port."""
+        if self.source == "embedded":
+            return self.embedded_backend.reset()
+
         if self.source != "simulator":
             return False
 
@@ -159,12 +418,19 @@ class Listener:
 
     def disconnect_from_sim(self):
         """Disconnect from simulator and close socket."""
+        if self.source == "embedded":
+            self.embedded_backend.shutdown()
+            return
+
         self.sock.sendto(b"(bye)\0", self.addr)
         time.sleep(0.1)
         self.sock.close()
 
     def restart_game(self):
         """Keep sending change_mode play_on until the server acknowledges it."""
+        if self.source == "embedded":
+            return
+
         play_on = False
         while not play_on:
             self.sock.sendto(b"(change_mode play_on)\0", self.addr)
@@ -214,22 +480,7 @@ class Client:
         Returns:
             Tuple of (x, y, theta) initial pose
         """
-        x, y = random.uniform(15, 30), random.uniform(-25, 25)
-        theta = random.uniform(-180, 180)
-
-        if side == "left":
-            x = -x
-            if first:
-                x, y, theta = (-10, 0, 0.0)
-            if goalie:
-                x, y, theta = -41.4, 0.0, 0.0
-        else:
-            if first:
-                x, y, theta = (20, 10, 180.0)
-            if goalie:
-                x, y, theta = (41.4, 0.0, 180.0)
-
-        return (x, y, theta)
+        return _compute_init_pose(side, first, goalie)
 
     def send_command(self, command: bytes):
         """Send a command to the simulator for this robot."""
@@ -290,13 +541,17 @@ class Commander:
         self.sim_player_port = int(sim_player_port)
         self.desired_init_poses = []
         self.sample_client = None
+        self.embedded_backend = None
 
-        if environment in ["sim-only", "sim-mixed"]:
+        if _uses_udp_simulator(environment):
             self.create_sim_clients()
             time.sleep(0.1)    # Allow time for simulator to set up
+        elif _uses_embedded_simulator(environment):
+            self.embedded_backend = EmbeddedSimulatorBackend(team_infos)
+            self.desired_init_poses = self.embedded_backend.desired_init_poses
 
         self.socks, self.addrs = {}, {}
-        if environment != "sim-only":
+        if _uses_robot_multicast(environment):
             for i, team_info in enumerate(team_infos):
                 teamname = team_info.name
                 port_num = COMMAND_PORT + (i * 1000)
@@ -333,6 +588,10 @@ class Commander:
             teamname: Name of team to send commands to
             commands: List of command bytes for each robot
         """
+        if self.embedded_backend is not None:
+            self.embedded_backend.queue_commands(teamname, commands)
+            return
+
         threads = []
         for (client, command) in zip(self.sim_clients[teamname], commands):
             if command is None:
@@ -363,6 +622,9 @@ class Commander:
         Returns:
             True if at least one player reset command was sent successfully.
         """
+        if self.embedded_backend is not None:
+            return self.embedded_backend.reset()
+
         if not hasattr(self, "sim_clients"):
             return False
 
@@ -400,6 +662,10 @@ class Commander:
 
     def disconnect_from_sim(self):
         """Disconnect all simulator clients."""
+        if self.embedded_backend is not None:
+            self.embedded_backend.shutdown()
+            return
+
         for team_clients in self.sim_clients.values():
             for client in team_clients:
                 time.sleep(0.1)

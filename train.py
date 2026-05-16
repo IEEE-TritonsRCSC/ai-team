@@ -37,6 +37,12 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _cli_flag_provided(flag: str) -> bool:
+    """Return True when a CLI flag was explicitly present in argv."""
+    argv = sys.argv[1:]
+    return flag in argv or any(arg.startswith(f"{flag}=") for arg in argv)
+
+
 def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[str, Any]:
     """Create default configuration based on trainer type and command line arguments."""
     base_config = {
@@ -367,7 +373,7 @@ Examples:
     parser.add_argument("--team_config", type=str, default="team_config.json",
                         help="Path to team configuration JSON file")
     parser.add_argument("--env", choices=[
-        "sim-only", "sim-mixed", "field-practice", "field-tournament"
+        "sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"
     ], default="sim-only", help="Environment mode for Networker")
     parser.add_argument("--team", type=str, default=None,
                         help="Team name to control")
@@ -407,6 +413,8 @@ Examples:
                         help="Save model every N episodes/timesteps")
     parser.add_argument("--load_model", type=str, default=None,
                         help="Path to load a pre-trained model (optional)")
+    parser.add_argument("--predict", action="store_true", default=False,
+                        help="Run infinite inference instead of training")
     parser.add_argument("--resume_checkpoint", type=str, default=None,
                         help="Path to a checkpoint to resume training from. "
                              "The original checkpoint is never modified; new "
@@ -449,20 +457,42 @@ Examples:
             config = load_config(args.config)
             trainer_type = config.get("trainer_type", args.trainer)
             # Backfill runtime defaults for older config files.
+            config.setdefault("env_mode", args.env)
+            config.setdefault("team_name", args.team)
             config.setdefault("num_envs", args.num_envs)
             config.setdefault("sim_host", args.sim_host)
             config.setdefault("sim_player_port", args.sim_player_port)
             config.setdefault("sim_port_stride", args.sim_port_stride)
+            config.setdefault("predict_only", args.predict)
+
+            # Allow launchers and direct CLI usage to override key runtime
+            # environment parameters even when a config file is supplied.
+            if _cli_flag_provided("--env"):
+                config["env_mode"] = args.env
+            if _cli_flag_provided("--team"):
+                config["team_name"] = args.team
+            if _cli_flag_provided("--num_envs"):
+                config["num_envs"] = args.num_envs
+            if _cli_flag_provided("--sim_host"):
+                config["sim_host"] = args.sim_host
+            if _cli_flag_provided("--sim_player_port"):
+                config["sim_player_port"] = args.sim_player_port
+            if _cli_flag_provided("--sim_port_stride"):
+                config["sim_port_stride"] = args.sim_port_stride
+
+            if args.predict:
+                config["predict_only"] = True
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
             config = create_default_config(trainer_type, args)
+            config["predict_only"] = bool(args.predict)
 
         num_envs = int(config.get("num_envs", 1))
         sim_port_stride = int(config.get("sim_port_stride", 10))
         env_mode = config.get("env_mode", "sim-only")
-        if num_envs > 1 and env_mode not in ["sim-only", "sim-mixed"]:
-            raise ValueError("Parallel simulator training requires env_mode to be sim-only or sim-mixed")
+        if num_envs > 1 and env_mode not in ["sim-only", "sim-embedded", "sim-mixed"]:
+            raise ValueError("Parallel simulator training requires env_mode to be sim-only, sim-embedded, or sim-mixed")
         if sim_port_stride < 3:
             raise ValueError("sim_port_stride must be >= 3 to avoid simulator port overlap")
         
@@ -483,14 +513,17 @@ Examples:
         # Create trainer
         trainer = get_trainer(trainer_type, config)
         
-        # Execute training
+        # Execute training or inference
         try:
-            trainer.train()
+            if config.get("predict_only", False):
+                trainer.predict()
+            else:
+                trainer.train()
         finally:
             trainer.cleanup()
-        
+
         print("\n" + "="*60)
-        print("Training completed successfully!")
+        print("Run completed successfully!")
         print("="*60)
         
     except KeyboardInterrupt:
