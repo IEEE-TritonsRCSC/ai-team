@@ -7,7 +7,7 @@ import math
 from scipy.optimize import differential_evolution
 from typing import Tuple
 from constants.player_constants import KICKABLE_MARGIN
-from constants.field_constants import GOAL_L, GOAL_R, GOAL_L_Y_TOP, GOAL_L_Y_BOTTOM, GOAL_R_Y_TOP, GOAL_R_Y_BOTTOM, MAX_KEEPER_OUT
+from constants.field_constants import FIELD_X, GOAL_L, GOAL_R, GOAL_L_Y_TOP, GOAL_L_Y_BOTTOM, GOAL_R_Y_TOP, GOAL_R_Y_BOTTOM, MAX_KEEPER_OUT
 
 def normalize_angle(angle: float) -> float:
     """Normalize angle to be within [-pi, pi] radians."""
@@ -24,6 +24,21 @@ def distance(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
 def face_ball_angle(pose: Tuple[float, ...], ball_pos: Tuple[float, ...]) -> float:
     """Heading angle from a robot pose toward the ball."""
     return math.atan2(ball_pos[1] - pose[1], ball_pos[0] - pose[0])
+
+
+def robot_id_and_pose(robot) -> tuple[int, tuple[float, float, float]]:
+    """Return a robot's uniform number and pose with theta normalized to radians."""
+    unum = int(next(iter(robot.keys())))
+    raw_pose = robot[unum]
+    theta = float(raw_pose[2])
+    if abs(theta) > 2 * math.pi:
+        theta = math.radians(theta)
+    return unum, (float(raw_pose[0]), float(raw_pose[1]), normalize_angle(theta))
+
+
+def field_units_per_meter(field_length_m: float = 9.0) -> float:
+    """Return the current field-coordinate scale for meter-based rule distances."""
+    return abs(FIELD_X[1] - FIELD_X[0]) / field_length_m
 
 
 def dist_point_to_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
