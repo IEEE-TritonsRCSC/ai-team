@@ -361,6 +361,24 @@ class RobotAttentionEnv(gym.Env):
         rel_y = -sin_theta * dx + cos_theta * dy
         return rel_x, rel_y
 
+    @staticmethod
+    def _clockwise_deg_to_math_rad(angle_deg: float) -> float:
+        """
+        Convert simulator/game headings into standard math radians.
+
+        Game convention:
+        - x+ is right
+        - y+ is up
+        - 0 degrees points right
+        - positive angles are clockwise
+
+        Internal convention:
+        - 0 radians points right
+        - positive angles are counterclockwise
+        """
+
+        return float(-np.deg2rad(angle_deg))
+
     def _init_obs_frame_buffers(self) -> Dict[str, List[np.ndarray]]:
         """Create empty temporal buffers for each tracked team name."""
 
@@ -398,12 +416,16 @@ class RobotAttentionEnv(gym.Env):
         if policy is None:
             raise RuntimeError("opponent_model does not expose a policy")
 
-        policy.set_training_mode(False)
-        with th.no_grad():
-            obs_tensor = obs_as_tensor(obs, self.opponent_model.device)
-            if obs_tensor.dim() == len(self.observation_space.shape):
-                obs_tensor = obs_tensor.unsqueeze(0)
-            actions, _, _ = policy(obs_tensor)
+        was_training = bool(policy.training)
+        try:
+            policy.set_training_mode(False)
+            with th.no_grad():
+                obs_tensor = obs_as_tensor(obs, self.opponent_model.device)
+                if obs_tensor.dim() == len(self.observation_space.shape):
+                    obs_tensor = obs_tensor.unsqueeze(0)
+                actions, _, _ = policy(obs_tensor)
+        finally:
+            policy.set_training_mode(was_training)
 
         actions = actions.cpu().numpy()
         if actions.shape[0] == 1:
@@ -474,7 +496,7 @@ class RobotAttentionEnv(gym.Env):
 
                 ego_x = float(ego_pose[0])
                 ego_y = float(ego_pose[1])
-                ego_theta = float(np.deg2rad(ego_pose[2]))
+                ego_theta = self._clockwise_deg_to_math_rad(float(ego_pose[2]))
 
                 robot_obs: list[float] = []
                 ball_rel_x, ball_rel_y = self._world_to_ego(
@@ -495,7 +517,7 @@ class RobotAttentionEnv(gym.Env):
 
                     other_x = float(other_pose[0])
                     other_y = float(other_pose[1])
-                    other_theta = float(np.deg2rad(other_pose[2]))
+                    other_theta = self._clockwise_deg_to_math_rad(float(other_pose[2]))
                     other_rel_x, other_rel_y = self._world_to_ego(
                         dx=other_x - ego_x,
                         dy=other_y - ego_y,
@@ -709,7 +731,7 @@ class RobotAttentionEnv(gym.Env):
 
         ball_x, ball_y = float(current_game_state.ball_pos[0]), float(current_game_state.ball_pos[1])
         robot_x, robot_y = float(pose[0]), float(pose[1])
-        robot_theta = float(np.deg2rad(pose[2]))
+        robot_theta = self._clockwise_deg_to_math_rad(float(pose[2]))
         ball_dist = float(np.hypot(ball_x - robot_x, ball_y - robot_y))
         has_ball = bool(ball_dist <= self.kickable_dist)
         reward_state = state if state is not None else self._default_reward_state(has_ball)

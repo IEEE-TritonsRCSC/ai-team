@@ -37,6 +37,12 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _cli_flag_provided(flag: str) -> bool:
+    """Return True when a CLI flag was explicitly present in argv."""
+    argv = sys.argv[1:]
+    return flag in argv or any(arg.startswith(f"{flag}=") for arg in argv)
+
+
 def value_or_default(value, default):
     """Return parser value when present, otherwise the documented default."""
     return default if value is None else value
@@ -374,7 +380,7 @@ Examples:
     parser.add_argument("--team_config", type=str, default="team_config.json",
                         help="Path to team configuration JSON file")
     parser.add_argument("--env", choices=[
-        "sim-only", "sim-mixed", "field-practice", "field-tournament"
+        "sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"
     ], default="sim-only", help="Environment mode for Networker")
     parser.add_argument("--team", type=str, default=None,
                         help="Team name to control")
@@ -481,6 +487,12 @@ Examples:
                 config["policy_config"] = load_config(args.policy_config)
             elif isinstance(config.get("policy_config"), str):
                 config["policy_config"] = load_config(config["policy_config"])
+
+            # Backfill runtime defaults for older config files.
+            config.setdefault("num_envs", args.num_envs)
+            config.setdefault("sim_host", args.sim_host)
+            config.setdefault("sim_player_port", args.sim_player_port)
+            config.setdefault("sim_port_stride", args.sim_port_stride)
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
@@ -494,8 +506,8 @@ Examples:
         env_mode = config.get("env_mode", "sim-only")
         if num_envs < 1:
             raise ValueError("num_envs must be >= 1")
-        if num_envs > 1 and env_mode not in ["sim-only", "sim-mixed"]:
-            raise ValueError("Parallel simulator training requires env_mode to be sim-only or sim-mixed")
+        if num_envs > 1 and env_mode not in ["sim-only", "sim-embedded", "sim-mixed"]:
+            raise ValueError("Parallel simulator training requires env_mode to be sim-only, sim-embedded, or sim-mixed")
         if sim_port_stride < 3:
             raise ValueError("sim_port_stride must be >= 3 to avoid simulator port overlap")
         
@@ -521,9 +533,9 @@ Examples:
             trainer.train()
         finally:
             trainer.cleanup()
-        
+
         print("\n" + "="*60)
-        print("Training completed successfully!")
+        print("Run completed successfully!")
         print("="*60)
         
     except KeyboardInterrupt:

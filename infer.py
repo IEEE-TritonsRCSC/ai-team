@@ -238,7 +238,7 @@ def main():
     parser.add_argument("--team_config", type=str, default="team_config.json",
                         help="Path to team configuration JSON file")
     parser.add_argument("--env", choices=[
-        "sim-only", "sim-mixed", "field-practice", "field-tournament"
+        "sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"
     ], default="sim-only", help="Environment mode for Networker")
     parser.add_argument("--team", type=str, default="TritonBots",
                         help="Team name to control")

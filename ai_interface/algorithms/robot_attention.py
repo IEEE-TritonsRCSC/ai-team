@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional, Sequence, Tuple
 
 from gymnasium import spaces
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch
 import torch.nn as nn
@@ -207,6 +209,114 @@ class ActionHead(nn.Module):
         z = self.head(z)
         B, N, A = z.shape
         return z.reshape(B, N * A)
+
+
+class RobotAttentionActorCriticNetwork(nn.Module):
+    """Custom SB3 actor/critic head using ``ActionHead`` for the policy branch."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        *,
+        num_robots: int,
+        hidden_dim: int,
+        action_dim_per_robot: int,
+        vf_net_arch: Sequence[int] = (64, 32),
+        activation_fn: type[nn.Module] = nn.Tanh,
+    ):
+        super().__init__()
+        if feature_dim != num_robots * hidden_dim:
+            raise ValueError(
+                f"feature_dim={feature_dim} does not match num_robots*hidden_dim="
+                f"{num_robots * hidden_dim}"
+            )
+
+        self.num_robots = int(num_robots)
+        self.hidden_dim = int(hidden_dim)
+        self.latent_dim_pi = int(num_robots * action_dim_per_robot)
+
+        self.policy_net = ActionHead(
+            hidden_dim=hidden_dim,
+            action_dim=action_dim_per_robot,
+        )
+
+        vf_layers: list[nn.Module] = []
+        last_dim = int(feature_dim)
+        for width in vf_net_arch:
+            vf_layers.append(nn.Linear(last_dim, int(width)))
+            vf_layers.append(activation_fn())
+            last_dim = int(width)
+        self.value_net = nn.Sequential(*vf_layers) if vf_layers else nn.Identity()
+        self.latent_dim_vf = last_dim
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_actor(features), self.forward_critic(features)
+
+    def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+        batch_size = features.shape[0]
+        robot_features = features.reshape(batch_size, self.num_robots, self.hidden_dim)
+        return self.policy_net(robot_features)
+
+    def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+        return self.value_net(features)
+
+
+class RobotAttentionActorCriticPolicy(ActorCriticPolicy):
+    """SB3 policy wrapper using ``ActionHead`` for the actor branch."""
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Callable[[float], float],
+        *args,
+        **kwargs,
+    ):
+        kwargs["ortho_init"] = False
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            *args,
+            **kwargs,
+        )
+
+    def _build_mlp_extractor(self) -> None:
+        if not hasattr(self.features_extractor, "num_robots"):
+            raise ValueError("features_extractor must expose num_robots")
+
+        num_robots = int(self.features_extractor.num_robots)
+        hidden_dim = int(self.features_dim // num_robots)
+        action_dim = int(get_action_dim(self.action_space))
+        if action_dim % num_robots != 0:
+            raise ValueError(
+                f"Action dim {action_dim} is not divisible by num_robots={num_robots}"
+            )
+        action_dim_per_robot = action_dim // num_robots
+
+        vf_net_arch = self.net_arch
+        if isinstance(vf_net_arch, dict):
+            vf_net_arch = vf_net_arch.get("vf", [])
+        if vf_net_arch is None:
+            vf_net_arch = []
+
+        self.mlp_extractor = RobotAttentionActorCriticNetwork(
+            self.features_dim,
+            num_robots=num_robots,
+            hidden_dim=hidden_dim,
+            action_dim_per_robot=action_dim_per_robot,
+            vf_net_arch=vf_net_arch,
+            activation_fn=self.activation_fn,
+        )
+
+    def _build(self, lr_schedule: Callable[[float], float]) -> None:
+        super()._build(lr_schedule)
+        self.action_net = nn.Identity()
+        self.optimizer = self.optimizer_class(
+            self.parameters(),
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
 
 
 class SB3MultiRobotFeatureExtractor(BaseFeaturesExtractor):

@@ -7,7 +7,13 @@ between the AI system and various game environments (simulators and real robots)
 
 import threading
 from .data_utils import GameState, TeamInfo, Serializer
-from .socket_utils import Listener, Commander
+from .socket_utils import (
+    Listener,
+    Commander,
+    _uses_embedded_simulator,
+    _uses_simulator,
+    _uses_robot_multicast,
+)
 
 class Networker:
     """
@@ -39,7 +45,8 @@ class Networker:
         self.game_watcher = Listener(team_infos, environment,
                                      self.commander.desired_init_poses,
                                      sim_host=sim_host,
-                                     sim_trainer_port=sim_trainer_port)
+                                     sim_trainer_port=sim_trainer_port,
+                                     embedded_backend=self.commander.embedded_backend)
         self._client_data_lock = threading.Lock()
         self._latest_client_data = None
 
@@ -81,16 +88,20 @@ class Networker:
             output: List of command strings from the AI system
             team_name: Name of the team executing the commands
         """
-        if self.environment in ["sim-only", "sim-mixed"]:
+        if _uses_simulator(self.environment):
             messages = self.serializer.sim_serialize(output)
             self.commander.send_to_sim(team_name, messages)
 
-        if self.environment != "sim-only":
+        if _uses_robot_multicast(self.environment):
             messages = self.serializer.robot_serialize(output)
             self.commander.send_to_robots(team_name, messages)
 
     def reset_sim(self):
         """Reset the simulator: move all players to initial poses, reset ball, restart play."""
+        if _uses_embedded_simulator(self.environment):
+            self.commander.reset_sim()
+            return
+
         import time
 
         # The Listener (game_watcher) holds the monitor socket which has authority
@@ -122,10 +133,10 @@ class Networker:
 
     def shutdown(self):
         """Cleanly shutdown all networking connections."""
-        if self.environment in ["sim-only", "sim-mixed"]:
+        if _uses_simulator(self.environment):
             self.commander.disconnect_from_sim()
             self.game_watcher.disconnect_from_sim()
         else:
             self.game_watcher.disconnect_from_camera()
-        if self.environment != "sim-only":
+        if _uses_robot_multicast(self.environment):
             self.commander.stop_robots()

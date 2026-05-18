@@ -15,6 +15,7 @@ Examples:
   python launch_train.py --num-envs 2 --base-port 7000 --monitor
   python launch_train.py --num-envs 3 --trainer qlearning -- --episodes 5000 --lr 1e-3
   python launch_train.py --num-envs 2 --sim-cmd "rcssserver" --sim-port-flag "server::port="
+  python launch_train.py --num-envs 2 --env sim-embedded --trainer discrete_ppo
 """
 
 from __future__ import annotations
@@ -53,6 +54,14 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         "--port-stride", type=int, default=10,
         help="Port gap between consecutive envs (default: 10, minimum: 3). "
              "Must be large enough so player and trainer ports do not overlap.",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"],
+        default="sim-only",
+        help="Environment mode forwarded to train.py (default: sim-only). "
+             "sim-embedded runs the synchronous embedded simulator in-process "
+             "and does not launch external rcssserver instances.",
     )
 
     # Simulator / monitor commands
@@ -232,75 +241,82 @@ def main() -> int:
     all_procs: list[subprocess.Popen] = []
 
     print(
-        f"[launcher] Starting {args.num_envs} simulator(s) "
-        f"(base-port={args.base_port}, stride={args.port_stride})",
+        f"[launcher] Starting launcher for env={args.env} "
+        f"(num-envs={args.num_envs}, base-port={args.base_port}, stride={args.port_stride})",
         flush=True,
     )
 
     # ------------------------------------------------------------------
     # 1. Launch simulator (and optional monitor) for each environment
     # ------------------------------------------------------------------
-    try:
-        for idx in range(args.num_envs):
-            port = player_port(args.base_port, args.port_stride, idx)
+    if args.env == "sim-embedded":
+        if args.monitor:
+            print("[launcher] --monitor is ignored for sim-embedded.", file=sys.stderr)
+    else:
+        try:
+            for idx in range(args.num_envs):
+                port = player_port(args.base_port, args.port_stride, idx)
 
-            # Build per-instance sim command with the correct player port
-            try:
-                sim_parts = build_sim_command(args.sim_cmd, args.sim_port_flag, port)
-            except ValueError as exc:
-                print(f"[launcher] {exc}", file=sys.stderr)
-                stop_processes(all_procs)
-                return 1
+                # Build per-instance sim command with the correct player port
+                try:
+                    sim_parts = build_sim_command(args.sim_cmd, args.sim_port_flag, port)
+                except ValueError as exc:
+                    print(f"[launcher] {exc}", file=sys.stderr)
+                    stop_processes(all_procs)
+                    return 1
 
-            try:
-                sim_proc = subprocess.Popen(sim_parts)
-            except FileNotFoundError:
-                print(command_missing_message(args.sim_cmd, "--sim-cmd"), file=sys.stderr)
-                stop_processes(all_procs)
-                return 1
+                try:
+                    sim_proc = subprocess.Popen(sim_parts)
+                except FileNotFoundError:
+                    print(command_missing_message(args.sim_cmd, "--sim-cmd"), file=sys.stderr)
+                    stop_processes(all_procs)
+                    return 1
 
-            all_procs.append(sim_proc)
-            print(f"[launcher] env {idx}: sim pid={sim_proc.pid}  port={port}")
+                all_procs.append(sim_proc)
+                print(f"[launcher] env {idx}: sim pid={sim_proc.pid}  port={port}")
 
-            # Launch optional monitor for this env (monitor reads trainer port = port+1)
-            if args.monitor:
-                if not monitor_parts:
-                    print("[launcher] --monitor-cmd is empty, skipping monitor", file=sys.stderr)
-                else:
-                    monitor_cmd = monitor_parts + [
-                        "--server-host",
-                        "127.0.0.1",
-                        "--server-port",
-                        str(port),
-                    ]
-                    try:
-                        mon_proc = subprocess.Popen(monitor_cmd)
-                    except FileNotFoundError:
-                        print(command_missing_message(args.monitor_cmd, "--monitor-cmd"), file=sys.stderr)
-                        stop_processes(all_procs)
-                        return 1
-                    all_procs.append(mon_proc)
-                    print(f"[launcher] env {idx}: monitor pid={mon_proc.pid}")
+                # Launch optional monitor for this env (monitor reads trainer port = port+1)
+                if args.monitor:
+                    if not monitor_parts:
+                        print("[launcher] --monitor-cmd is empty, skipping monitor", file=sys.stderr)
+                    else:
+                        monitor_cmd = monitor_parts + [
+                            "--server-host",
+                            "127.0.0.1",
+                            "--server-port",
+                            str(port),
+                        ]
+                        try:
+                            mon_proc = subprocess.Popen(monitor_cmd)
+                        except FileNotFoundError:
+                            print(command_missing_message(args.monitor_cmd, "--monitor-cmd"), file=sys.stderr)
+                            stop_processes(all_procs)
+                            return 1
+                        all_procs.append(mon_proc)
+                        print(f"[launcher] env {idx}: monitor pid={mon_proc.pid}")
 
-            # Small delay between sequential sim launches to avoid port race
-            if idx < args.num_envs - 1:
-                time.sleep(args.sim_delay)
+                # Small delay between sequential sim launches to avoid port race
+                if idx < args.num_envs - 1:
+                    time.sleep(args.sim_delay)
 
-    except KeyboardInterrupt:
-        print("\n[launcher] Interrupted during sim launch. Stopping...", file=sys.stderr)
-        stop_processes(all_procs)
-        return 130
+        except KeyboardInterrupt:
+            print("\n[launcher] Interrupted during sim launch. Stopping...", file=sys.stderr)
+            stop_processes(all_procs)
+            return 130
 
     # ------------------------------------------------------------------
     # 2. Wait for simulators to initialise before connecting the trainer
     # ------------------------------------------------------------------
-    print(f"[launcher] Waiting {args.sim_wait}s for simulators to initialise...")
-    try:
-        time.sleep(args.sim_wait)
-    except KeyboardInterrupt:
-        print("\n[launcher] Interrupted during wait. Stopping...", file=sys.stderr)
-        stop_processes(all_procs)
-        return 130
+    if args.env == "sim-embedded":
+        print("[launcher] sim-embedded selected; skipping external simulator startup wait.")
+    else:
+        print(f"[launcher] Waiting {args.sim_wait}s for simulators to initialise...")
+        try:
+            time.sleep(args.sim_wait)
+        except KeyboardInterrupt:
+            print("\n[launcher] Interrupted during wait. Stopping...", file=sys.stderr)
+            stop_processes(all_procs)
+            return 130
 
     # ------------------------------------------------------------------
     # 3. Build and launch the training command
@@ -309,6 +325,7 @@ def main() -> int:
         args.python,
         args.train_script,
         "--trainer", args.trainer,
+        "--env", args.env,
         "--num_envs", str(args.num_envs),
         "--sim_player_port", str(args.base_port),
         "--sim_port_stride", str(args.port_stride),

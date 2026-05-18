@@ -24,6 +24,7 @@ parser.add_argument("--team_config", type=str, default="team_config.json",
 
 parser.add_argument("--env", choices=[
     "sim-only",        # one or both teams in simulator
+    "sim-embedded",    # one or both teams in the synchronous embedded simulator
     "sim-mixed",       # one or both teams - simulator + physical robots  
     "field-practice",  # one or both teams - camera + physical robots
     "field-tournament" # our team only - camera + physical robots
