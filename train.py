@@ -207,6 +207,7 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
             "save_path": args.save_path or "models/td3_jal_policy.zip",
             "save_interval": args.save_interval,
             "load_model": args.load_model,
+            "policy_config": args.policy_config,
             "model_params": {
                 "learning_rate": 0.001,
                 "buffer_size": 100000,
@@ -413,6 +414,8 @@ Examples:
                         help="Save model every N episodes/timesteps")
     parser.add_argument("--load_model", type=str, default=None,
                         help="Path to load a pre-trained model (optional)")
+    parser.add_argument("--policy_config", type=str, default=None,
+                        help="Path to a JSON policy catalog for frozen teammate/opponent inference")
     parser.add_argument("--resume_checkpoint", type=str, default=None,
                         help="Path to a checkpoint to resume training from. "
                              "The original checkpoint is never modified; new "
@@ -473,10 +476,18 @@ Examples:
                     config[key] = value
                 else:
                     config.setdefault(key, runtime_defaults[key])
+
+            if args.policy_config is not None:
+                config["policy_config"] = load_config(args.policy_config)
+            elif isinstance(config.get("policy_config"), str):
+                config["policy_config"] = load_config(config["policy_config"])
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
             config = create_default_config(trainer_type, args)
+
+            if args.policy_config is not None:
+                config["policy_config"] = load_config(args.policy_config)
 
         num_envs = int(config.get("num_envs", 1))
         sim_port_stride = int(config.get("sim_port_stride", 10))

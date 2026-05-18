@@ -33,12 +33,13 @@ Three methods are overridden relative to JALTeamEnv:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from gymnasium import spaces
 
 from ai_interface.envs.JAL_env import JALTeamEnv
+from networking.data_utils import GameState
 
 
 # Weights for the HER-specific reward terms added on top of the parent reward.
@@ -53,6 +54,7 @@ class JALHEREnv(JALTeamEnv):
     def __init__(
         self,
         her_distance_threshold: float = 0.1,
+        aux_team_command_providers: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -89,6 +91,7 @@ class JALHEREnv(JALTeamEnv):
         # Tracks previous ball distance to _desired_goal (normalized) for the
         # progress shaping term in _calculate_reward. Reset each episode.
         self._prev_ball_to_desired_dist: Optional[float] = None
+        self.aux_team_command_providers = dict(aux_team_command_providers or {})
 
     # ------------------------------------------------------------------
     # reset — clear the extra HER episode state
@@ -98,6 +101,48 @@ class JALHEREnv(JALTeamEnv):
         obs, info = super().reset(seed=seed, options=options)
         self._prev_ball_to_desired_dist = None
         return obs, info
+
+    def step(
+        self,
+        action: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """Step the HER env while optionally sending frozen-policy teammates."""
+        self.current_step += 1
+
+        current_game_state = self._get_game_state(
+            retries=self.state_retry_count,
+            sleep_s=self.state_retry_sleep_s,
+        )
+
+        aux_team_commands = self._build_aux_team_commands(current_game_state)
+        commands, action_info = self._action_to_commands(action, current_game_state)
+
+        self.episode_actions.append(action_info["action_type"])
+
+        for team_name, team_commands in aux_team_commands.items():
+            self._send_team_commands(team_name, team_commands)
+        self._send_commands(commands)
+
+        next_game_state = self._get_game_state(
+            retries=self.state_retry_count,
+            sleep_s=self.state_retry_sleep_s,
+        )
+        obs = self._game_state_to_obs(next_game_state)
+
+        reward = self._calculate_reward(next_game_state)
+        invalid_action_count = int(action_info.get("invalid_action_count", 0))
+        if invalid_action_count > 0 and self.invalid_action_penalty > 0.0:
+            reward -= self.invalid_action_penalty * invalid_action_count
+        self.total_rewards += reward
+        terminated = False
+        truncated = self.current_step >= self.max_steps
+        info = {
+            "action_info": action_info,
+            "reward": reward,
+            "total_reward": self.total_rewards,
+            "invalid_action_count": invalid_action_count,
+        }
+        return obs, reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
     # _game_state_to_obs override
@@ -125,6 +170,39 @@ class JALHEREnv(JALTeamEnv):
             "achieved_goal": achieved_goal,
             "desired_goal":  self._desired_goal.copy(),
         }
+
+    def _send_team_commands(self, team_name: str, commands: List[str]):
+        """Send commands for a specific team controller."""
+        try:
+            if not commands:
+                return
+
+            serialized_commands = self._preprocess_commands_for_send(commands)
+            self.networker.execute_ai_output(serialized_commands, team_name)
+        except Exception as e:
+            self.logger.error("Error sending commands for team %s: %s", team_name, e)
+
+    def _build_aux_team_commands(self, game_state: Optional[GameState]) -> Dict[str, List[str]]:
+        """Build commands for any auxiliary frozen/scripted team controllers."""
+        if game_state is None or not self.aux_team_command_providers:
+            return {}
+
+        aux_team_commands: Dict[str, List[str]] = {}
+        for team_name, provider in self.aux_team_command_providers.items():
+            if team_name == self.team_name:
+                continue
+
+            try:
+                team_commands = provider.predict_commands(game_state)
+                if team_commands:
+                    aux_team_commands[team_name] = team_commands
+            except Exception as e:
+                self.logger.error("Aux team controller failed for %s: %s", team_name, e)
+                fallback_count = int(getattr(provider, "num_robots", 0))
+                if fallback_count > 0:
+                    aux_team_commands[team_name] = ["turn 0"] * fallback_count
+
+        return aux_team_commands
 
     # ------------------------------------------------------------------
     # _calculate_reward override — HER-extended live reward

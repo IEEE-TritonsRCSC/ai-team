@@ -21,6 +21,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from ai_interface.envs.JAL_her_env import JALHEREnv
 from ai_interface.trainers.base_trainer import BaseTrainer
+from ai_interface.trainers.policy_control import build_aux_team_command_providers, load_json_config
 from networking.networker import Networker, TeamInfo
 
 
@@ -72,6 +73,7 @@ class TD3JALHERTrainer(BaseTrainer):
         self.model: Optional[TD3] = None
 
         self.curriculum = config.get("curriculum", {})
+        self.policy_config = load_json_config(config.get("policy_config"))
         # Track which obs/action dim the live model was built for, so we can
         # detect curriculum stage transitions and rebuild the model when
         # num_robots changes (the network shape would otherwise be wrong).
@@ -82,9 +84,19 @@ class TD3JALHERTrainer(BaseTrainer):
     # Environment
     # ------------------------------------------------------------------
 
-    def setup_environment(self, num_robots: int, robot_ids: List[int]) -> JALHEREnv:
-        team_infos = self._load_team_config(self.config["team_config"])
-        team_name = self.config.get("team_name") or team_infos[0].name
+    def setup_environment(
+        self,
+        num_robots: int,
+        robot_ids: List[int],
+        team_config_path: Optional[str] = None,
+        stage_config: Optional[Dict[str, Any]] = None,
+    ) -> JALHEREnv:
+        team_infos = self._load_team_config(team_config_path or self.config["team_config"])
+        team_name = (
+            (stage_config or {}).get("team_name")
+            or self.config.get("team_name")
+            or team_infos[0].name
+        )
 
         sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
         self.networker = Networker(
@@ -93,6 +105,13 @@ class TD3JALHERTrainer(BaseTrainer):
             sim_host=sim_host,
             sim_player_port=sim_player_port,
             sim_trainer_port=sim_trainer_port,
+        )
+
+        aux_team_command_providers = build_aux_team_command_providers(
+            self.policy_config,
+            self.networker,
+            device=self.device,
+            stage_config=stage_config,
         )
 
         self.env = JALHEREnv(
@@ -104,6 +123,7 @@ class TD3JALHERTrainer(BaseTrainer):
             non_robot_obs_dim=int(self.config.get("non_robot_obs_dim", 4)),
             max_steps=int(self.config.get("max_steps", 200)),
             debug=bool(self.config.get("debug", False)),
+            aux_team_command_providers=aux_team_command_providers,
         )
 
         # obs_dim is stored on the env; observation_space is now a Dict
@@ -211,11 +231,29 @@ class TD3JALHERTrainer(BaseTrainer):
         num_robots = int(stage_config.get("num_robots", 1))
         robot_ids  = stage_config.get("robot_ids", list(range(1, num_robots + 1)))
         timesteps  = int(stage_config.get("timesteps", 200_000))
+        team_config_path = stage_config.get("team_config", self.config["team_config"])
+        stage_signature = (
+            stage_name,
+            team_config_path,
+            tuple(robot_ids),
+            tuple(
+                sorted(
+                    str(item)
+                    for item in stage_config.get("aux_team_policies", [])
+                )
+            ),
+        )
 
         self.logger.info("Starting %s — %d robot(s) %s", stage_name, num_robots, robot_ids)
 
-        if self.env is None or self.env.num_robots != num_robots:
-            self.env = self.setup_environment(num_robots, robot_ids)
+        if self.env is None or getattr(self, "_current_stage_signature", None) != stage_signature:
+            self.env = self.setup_environment(
+                num_robots,
+                robot_ids,
+                team_config_path=team_config_path,
+                stage_config=stage_config,
+            )
+            self._current_stage_signature = stage_signature
 
         # Rebuild the model whenever num_robots changes: the policy/Q-net
         # input dim is tied to obs_dim, which depends on num_robots.

@@ -27,6 +27,7 @@
   "non_robot_obs_dim": 4,
   "max_steps": 200,
   "her_distance_threshold": 0.1,
+  "policy_config": "configs/td3_jal_her_policy_config.json",
   "learn_batch_timesteps": 2048,
   "save_interval": 10000,
   "save_path": "models/td3_jal_her",

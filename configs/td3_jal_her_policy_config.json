@@ -1,0 +1,16 @@
+{
+  "policy_catalog": {
+    "example_frozen_policy": {
+      "model_path": "models/example_frozen_policy.zip",
+      "team_name": "OpponentTeam",
+      "robot_ids": [1],
+      "obs_mode": "her",
+      "obs_dim_per_robot": 8,
+      "non_robot_obs_dim": 4,
+      "her_distance_threshold": 0.1,
+      "max_steps": 200,
+      "debug": false,
+      "deterministic": true
+    }
+  }
+}
