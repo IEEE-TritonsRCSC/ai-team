@@ -304,6 +304,36 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
                 "max_robots": 3
             },
         }
+    elif trainer_type == "ppo_jal_curriculum":
+        return {
+            **base_config,
+            "obs_dim_per_robot": 9,
+            "non_robot_obs_dim": 4,
+            "max_steps": args.max_steps,
+            "save_path": args.save_path or "models/ppo_jal_curriculum",
+            "save_interval": args.save_interval,
+            "load_model": args.load_model,
+            "model_params": {
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "target_kl": 0.015,
+                "n_epochs": 10,
+                "minibatch_size": 256,
+                "rollout_size": 4096,
+                "learning_rate_initial": 3e-4,
+                "learning_rate_final": 1e-4,
+                "ent_coef_initial": 0.05,
+                "ent_coef_final": 0.005,
+                "vf_coef": 0.5,
+                "max_grad_norm": 0.5,
+                "value_clip_range": 0.2,
+                "advantage_clip": 5.0,
+                "encoder_hidden": [256, 256],
+                "entropy_tripwire": 0.5,
+                "kl_lr_halve_factor": 2.0,
+            },
+        }
     else:
         raise ValueError(f"Unknown trainer type: {trainer_type}")
 
@@ -323,6 +353,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "td3_jal": ("ai_interface.trainers.td3_jal_trainer", "TD3JALTrainer"),
         "td3_jal_curriculum": ("ai_interface.trainers.td3_jal_curriculum_trainer", "TD3JALCurriculumTrainer"),
         "td3_jal_her": ("ai_interface.trainers.td3_jal_her_trainer", "TD3JALHERTrainer"),
+        "ppo_jal_curriculum": ("ai_interface.trainers.ppo_jal_curriculum_trainer", "PPOJALCurriculumTrainer"),
     }
     
     if trainer_type not in trainers:
@@ -373,7 +404,7 @@ Examples:
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
     parser.add_argument("--trainer", type=str,
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "qlearning"],
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "ppo_jal_curriculum", "qlearning"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options
@@ -458,48 +489,52 @@ Examples:
     args = parser.parse_args()
     
     try:
-        # Load configuration
+        # Load configuration. Resolution order:
+        #   1. Explicit --config <path>
+        #   2. Auto-discover configs/<trainer_type>_config.json if it exists
+        #      (avoids needing `-- --config ...` after launch_train.py args
+        #      when a canonical per-trainer config already lives in configs/)
+        #   3. Fall back to create_default_config(trainer_type)
+        auto_config_path = Path(__file__).parent / "configs" / f"{args.trainer}_config.json"
         if args.config:
             print(f"Loading configuration from {args.config}")
             config = load_config(args.config)
             trainer_type = config.get("trainer_type", args.trainer)
-            # Backfill runtime defaults for older config files, while allowing
-            # launcher/CLI runtime values to override stale config values.
-            runtime_overrides = {
-                "num_envs": args.num_envs,
-                "sim_host": args.sim_host,
-                "sim_player_port": args.sim_player_port,
-                "sim_port_stride": args.sim_port_stride,
-            }
-            runtime_defaults = {
-                "num_envs": 1,
-                "sim_host": "127.0.0.1",
-                "sim_player_port": 6000,
-                "sim_port_stride": 10,
-            }
-            for key, value in runtime_overrides.items():
-                if value is not None:
-                    config[key] = value
-                else:
-                    config.setdefault(key, runtime_defaults[key])
 
             if args.policy_config is not None:
                 config["policy_config"] = load_config(args.policy_config)
             elif isinstance(config.get("policy_config"), str):
                 config["policy_config"] = load_config(config["policy_config"])
 
-            # Backfill runtime defaults for older config files.
-            config.setdefault("num_envs", args.num_envs)
-            config.setdefault("sim_host", args.sim_host)
-            config.setdefault("sim_player_port", args.sim_player_port)
-            config.setdefault("sim_port_stride", args.sim_port_stride)
+        elif auto_config_path.is_file():
+            print(f"Auto-loading configuration from {auto_config_path}")
+            config = load_config(str(auto_config_path))
+            trainer_type = config.get("trainer_type", args.trainer)
         else:
             print(f"Using command line configuration for {args.trainer} trainer")
             trainer_type = args.trainer
             config = create_default_config(trainer_type, args)
 
-            if args.policy_config is not None:
-                config["policy_config"] = load_config(args.policy_config)
+        # Backfill runtime defaults regardless of config source. Launcher/CLI
+        # runtime values override config values when explicitly provided;
+        # otherwise defaults fill in for older config files.
+        runtime_overrides = {
+            "num_envs": args.num_envs,
+            "sim_host": args.sim_host,
+            "sim_player_port": args.sim_player_port,
+            "sim_port_stride": args.sim_port_stride,
+        }
+        runtime_defaults = {
+            "num_envs": 1,
+            "sim_host": "127.0.0.1",
+            "sim_player_port": 6000,
+            "sim_port_stride": 10,
+        }
+        for key, value in runtime_overrides.items():
+            if value is not None:
+                config[key] = value
+            else:
+                config.setdefault(key, runtime_defaults[key])
 
         num_envs = int(config.get("num_envs", 1))
         sim_port_stride = int(config.get("sim_port_stride", 10))

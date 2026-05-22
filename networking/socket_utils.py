@@ -24,7 +24,7 @@ BUFFER_SIZE = 1536
 LOCALHOST_IP = "127.0.0.1"
 DEFAULT_SIM_PLAYER_PORT = 6000
 DEFAULT_SIM_TRAINER_PORT = 6001
-INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) before_kick_off\)"
+INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) \w+\)"
 PLAYMODE_REGEX = r"\(hear \d+ referee (\w+)\)"
 
 # Multicast settings for real robots

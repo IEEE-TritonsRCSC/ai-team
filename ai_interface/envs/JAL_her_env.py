@@ -45,7 +45,17 @@ from networking.data_utils import GameState
 # Weights for the HER-specific reward terms added on top of the parent reward.
 _HER_GOAL_PROGRESS_WEIGHT: float = 2.0   # scales ball-toward-desired-goal progress
 _HER_GOAL_PROGRESS_CLIP:   float = 0.3   # max/min clamp on that progress per step
-_HER_GOAL_REACHED_BONUS:   float = 10.0  # one-shot bonus when ball enters threshold
+_HER_GOAL_REACHED_BONUS:   float = 0.0   # disabled — see note below
+# Disabled 2026-05-19: the +10 bonus was firing whenever the ball came within
+# 0.1 (normalized) of the desired goal (x=1.0, y=0.0). In raw field units that
+# is a ~4.5×3.0 ellipse around (45, 0) — covering the entire penalty area in
+# front of the goal mouth, not just the goal itself. On the 200k stage1_180
+# run the off-target-but-close kicks (ball ending at e.g. (44, 4.5)) were
+# being reinforced as "near-goal achievement" worth +10, on top of the
+# parent's +150 goal reward only firing for the true 5-unit-half-height
+# mouth. Net effect: a strong gradient toward "kick into the corner of the
+# penalty area" — exactly the failure mode we observed (75% off-target).
+# Killing this bonus removes the false attractor; goal reward stays sharp.
 
 
 class JALHEREnv(JALTeamEnv):

@@ -18,10 +18,10 @@ class RewardConfig:
     invalid_context_reward: float = -0.1
     approach_clip: float = 0.5
     approach_weight: float = 1.8
-    goal_progress_clip: float = 0.4
+    goal_progress_clip: float = 2.0
     goal_progress_weight: float = 3.0
-    has_ball_bonus: float = 0.8
-    near_ball_bonus: float = 0.2
+    has_ball_bonus: float = 0.1
+    near_ball_bonus: float = 0.05
     near_ball_scale: float = 1.5
     opponent_near_ball_penalty: float = -0.5
     opponent_near_ball_threshold: float = 5.0
@@ -31,7 +31,33 @@ class RewardConfig:
     robot_out_of_bounds_penalty: float = 3.0
     ball_out_of_bounds_penalty: float = 1.5
     step_bonus: float = 0.03
-    goal_half_height: float = 3.66
+    goal_half_height: float = 5.0  # SSL Div B goal width=1000mm → 10 sim units → half=5.0
+    ball_speed_bonus_weight: float = 2.0
+    ball_speed_threshold: float = 0.2
+    ball_speed_clip: float = 2.0
+    alignment_weight: float = 3.0
+    alignment_near_ball_only: bool = True
+    # Stricter gate: when True, the alignment reward fires only while the
+    # robot actually possesses the ball (kickable range), not merely while
+    # it is "near" it. Overrides alignment_near_ball_only.
+    alignment_has_ball_only: bool = False
+    # Per-step clip on the cos-delta used for alignment reward. cos itself is
+    # in [-1, 1] so the delta is in [-2, 2]; clipping at 1.0 prevents reward
+    # spikes from large single-step rotations.
+    alignment_clip: float = 1.0
+    # One-shot bonus added by JAL_env when the model picks the `kick` action
+    # while having the ball. Scaled by max(0, cos)^4 where cos is the angle
+    # from the robot's facing direction to the goal. cos^4 (instead of cos^2)
+    # sharpens aim discrimination — a kick at ~45° off goal earns only 24%
+    # of the bonus instead of 49%. Cannot be exploited by spinning because
+    # it only fires on a committed kick action.
+    kick_aim_bonus_weight: float = 0.0
+    # Hard penalty applied (one-shot, by JAL_env) when a kick fires but its
+    # straight-line projection misses the goal mouth — i.e. |predicted_y| >
+    # goal_half_height. Pushes the EV of unaimed kicks negative so the policy
+    # cannot collect zero-reward "free kicks" by firing on step 1 of every
+    # episode; forces it to delay-and-aim. Set per stage via reward_config_overrides.
+    bad_aim_kick_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +73,8 @@ class RewardInputs:
     opponent_positions: Tuple[Tuple[float, float], ...] = ()
     prev_ball_dist: Optional[float] = None
     prev_ball_to_goal_dist: Optional[float] = None
+    prev_ball_pos: Optional[Tuple[float, float]] = None
+    prev_facing_goal_cos: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +85,13 @@ class RewardIntermediates:
     ball_to_goal_dist: float
     approach: Optional[float]
     goal_progress: Optional[float]
+    ball_speed: Optional[float]
+    facing_goal_cos: Optional[float]
+    facing_goal_cos_delta: Optional[float]
+    # Predicted y-coordinate at which the ball would cross x=FIELD_X[1] if it
+    # continued on its current linear velocity. None when ball isn't moving
+    # forward (vx <= 0) or when prev_ball_pos is unavailable.
+    predicted_y_at_goal_line: Optional[float]
     has_ball: bool
     near_ball: bool
     nearest_opponent_ball_dist: Optional[float]
@@ -105,7 +140,7 @@ def calculate_reward_intermediates(
         config = RewardConfig()
 
     bx, by = inputs.ball_pos
-    rx, ry, _ = inputs.self_pose_rad
+    rx, ry, theta = inputs.self_pose_rad
 
     ball_dist = float(inputs.ball_dist)
     ball_to_goal_dist = float(math.hypot(FIELD_X[1] - bx, -by))
@@ -124,6 +159,37 @@ def calculate_reward_intermediates(
             )
         )
 
+    ball_speed = None
+    predicted_y_at_goal_line: Optional[float] = None
+    if inputs.prev_ball_pos is not None:
+        pbx, pby = inputs.prev_ball_pos
+        vx = bx - pbx
+        vy = by - pby
+        ball_speed = float(math.hypot(vx, vy))
+        # Project ball's current velocity to the goal line (x=FIELD_X[1]).
+        # Only meaningful when the ball is moving toward the goal (vx > 0).
+        if vx > 1e-6:
+            predicted_y_at_goal_line = float(by + (FIELD_X[1] - bx) * (vy / vx))
+
+    facing_goal_cos = None
+    to_goal_x = FIELD_X[1] - rx
+    to_goal_y = -ry
+    to_goal_norm = math.hypot(to_goal_x, to_goal_y)
+    if to_goal_norm > 1e-6:
+        facing_goal_cos = float(
+            (math.cos(theta) * to_goal_x + math.sin(theta) * to_goal_y) / to_goal_norm
+        )
+
+    facing_goal_cos_delta = None
+    if facing_goal_cos is not None and inputs.prev_facing_goal_cos is not None:
+        facing_goal_cos_delta = float(
+            np.clip(
+                facing_goal_cos - inputs.prev_facing_goal_cos,
+                -config.alignment_clip,
+                config.alignment_clip,
+            )
+        )
+
     nearest_opponent_ball_dist = None
     if inputs.opponent_positions:
         nearest_opponent_ball_dist = min(
@@ -139,6 +205,10 @@ def calculate_reward_intermediates(
         ball_to_goal_dist=ball_to_goal_dist,
         approach=approach,
         goal_progress=goal_progress,
+        ball_speed=ball_speed,
+        facing_goal_cos=facing_goal_cos,
+        facing_goal_cos_delta=facing_goal_cos_delta,
+        predicted_y_at_goal_line=predicted_y_at_goal_line,
         has_ball=bool(inputs.has_ball),
         near_ball=bool(ball_dist < inputs.kickable_dist * config.near_ball_scale),
         nearest_opponent_ball_dist=nearest_opponent_ball_dist,
@@ -165,11 +235,47 @@ def calculate_reward(
 
     reward = 0.0
 
-    if intermediates.approach is not None:
+    if intermediates.approach is not None and not intermediates.has_ball:
         reward += intermediates.approach * config.approach_weight
 
     if intermediates.goal_progress is not None:
         reward += intermediates.goal_progress * config.goal_progress_weight
+
+    # Aim-gated ball-speed reward: a fast ball only counts toward reward to the
+    # extent that its current velocity would carry it through the goal mouth.
+    # `aim_quality` is 1.0 if the linear projection lands at y=0 (dead center),
+    # decays linearly to 0 at |y|=goal_half_height, and is 0 beyond that. This
+    # makes "kick hard but misaim" worth almost nothing, so the policy can't
+    # collect intermediate speed reward without also aiming.
+    if intermediates.ball_speed is not None and intermediates.ball_speed > config.ball_speed_threshold:
+        if intermediates.predicted_y_at_goal_line is None:
+            aim_quality = 0.0  # ball not moving toward goal
+        else:
+            aim_quality = max(
+                0.0,
+                1.0 - abs(intermediates.predicted_y_at_goal_line) / config.goal_half_height,
+            )
+        reward += (
+            min(intermediates.ball_speed, config.ball_speed_clip)
+            * config.ball_speed_bonus_weight
+            * aim_quality
+        )
+
+    # Alignment reward is now delta-based: reward the *improvement* in cos
+    # this step, not the absolute cos value. A robot that stands still next
+    # to the ball facing the goal gets delta=0 (no harvest), while a robot
+    # that actively turns toward the goal gets positive reward proportional
+    # to the cos improvement. Total reward for ending up well-aligned is
+    # unchanged, but idle-camp exploits are structurally eliminated.
+    if intermediates.facing_goal_cos_delta is not None:
+        if config.alignment_has_ball_only:
+            fire_alignment = intermediates.has_ball
+        elif config.alignment_near_ball_only:
+            fire_alignment = intermediates.near_ball
+        else:
+            fire_alignment = True
+        if fire_alignment:
+            reward += intermediates.facing_goal_cos_delta * config.alignment_weight
 
     if intermediates.has_ball:
         reward += config.has_ball_bonus

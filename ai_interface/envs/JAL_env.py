@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple, Dict, Any, List
 import logging
+import math
 import time
 
 import gymnasium as gym
@@ -16,10 +17,10 @@ from gymnasium import spaces
 import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
-from ai_interface.utils.basic_commands import goto
+from ai_interface.utils.basic_commands import goto, approach_ball
 from ai_interface.constants.field_constants import *
 from ai_interface.constants.player_constants import *
-from ai_interface.envs.reward import RewardInputs, evaluate_reward, extract_opponent_positions
+from ai_interface.envs.reward import RewardConfig, RewardInputs, evaluate_reward, extract_opponent_positions
 from networking.networker import Networker
 from networking.data_utils import GameState
 
@@ -29,7 +30,7 @@ class JALTeamEnv(gym.Env):
 
     def __init__(
         self, 
-        networker: Networker,  
+        networker: Networker,
         team_name: str,
         robot_ids: Optional[List[int]] = None,
         obs_dim_per_robot: int = 8,
@@ -42,11 +43,21 @@ class JALTeamEnv(gym.Env):
         position_noise_std: float = 0.05,
         invalid_action_penalty: float = 0.2,
         state_dependent_action_selection: bool = False,
+        disabled_actions: Optional[List[str]] = None,
+        spawn_robot_at_ball: bool = False,
+        spawn_offset_behind_ball: float = 1.0,
+        random_ball_x: bool = False,
+        random_ball_x_range: Tuple[float, float] = (5.0, 30.0),
+        random_ball_y: bool = False,
+        random_ball_y_range: Tuple[float, float] = (-3.0, 3.0),
+        random_spawn_theta: bool = False,
+        random_spawn_theta_range_deg: Tuple[float, float] = (-45.0, 45.0),
+        reward_config_overrides: Optional[Dict[str, float]] = None,
         some_arg=None
         ):
-        
+
         super().__init__()
-        
+
         self.networker = networker
         self.team_name = team_name
         if robot_ids is None:
@@ -61,6 +72,40 @@ class JALTeamEnv(gym.Env):
         self.position_noise_std = float(position_noise_std)
         self.invalid_action_penalty = max(0.0, float(invalid_action_penalty))
         self.state_dependent_action_selection = bool(state_dependent_action_selection)
+
+        # Stage-specific knobs
+        self.disabled_actions: List[str] = list(disabled_actions) if disabled_actions else []
+        self.spawn_robot_at_ball: bool = bool(spawn_robot_at_ball)
+        self.spawn_offset_behind_ball: float = float(spawn_offset_behind_ball)
+        self.random_ball_x: bool = bool(random_ball_x)
+        self.random_ball_x_range: Tuple[float, float] = (
+            float(random_ball_x_range[0]),
+            float(random_ball_x_range[1]),
+        )
+        self.random_ball_y: bool = bool(random_ball_y)
+        self.random_ball_y_range: Tuple[float, float] = (
+            float(random_ball_y_range[0]),
+            float(random_ball_y_range[1]),
+        )
+        self.random_spawn_theta: bool = bool(random_spawn_theta)
+        self.random_spawn_theta_range_deg: Tuple[float, float] = (
+            float(random_spawn_theta_range_deg[0]),
+            float(random_spawn_theta_range_deg[1]),
+        )
+
+        # Build a RewardConfig with optional overrides from caller. Field names
+        # must match the RewardConfig dataclass attributes in reward.py.
+        if reward_config_overrides:
+            # Filter to known fields to avoid TypeError on unknown keys.
+            known_fields = set(RewardConfig.__dataclass_fields__.keys())
+            unknown = [k for k in reward_config_overrides if k not in known_fields]
+            if unknown:
+                raise ValueError(f"Unknown reward_config_overrides keys: {unknown}")
+            self.reward_config = RewardConfig(**{
+                k: v for k, v in reward_config_overrides.items() if k in known_fields
+            })
+        else:
+            self.reward_config = RewardConfig()
         
         
         # Create a logger for this environment
@@ -71,6 +116,10 @@ class JALTeamEnv(gym.Env):
         # Observation design:
         # global: [ball_x, ball_y, ball_vx, ball_vy] (4)
         # per robot: [robot_x, robot_y, robot_theta, robot_vx, robot_vy, is_dribbling, start_dribble_x, start_dribble_y] (8)
+        # Matches the 58% checkpoint (`stage1_6_final_58pct.zip`) obs shape so
+        # warm-starting from that model is straight-forward; the cone-related
+        # cos_to_ball / cos_to_goal / sin_to_goal channels were removed along
+        # with the kicker-cone gate (2026-05-20).
         self.obs_dim_per_robot = obs_dim_per_robot
         self.non_robot_obs_dim = non_robot_obs_dim
         self.obs_dim = obs_dim_per_robot * self.num_robots + non_robot_obs_dim
@@ -83,8 +132,14 @@ class JALTeamEnv(gym.Env):
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
         self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
         
-        # Action design per robot (8D): [goto_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
-        self.action_dim_per_robot = 8
+        # Action design per robot (9D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
+        # Matches the layout used to train `stage1_6_final_58pct.zip` so that
+        # checkpoint can be warm-started directly. In the 58% run only turn
+        # (slot 2) and kick (slot 3) were enabled, so those slots carry
+        # trained weights; goto / approach_ball / start_dribble / stop_dribble
+        # were masked and have effectively untrained weights. For stage1_9 we
+        # enable approach_ball alongside the already-trained turn/kick.
+        self.action_dim_per_robot = 9
         self.action_space = spaces.Box(
             low=-1.0, 
             high=1.0, 
@@ -95,6 +150,7 @@ class JALTeamEnv(gym.Env):
         # Episode tracking
         self.current_step = 0
         self.episode_num = 0
+        self._cached_game_state = None  # reused as current_game_state at next step start
         
         # Ball position history for estimate_ball_velocity()
         self.ball_pos_history: List[np.ndarray] = []
@@ -104,19 +160,36 @@ class JALTeamEnv(gym.Env):
         self.field_half_width = 45.0
         self.field_half_height = 30.0
 
-        self.kickable_dist = KICKABLE_MARGIN + BALL_SIZE / 2 + PLAYER_SIZE / 2
+        self.kickable_dist = KICKABLE_MARGIN + BALL_SIZE + PLAYER_SIZE
+        # Kicker cone gate removed (2026-05-20): the cone restriction caused
+        # both TD3 (turn=100% collapse) and PPO (flat 7.6% goal rate) to fail
+        # to learn. The 58% checkpoint trained without it, and rcssserver
+        # accepts kick commands regardless of orientation — re-add a
+        # physically realistic gate only once the simulator policy is solid.
 
         # Per-robot pose history for velocity estimation
         self.prev_robot_pose_by_id: Dict[int, np.ndarray] = {}
         self.prev_reward_ball_dist_by_id: Dict[int, float] = {}
         self.prev_reward_ball_to_goal_dist: Optional[float] = None
+        self.prev_reward_ball_pos: Optional[Tuple[float, float]] = None
+        self.prev_reward_facing_goal_cos_by_id: Dict[int, float] = {}
+        self._stopped_ball_counter: int = 0
 
         # Statistics
         self.total_rewards = 0.0
         self.episode_actions = []  # Track action distribution
         self._none_state_counter = 0
         
-        self.logger.info(f"Initialized JALTeamEnv for team '{team_name}' with robots {robot_ids}, num_robots={self.num_robots}, obs_dim={self.obs_dim}, action_dim={self.action_space.shape[0]}")
+        self.logger.info(
+            f"Initialized JALTeamEnv for team '{team_name}' with robots {robot_ids}, "
+            f"num_robots={self.num_robots}, obs_dim={self.obs_dim}, "
+            f"action_dim={self.action_space.shape[0]}, "
+            f"disabled_actions={self.disabled_actions}, "
+            f"spawn_robot_at_ball={self.spawn_robot_at_ball}, "
+            f"random_ball_x={self.random_ball_x}, "
+            f"random_ball_y={self.random_ball_y}, "
+            f"random_spawn_theta={self.random_spawn_theta}"
+        )
 
     def _select_action_index(
         self,
@@ -154,8 +227,65 @@ class JALTeamEnv(gym.Env):
         
         
         super().reset(seed=seed)
-        self.networker.reset_sim()
-        
+
+        # Curriculum ball position: start ball near the goal in early episodes
+        # so random kicks have a real chance of scoring (gives the model the
+        # sparse goal_reward signal it would otherwise never see). Gradually
+        # move ball toward centre as the model learns.
+        ball_pos = self._get_curriculum_ball_pos()
+
+        # Optionally pre-position the first robot adjacent to the ball, facing
+        # +x (opponent goal). Used in narrowed Stage 1 to isolate the kick
+        # primitive — the model already starts in kicking range, so it can
+        # only learn "kick" rather than "walk to ball, then kick".
+        player_poses_override = None
+        if self.networker is not None and (self.spawn_robot_at_ball or self.random_spawn_theta):
+            commander = getattr(self.networker, "commander", None)
+            default_poses = getattr(commander, "desired_init_poses", None) if commander else None
+            if default_poses:
+                first_obj_name, default_pose = default_poses[0]
+                if self.random_spawn_theta:
+                    theta_min, theta_max = self.random_spawn_theta_range_deg
+                    spawn_theta_deg = float(np.random.uniform(theta_min, theta_max))
+                else:
+                    spawn_theta_deg = 0.0
+                if self.spawn_robot_at_ball:
+                    # Place robot behind ball on the ball-goal axis so that
+                    # ball direction ≈ goal direction from robot's spawn pos.
+                    # Turning toward goal then also keeps the ball roughly in
+                    # front of the chassis, which matches the natural shooting
+                    # posture without requiring an explicit cone gate.
+                    bx, by = float(ball_pos[0]), float(ball_pos[1])
+                    goal_dx = float(GOAL_R[0]) - bx
+                    goal_dy = float(GOAL_R[1]) - by
+                    goal_dist = float(np.hypot(goal_dx, goal_dy))
+                    if goal_dist > 1e-6:
+                        goal_dir_x = goal_dx / goal_dist
+                        goal_dir_y = goal_dy / goal_dist
+                    else:
+                        goal_dir_x, goal_dir_y = 1.0, 0.0
+                    offset = float(self.spawn_offset_behind_ball)
+                    robot_x = bx - offset * goal_dir_x
+                    robot_y = by - offset * goal_dir_y
+                else:
+                    # Keep the default spawn x,y but optionally randomise theta.
+                    # rcssserver's dash command translates without rotating, so
+                    # a fixed spawn theta means approach_ball arrives at the
+                    # ball with the robot still facing its starting orientation
+                    # — which trivially lets "kick straight" score whenever the
+                    # default theta happens to point at goal. Randomising theta
+                    # forces the policy to use the turn skill after approach.
+                    robot_x = float(default_pose[0])
+                    robot_y = float(default_pose[1])
+                robot_pose = (robot_x, robot_y, spawn_theta_deg)
+                # Keep all other players at their default poses; only override the first.
+                player_poses_override = [(first_obj_name, robot_pose)] + list(default_poses[1:])
+
+        self.networker.reset_sim(ball_pos=ball_pos, player_poses_override=player_poses_override)
+        if ball_pos != (0.0, 0.0):
+            self.logger.info("Episode %d curriculum ball start: (%.1f, %.1f)",
+                             self.episode_num + 1, ball_pos[0], ball_pos[1])
+
         # Reset episode tracking
         self.current_step = 0
         self.episode_num += 1
@@ -170,13 +300,27 @@ class JALTeamEnv(gym.Env):
         self.prev_robot_pose_by_id = {}
         self.prev_reward_ball_dist_by_id = {}
         self.prev_reward_ball_to_goal_dist = None
+        self.prev_reward_ball_pos = None
+        self.prev_reward_facing_goal_cos_by_id = {}
+        self._stopped_ball_counter = 0
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
             retries=max(self.state_retry_count, 20),
             sleep_s=self.state_retry_sleep_s,
         )
-        
+        self._cached_game_state = game_state
+
+        playmode = getattr(game_state, "playmode", None) if game_state is not None else None
+        self.logger.info("Episode %d playmode=%s", self.episode_num, playmode)
+        self._log_episode_start_state(game_state)
+        if playmode == "time_over":
+            self.logger.warning(
+                "Episode %d started in time_over — physics is frozen; "
+                "rewards will be meaningless until the rcssserver session is restarted",
+                self.episode_num,
+            )
+
         # Build initial observation
         obs = self._game_state_to_obs(game_state)
 
@@ -188,19 +332,49 @@ class JALTeamEnv(gym.Env):
         
         if self.debug:
             self.logger.debug(f"Episode {self.episode_num} started")
-        
+
         return obs, info
 
+    def _log_episode_start_state(self, game_state) -> None:
+        """Log a one-line snapshot of the initial game state for each episode."""
+        if game_state is None:
+            self.logger.info("Episode %d initial state: <none>", self.episode_num)
+            return
+
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is not None:
+            ball_str = f"ball=({float(ball_pos[0]):.2f}, {float(ball_pos[1]):.2f})"
+        else:
+            ball_str = "ball=<none>"
+
+        robot_strs = []
+        for team_name, team_poses in getattr(game_state, "robot_poses", {}).items():
+            for entry in team_poses:
+                for unum, pose in entry.items():
+                    rx, ry, rtheta = float(pose[0]), float(pose[1]), float(pose[2])
+                    robot_strs.append(f"{team_name}#{int(unum)}=({rx:.2f}, {ry:.2f}, {rtheta:.1f}°)")
+        robots_str = "  ".join(robot_strs) if robot_strs else "robots=<none>"
+
+        self.logger.info(
+            "Episode %d initial state: %s  %s",
+            self.episode_num, ball_str, robots_str,
+        )
+
     def step(
-        self, 
-        action: np.ndarray
+        self,
+        action
         ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         Execute one step in the environment.
-        
+
         Args:
-            action: Joint action vector with shape (6 * num_robots,).
-        
+            action: Either
+              (a) a flat np.ndarray of shape (9 * num_robots,) — legacy TD3 format
+                  (6 action logits + 3 continuous params per robot), or
+              (b) a dict with keys "primitive_idx" (np.ndarray[num_robots] int)
+                  and "params" (np.ndarray[num_robots*3] float in [-1,1]) —
+                  new PPO hybrid format.
+
         Returns:
             observation: Next observation
             reward: Reward for this step
@@ -210,11 +384,15 @@ class JALTeamEnv(gym.Env):
         """
         self.current_step += 1
 
-        # Use current state to decode pose-aware commands (especially goto()).
-        current_game_state = self._get_game_state(
-            retries=self.state_retry_count,
-            sleep_s=self.state_retry_sleep_s,
-        )
+        # Reuse the state fetched at the end of the previous step (or reset).
+        # This eliminates the redundant fetch that consumed a simulator cycle
+        # before sending commands, halving cycle usage from 2 per step to 1.
+        current_game_state = self._cached_game_state
+        if current_game_state is None:
+            current_game_state = self._get_game_state(
+                retries=self.state_retry_count,
+                sleep_s=self.state_retry_sleep_s,
+            )
 
         # Decode action vector into simulator commands
         commands, action_info = self._action_to_commands(action, current_game_state)
@@ -224,26 +402,172 @@ class JALTeamEnv(gym.Env):
 
         # Send commands to simulator
         self._send_commands(commands)
-        
+
         # Read next state after sending commands, then build next observation.
         next_game_state = self._get_game_state(
             retries=self.state_retry_count,
             sleep_s=self.state_retry_sleep_s,
         )
+        self._cached_game_state = next_game_state
         obs = self._game_state_to_obs(next_game_state)
 
         reward = self._calculate_reward(next_game_state)
         invalid_action_count = int(action_info.get("invalid_action_count", 0))
         if invalid_action_count > 0 and self.invalid_action_penalty > 0.0:
             reward -= self.invalid_action_penalty * invalid_action_count
+
+        # Kick-aim bonus: one-shot reward at the moment a valid kick action
+        # fires, scaled by aim_quality — a *hard cutoff* on whether the kick's
+        # straight-line trajectory would actually cross the goal mouth.
+        # Replaces the earlier cos^N (cos^2, cos^4) formulation, which awarded
+        # large fractions of the bonus to kicks well outside the goal: with
+        # ball_x≈10, the goal subtends only ~arctan(5/35)≈8° from the kicker,
+        # but cos^4 still yields 0.88 at 10° off, 0.66 at 20° off — so the
+        # policy could convergently "turn approximately toward goal then kick"
+        # and collect ~80% of the bonus on every miss. aim_quality drops
+        # *linearly to zero across the goal mouth* and is exactly 0 for any
+        # kick angled outside the mouth, so off-target kicks earn nothing.
+        #
+        # In addition to the bonus on aimed kicks, a *hard penalty*
+        # (`bad_aim_kick_penalty`) is applied on kicks whose straight-line
+        # projection misses the goal mouth (|predicted_y| > goal_half_height).
+        # Without this, an unaimed kick's reward is zero rather than negative,
+        # so the policy can fire on step 1 of every episode with no EV cost
+        # and the actor never explores "delay-then-aim" trajectories.
+        #
+        # predicted_y_at_goal_line = ry + (FIELD_X[1] - rx) * tan(theta);
+        # aim_quality = max(0, 1 - |predicted_y| / goal_half_height).
+        kick_aim_weight = float(getattr(self.reward_config, "kick_aim_bonus_weight", 0.0))
+        goal_half_height = float(getattr(self.reward_config, "goal_half_height", 5.0))
+        bad_aim_penalty = float(
+            getattr(self.reward_config, "bad_aim_kick_penalty", 0.0)
+        )
+        if (kick_aim_weight > 0.0 or bad_aim_penalty > 0.0) and current_game_state is not None:
+            per_robot = action_info.get("per_robot", [])
+            pose_by_id: Dict[int, Any] = {}
+            for entry in getattr(current_game_state, "robot_poses", {}).get(self.team_name, []):
+                if isinstance(entry, dict):
+                    pose_by_id.update(entry)
+            for info_i in per_robot:
+                if info_i.get("action_type") != "kick":
+                    continue
+                # Only score the aim signal on a real kick command (i.e. the
+                # robot was in kickable range and the simulator accepted the
+                # kick). Awarding it on intent alone would let the policy
+                # collect free reward for "picked kick while facing goal"
+                # without actually being able to kick.
+                if not info_i.get("kick_fired", False):
+                    continue
+                pose = pose_by_id.get(info_i.get("robot_id"))
+                if pose is None:
+                    continue
+                rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
+                theta_rad = math.radians(theta_deg)
+                cos_t = math.cos(theta_rad)
+                # Facing away from / parallel to the goal line: kick can
+                # never cross x=FIELD_X[1]. Guaranteed miss — apply the
+                # bad-aim penalty and move on.
+                if cos_t <= 1e-3:
+                    if bad_aim_penalty > 0.0:
+                        reward -= bad_aim_penalty
+                    self.logger.info(
+                        "Kick fired: robot=(%.2f, %.2f, %.1f°)  "
+                        "predicted_y=N/A (cos≈0)  aim_quality=0.00  bad_aim=True",
+                        rx, ry, theta_deg,
+                    )
+                    continue
+                predicted_y_at_goal_line = ry + (FIELD_X[1] - rx) * (
+                    math.sin(theta_rad) / cos_t
+                )
+                aim_quality = max(
+                    0.0, 1.0 - abs(predicted_y_at_goal_line) / goal_half_height
+                )
+                bad_aim = aim_quality <= 0.0
+                if bad_aim:
+                    if bad_aim_penalty > 0.0:
+                        reward -= bad_aim_penalty
+                else:
+                    reward += aim_quality * kick_aim_weight
+                # Diagnostic log: confirms predicted_y vs the actual episode
+                # outcome. If most ball_in_penalty_off_target episodes show
+                # high aim_quality at fire, the divergence is on the physics
+                # side (ball deflection / decay), not the policy's aim.
+                self.logger.info(
+                    "Kick fired: robot=(%.2f, %.2f, %.1f°)  "
+                    "predicted_y=%.2f  aim_quality=%.2f  bad_aim=%s",
+                    rx, ry, theta_deg, predicted_y_at_goal_line,
+                    aim_quality, bad_aim,
+                )
+
         self.total_rewards += reward
-        terminated = False
-        truncated = self.current_step >= self.max_steps
+        terminated, term_reason = self._check_terminal(next_game_state, prev_game_state=current_game_state)
+        # Off-target terminal penalty disabled: a -3 penalty here flipped the
+        # net-EV of "kick" to slightly negative once the policy was at all
+        # uncertain about aim, which collapsed the policy into "turn 100%"
+        # action distribution (TD3 is deterministic — once Q(turn)=0 stably
+        # exceeds noisy Q(kick), kicking stops entirely). The off-target
+        # exploit it was meant to address is better fixed at the shaping
+        # level (aim-gate goal_progress) than at the terminal level.
+        if terminated and term_reason == "ball_in_penalty_off_target":
+            pass
+        # Small penalty for "wasted kick" outcomes — ball went dead via a
+        # non-goal playmode (kick_in/corner/goal_kick), or came to rest where
+        # the robot can't recover it. Small enough not to crush kick
+        # exploration (cf. the -50 off-target penalty that caused the spin
+        # collapse), but nonzero so the model has signal that the kick was
+        # unproductive. Self-disables when approach actions are available:
+        # with approach_ball enabled the robot could legitimately recover
+        # from a dead-ball / stopped-ball state, so the penalty would punish
+        # the wrong thing.
+        approach_disabled = (
+            "approach_ball" in self.disabled_actions
+            and "goto" in self.disabled_actions
+        )
+        if (
+            terminated
+            and approach_disabled
+            and (term_reason.startswith("ball_dead_") or term_reason == "ball_stopped_unreachable")
+        ):
+            reward -= 3.0
+            self.total_rewards -= 3.0
+        truncated = (not terminated) and self.current_step >= self.max_steps
+        # max_steps terminal penalty: punishes "stand still for 300 steps"
+        # so that turn-only / no-kick behavior isn't a stable 0-reward
+        # attractor. Without this, an under-trained policy can collapse into
+        # turn 100% of the time because stable 0 beats noisy +small from
+        # uncertain kicks. -10 is small relative to a successful goal (+70)
+        # but large enough to push the deterministic-policy preference back
+        # toward acting.
+        if truncated:
+            reward -= 10.0
+            self.total_rewards -= 10.0
+
+        if terminated or truncated:
+            total = len(self.episode_actions)
+            if total > 0:
+                from collections import Counter
+                counts = Counter(self.episode_actions)
+                dist = "  ".join(
+                    f"{k}={100*v//total}%" for k, v in sorted(counts.items())
+                )
+                self.logger.info(
+                    "Episode %d action distribution (%d steps): %s",
+                    self.episode_num, total, dist,
+                )
+            end_reason = term_reason if terminated else "max_steps"
+            self.logger.info(
+                "Episode %d ended — reason=%s  steps=%d  total_reward=%.2f",
+                self.episode_num, end_reason, self.current_step, self.total_rewards,
+            )
+            if terminated:
+                self._cached_game_state = None
+
         info = {
             "action_info": action_info,
             "reward": reward,
             "total_reward": self.total_rewards,
             "invalid_action_count": invalid_action_count,
+            "termination_reason": term_reason if terminated else ("max_steps" if truncated else ""),
         }
         return obs, reward, terminated, truncated, info
     
@@ -400,7 +724,7 @@ class JALTeamEnv(gym.Env):
                 pose = pose_by_robot_id.get(robot_id)
 
                 if pose is None:
-                    obs_values.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0])  # Default values for missing robot
+                    obs_values.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0])
                     continue
 
                 robot_x = float(pose[0])
@@ -446,31 +770,115 @@ class JALTeamEnv(gym.Env):
             self.logger.error(f"Error building observation: {e}")
             return np.zeros(self.obs_dim, dtype=np.float32)
 
-    def _action_to_commands(self, action: np.ndarray, game_state: Optional[GameState]) -> Tuple[List[str], Dict[str, Any]]:
+    def _action_to_commands(self, action, game_state: Optional[GameState]) -> Tuple[List[str], Dict[str, Any]]:
         """
-        Convert TD3 action vector to simulator command strings.
-        
-        Action vector format (8*number of robots) Dimensions:
-        [0]: goto_logit
-        [1]: turn_logit
-        [2]: kick_logit
-        [3]: start_dribble_logit
-        [4]: stop_dribble_logit
-        [5]: goto_x_raw  (range: [-1, 1])
-        [6]: goto_y_raw  (range: [-1, 1])
-        [7]: turn_theta_raw  (range: [-1, 1])
-        
-        Args:
-            action: Action vector from TD3 policy
-        
+        Convert a JAL action into simulator command strings.
+
+        Two accepted action formats:
+
+        1. Legacy TD3 flat Box vector, shape (9 * num_robots,):
+            [0..5] logits over {goto, approach_ball, turn, kick,
+                                start_dribble, stop_dribble}
+            [6] goto_x_raw ∈ [-1, 1]
+            [7] goto_y_raw ∈ [-1, 1]
+            [8] turn_theta_raw ∈ [-1, 1]
+
+        2. New PPO hybrid dict:
+            {
+              "primitive_idx": np.ndarray[num_robots] (int),
+              "params": np.ndarray[num_robots * 3] (float),
+                # per robot: Dx_raw, Dy_raw, Dtheta_raw ∈ [-1, 1]
+            }
+
+        The PPO format avoids the broken "continuous-logits + argmax" trick:
+        the discrete primitive choice is sampled from a true Categorical at
+        the policy layer; this env decode just executes whichever primitive
+        was selected.
+
         Returns:
             commands: List of simulator command strings in robot_ids order
             action_info: Dictionary with action details (for logging/debugging)
         """
-        action_arr = np.asarray(action, dtype=np.float32).flatten()
-        expected_dim = self.num_robots * self.action_dim_per_robot
-        if action_arr.shape[0] != expected_dim:
-            raise ValueError(f"Expected action dim {expected_dim}, got {action_arr.shape[0]}")
+        action_types = ["goto", "approach_ball", "turn", "kick", "start_dribble", "stop_dribble"]
+
+        # Detect format and extract per-robot (action_type, goto_x, goto_y, turn_theta).
+        per_robot_decoded: List[Dict[str, Any]] = []
+        is_ppo_dict = isinstance(action, dict) and "primitive_idx" in action
+
+        if is_ppo_dict:
+            primitive_idx_arr = np.asarray(action["primitive_idx"], dtype=np.int64).flatten()
+            params_arr = np.asarray(action.get("params", []), dtype=np.float32).flatten()
+            if primitive_idx_arr.shape[0] != self.num_robots:
+                raise ValueError(
+                    f"Expected primitive_idx shape ({self.num_robots},), got {primitive_idx_arr.shape}"
+                )
+            expected_params = self.num_robots * 3
+            if params_arr.shape[0] != expected_params:
+                raise ValueError(
+                    f"Expected params dim {expected_params}, got {params_arr.shape[0]}"
+                )
+            for i in range(self.num_robots):
+                idx = int(primitive_idx_arr[i])
+                if idx < 0 or idx >= len(action_types):
+                    raise ValueError(f"primitive_idx[{i}]={idx} out of range")
+                action_type = action_types[idx]
+                # Honest masking sanity-check: if the policy somehow picked a
+                # disabled primitive, log it and degrade to a no-op turn.
+                if self.disabled_actions and action_type in self.disabled_actions:
+                    self.logger.warning(
+                        "PPO policy selected disabled primitive %s for robot %d; "
+                        "honest masking should have blocked this — forcing turn 0.",
+                        action_type, self.robot_ids[i],
+                    )
+                    action_type = "turn"
+                    goto_x_raw, goto_y_raw, turn_theta_raw = 0.0, 0.0, 0.0
+                else:
+                    base = i * 3
+                    goto_x_raw = float(params_arr[base + 0])
+                    goto_y_raw = float(params_arr[base + 1])
+                    turn_theta_raw = float(params_arr[base + 2])
+                per_robot_decoded.append({
+                    "action_idx": idx,
+                    "action_type": action_type,
+                    "goto_x_raw": goto_x_raw,
+                    "goto_y_raw": goto_y_raw,
+                    "turn_theta_raw": turn_theta_raw,
+                    "logits": None,
+                    "probs": None,
+                })
+        else:
+            action_arr = np.asarray(action, dtype=np.float32).flatten()
+            expected_dim = self.num_robots * self.action_dim_per_robot
+            if action_arr.shape[0] != expected_dim:
+                raise ValueError(f"Expected action dim {expected_dim}, got {action_arr.shape[0]}")
+            for i in range(self.num_robots):
+                base = i * self.action_dim_per_robot
+                logits = np.array([
+                    float(action_arr[base + 0]),
+                    float(action_arr[base + 1]),
+                    float(action_arr[base + 2]),
+                    float(action_arr[base + 3]),
+                    float(action_arr[base + 4]),
+                    float(action_arr[base + 5]),
+                ], dtype=np.float32)
+                if self.disabled_actions:
+                    for j, name in enumerate(action_types):
+                        if name in self.disabled_actions:
+                            logits[j] = -1e9
+                logits_shifted = logits - np.max(logits)
+                exp_logits = np.exp(logits_shifted)
+                probs = exp_logits / np.sum(exp_logits)
+                action_idx = int(np.argmax(probs))
+                action_type = action_types[action_idx]
+                per_robot_decoded.append({
+                    "action_idx": action_idx,
+                    "action_type": action_type,
+                    "goto_x_raw": float(action_arr[base + 6]),
+                    "goto_y_raw": float(action_arr[base + 7]),
+                    "turn_theta_raw": float(action_arr[base + 8]),
+                    "logits": logits.tolist(),
+                    "probs": probs.tolist(),
+                })
 
         pose_by_robot_id: Dict[int, Any] = {}
         if game_state is not None:
@@ -485,17 +893,16 @@ class JALTeamEnv(gym.Env):
         ball_pos = game_state.ball_pos if game_state is not None else None
 
         for i, robot_id in enumerate(self.robot_ids):
-            base = i * self.action_dim_per_robot
-            goto_logit = float(action_arr[base + 0])
-            turn_logit = float(action_arr[base + 1])
-            kick_logit = float(action_arr[base + 2])
-            start_dribble_logit = float(action_arr[base + 3])
-            stop_dribble_logit = float(action_arr[base + 4])
-            goto_x_raw = float(action_arr[base + 5])
-            goto_y_raw = float(action_arr[base + 6])
-            turn_theta_raw = float(action_arr[base + 7])
+            decoded = per_robot_decoded[i]
+            action_idx = decoded["action_idx"]
+            action_type = decoded["action_type"]
+            goto_x_raw = decoded["goto_x_raw"]
+            goto_y_raw = decoded["goto_y_raw"]
+            turn_theta_raw = decoded["turn_theta_raw"]
 
-            logits = np.array([goto_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit], dtype=np.float32)
+            goto_x = float(goto_x_raw * self.field_half_width)
+            goto_y = float(goto_y_raw * self.field_half_height)
+            turn_theta = float(turn_theta_raw * np.pi)
 
             pose = pose_by_robot_id.get(robot_id)
             has_ball_now = False
@@ -506,23 +913,11 @@ class JALTeamEnv(gym.Env):
                     kickable_dist=self.kickable_dist,
                 )
 
-            if self.state_dependent_action_selection:
-                action_idx, probs = self._select_action_index(logits, has_ball_now)
-            else:
-                # Numerical stability: subtract max before exp
-                logits_shifted = logits - np.max(logits)
-                exp_logits = np.exp(logits_shifted)
-                probs = exp_logits / np.sum(exp_logits)
-                action_idx = int(np.argmax(probs))
-
-            action_type = self.ACTION_TYPES[action_idx]
-
-            goto_x = float(goto_x_raw * self.field_half_width)
-            goto_y = float(goto_y_raw * self.field_half_height)
-            turn_theta = float(turn_theta_raw * np.pi)
+            can_kick = has_ball_now
+            kick_fired = False
 
             invalid_action_requested = (
-                (action_type == "kick" and not has_ball_now)
+                (action_type == "kick" and not can_kick)
                 or (action_type == "start_dribble" and not has_ball_now)
                 or (action_type == "stop_dribble" and not has_ball_now)
             )
@@ -530,10 +925,15 @@ class JALTeamEnv(gym.Env):
                 invalid_action_count += 1
 
             if action_type == "kick":
-                if not has_ball_now:
-                    command = "turn 0"
+                if not can_kick:
+                    # Use the policy's own turn_theta rather than "turn 0" so
+                    # the state changes each step, allowing Q(kick) to receive
+                    # proper TD targets instead of bootstrapping off itself in
+                    # a stationary (s == s') loop.
+                    command = f"turn {turn_theta:.2f}"
                 else:
                     command = "kick 100 0"
+                    kick_fired = True
             elif action_type == "start_dribble":
                 if not has_ball_now:
                     command = "turn 0"
@@ -546,6 +946,22 @@ class JALTeamEnv(gym.Env):
                     command = "drop"  # Stop dribble
             elif action_type == "turn":
                 command = f"turn {turn_theta:.2f}"
+            elif action_type == "approach_ball":
+                if pose is None or game_state is None:
+                    command = "turn 0"
+                else:
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    command = approach_ball(
+                        self_pose=self_pose,
+                        game_state=game_state,
+                        kickable_dist=self.kickable_dist,
+                    )
+                    if command == "done":
+                        command = "turn 0"
             else:
                 if pose is None or game_state is None:
                     command = "turn 0"
@@ -570,12 +986,13 @@ class JALTeamEnv(gym.Env):
                     "robot_id": robot_id,
                     "action_type": action_type,
                     "action_idx": action_idx,
-                    "probs": probs.tolist(),
-                    "logits": logits.tolist(),
+                    "probs": decoded["probs"],
+                    "logits": decoded["logits"],
                     "goto_x": goto_x,
                     "goto_y": goto_y,
                     "turn_theta": turn_theta,
                     "has_ball_now": has_ball_now,
+                    "kick_fired": kick_fired,
                     "invalid_action_requested": invalid_action_requested,
                     "command": command,
                 }
@@ -601,6 +1018,8 @@ class JALTeamEnv(gym.Env):
         state: Optional[str] = None,
         prev_ball_dist: Optional[float] = None,
         prev_ball_to_goal_dist: Optional[float] = None,
+        prev_ball_pos: Optional[Tuple[float, float]] = None,
+        prev_facing_goal_cos: Optional[float] = None,
     ) -> RewardInputs:
         """Build a shared `RewardInputs` object from the current game state."""
 
@@ -642,6 +1061,8 @@ class JALTeamEnv(gym.Env):
             ),
             prev_ball_dist=prev_ball_dist,
             prev_ball_to_goal_dist=prev_ball_to_goal_dist,
+            prev_ball_pos=prev_ball_pos,
+            prev_facing_goal_cos=prev_facing_goal_cos,
         )
 
     @staticmethod
@@ -668,22 +1089,242 @@ class JALTeamEnv(gym.Env):
                     robot_id=robot_id,
                     prev_ball_dist=self.prev_reward_ball_dist_by_id.get(robot_id),
                     prev_ball_to_goal_dist=self.prev_reward_ball_to_goal_dist,
+                    prev_ball_pos=self.prev_reward_ball_pos,
+                    prev_facing_goal_cos=self.prev_reward_facing_goal_cos_by_id.get(robot_id),
                 )
             except ValueError:
                 continue
 
-            reward_result = evaluate_reward(reward_inputs)
+            reward_result = evaluate_reward(reward_inputs, config=self.reward_config)
             rewards.append(float(reward_result.reward))
             self.prev_reward_ball_dist_by_id[robot_id] = reward_result.intermediates.ball_dist
+            if reward_result.intermediates.facing_goal_cos is not None:
+                self.prev_reward_facing_goal_cos_by_id[robot_id] = reward_result.intermediates.facing_goal_cos
             next_ball_to_goal_dist = reward_result.intermediates.ball_to_goal_dist
 
         if next_ball_to_goal_dist is not None:
             self.prev_reward_ball_to_goal_dist = next_ball_to_goal_dist
 
+        if current_game_state.ball_pos is not None:
+            self.prev_reward_ball_pos = (
+                float(current_game_state.ball_pos[0]),
+                float(current_game_state.ball_pos[1]),
+            )
+
         if not rewards:
             return 0.0
 
         return float(np.mean(rewards))
+
+    _GOAL_HALF_HEIGHT: float = 5.0  # SSL Div B goal width=1000mm → 10 sim units → half=5.0
+
+    def _get_curriculum_ball_pos(self) -> tuple[float, float]:
+        """Curriculum: start ball near opponent goal early, move toward centre as
+        episodes progress. Random kicks score frequently when the ball is near
+        the goal, giving the agent the sparse goal_reward signal needed to break
+        out of the approach-and-park local maximum.
+
+        Ball must stay OUTSIDE the right penalty area (x < 35, y any) to avoid
+        rcssserver's BallStuckRef: if the ball sits still for drop_ball_time=100
+        cycles inside the penalty area, the server calls awardDropBall() which
+        runs moveOutOfPenalty() and teleports the ball to (35, ±10) — the corner
+        of the penalty area — disrupting the curriculum entirely.
+
+        Stage 1 narrowed mode: when `self.random_ball_x` is True, the ball x is
+        sampled uniformly from `self.random_ball_x_range`. When `self.random_ball_y`
+        is also True, the ball y is sampled from `self.random_ball_y_range`,
+        forcing the robot to actually rotate to face the goal before kicking
+        (otherwise the robot spawn at theta=0 trivially aims at the goal).
+        """
+        if self.random_ball_x:
+            x_min, x_max = self.random_ball_x_range
+            x = float(np.random.uniform(x_min, x_max))
+            if self.random_ball_y:
+                y_min, y_max = self.random_ball_y_range
+                y = float(np.random.uniform(y_min, y_max))
+            else:
+                y = 0.0
+            return (x, y)
+
+        ep = self.episode_num
+        if ep < 50:
+            return (34.0, 0.0)   # penalty spot — 11m from goal, just outside penalty area
+        elif ep < 120:
+            return (25.0, 0.0)   # 20m from goal
+        elif ep < 220:
+            return (15.0, 0.0)   # 30m from goal
+        else:
+            return (0.0, 0.0)    # full task — centre kickoff
+
+    # Right-side penalty area boundary in our env coordinates. rcssserver's
+    # BallStuckRef rule fires when a ball stays still inside the penalty area
+    # for `drop_ball_time` cycles (default 100), then teleports it and may
+    # change the playmode — corrupting any further training transitions.
+    # Cutting the episode short the moment the ball enters this region (and
+    # misses the goal mouth) avoids the bug entirely AND gives the model a
+    # shaping signal: "kicks past x=35 must hit the goal mouth, not the sides".
+    _RIGHT_PENALTY_AREA_X: float = 35.0
+
+    # Position-jump tolerances for the teleport backstop. A ball under any
+    # normal physics moves at most ~3 units/cycle (and decays fast). The robot,
+    # under our Stage 1 action mask, cannot move at all (only kick/turn are
+    # selectable). Anything beyond these is a server-side teleport.
+    _BALL_TELEPORT_THRESHOLD: float = 5.0
+    _ROBOT_TELEPORT_THRESHOLD: float = 1.0
+
+    # Ball-stopped detection. Speed under this threshold for N consecutive
+    # cycles signals the ball has come to rest. Combined with the robot being
+    # unable to reach it (approach disabled and distance > kickable_dist), this
+    # ends the episode early instead of burning the remaining max_steps.
+    _BALL_STOPPED_SPEED: float = 0.05
+    _BALL_STOPPED_STEPS: int = 10
+
+    # Touchline dead-zone margin: a ball within this many units of the
+    # |y|=FIELD_Y[1] touchline is treated as out-of-bounds. In a real game a
+    # ball this close to the line is a kick-in/throw-in (dead, not
+    # recoverable). The strict `|by| > FIELD_Y[1]` check used to terminate
+    # only after the ball had fully crossed — but in stage 1.9 (with
+    # approach_ball enabled) a ball that decays to rest just inside the
+    # touchline triggers no termination and the episode idles to max_steps.
+    # Applied to the touchline only — end-line near-misses are still handled
+    # by `ball_in_penalty_off_target`, and applying a margin to the end line
+    # would risk pre-empting goals.
+    _TOUCHLINE_DEAD_MARGIN: float = 0.5
+
+    def _own_robot_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
+        """Return (x, y, theta_deg) for the first controlled robot, or None."""
+        if game_state is None:
+            return None
+        team_pose_entries = getattr(game_state, "robot_poses", {}).get(self.team_name, [])
+        for entry in team_pose_entries:
+            if isinstance(entry, dict):
+                for rid, pose in entry.items():
+                    if rid == self.robot_ids[0]:
+                        return (float(pose[0]), float(pose[1]), float(pose[2]))
+        return None
+
+    def _check_terminal(self, game_state, prev_game_state=None) -> tuple[bool, str]:
+        """Return (terminated, reason) based on goal/out-of-bounds conditions.
+
+        `prev_game_state` is the game state at the *start* of the current step
+        (before the action was applied). It's used for unphysical-jump checks;
+        comparing against fields like `self.prev_reward_ball_pos` doesn't work
+        because those are updated by `_calculate_reward` before this method runs.
+        """
+        if game_state is None:
+            return False, ""
+
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is None:
+            return False, ""
+
+        bx, by = float(ball_pos[0]), float(ball_pos[1])
+
+        if bx >= FIELD_X[1] and abs(by) < self._GOAL_HALF_HEIGHT:
+            return True, "goal_scored"
+
+        if abs(by) >= FIELD_Y[1] - self._TOUCHLINE_DEAD_MARGIN or abs(bx) > FIELD_X[1]:
+            return True, "ball_out_of_bounds"
+
+        # Ball entered the right penalty area but missed the goal mouth. Ending
+        # the episode here is BOTH a bug workaround (avoids BallStuckRef) AND a
+        # learning signal — see _RIGHT_PENALTY_AREA_X comment above.
+        if bx >= self._RIGHT_PENALTY_AREA_X and abs(by) > self._GOAL_HALF_HEIGHT:
+            return True, "ball_in_penalty_off_target"
+
+        # Dead-ball playmodes: when rcssserver transitions out of play_on
+        # (kick_in_*, corner_kick_*, goal_kick_*, foul_*, etc.) the ball is no
+        # longer in play. Without approach_ball/goto enabled, the robot can't
+        # do anything meaningful — keep going just wastes cycles until
+        # max_steps. End immediately. The playmode is preserved in the reason
+        # so the trainer logs distinguish causes.
+        playmode = getattr(game_state, "playmode", None)
+        if playmode is not None and playmode not in ("play_on", "before_kick_off"):
+            return True, f"ball_dead_{playmode}"
+
+        # Ball stopped far from the robot: if the ball has come to rest (low
+        # speed for several consecutive cycles) and the robot can't reach it
+        # (no approach action available, robot distance > kickable_dist), the
+        # episode is effectively dead. Don't burn the remaining max_steps.
+        if prev_game_state is not None:
+            prev_ball_pos = getattr(prev_game_state, "ball_pos", None)
+            if prev_ball_pos is not None:
+                pbx, pby = float(prev_ball_pos[0]), float(prev_ball_pos[1])
+                ball_speed = math.hypot(bx - pbx, by - pby)
+                if ball_speed < self._BALL_STOPPED_SPEED:
+                    self._stopped_ball_counter += 1
+                else:
+                    self._stopped_ball_counter = 0
+                approach_disabled = (
+                    "approach_ball" in self.disabled_actions
+                    and "goto" in self.disabled_actions
+                )
+                if (
+                    self._stopped_ball_counter >= self._BALL_STOPPED_STEPS
+                    and approach_disabled
+                ):
+                    own_pose = self._own_robot_pose(game_state)
+                    if own_pose is not None:
+                        rx, ry, _ = own_pose
+                        if math.hypot(bx - rx, by - ry) > self.kickable_dist:
+                            return True, "ball_stopped_unreachable"
+
+        # Position-jump backstop: compare positions at the start of this step
+        # (prev_game_state, pre-action) to the end (game_state, post-action).
+        # An unphysical jump means rcssserver teleported the object.
+        prev_ball_pos = getattr(prev_game_state, "ball_pos", None) if prev_game_state is not None else None
+        if prev_ball_pos is not None:
+            pbx, pby = float(prev_ball_pos[0]), float(prev_ball_pos[1])
+            ball_jump = math.hypot(bx - pbx, by - pby)
+            if ball_jump > self._BALL_TELEPORT_THRESHOLD:
+                self.logger.warning(
+                    "Ball teleport detected: prev=(%.2f, %.2f) curr=(%.2f, %.2f) "
+                    "jump=%.2f", pbx, pby, bx, by, ball_jump,
+                )
+                return True, "ball_teleport"
+
+        # Only iterate our own team's robots. Both teams use unum=1, so
+        # iterating all teams + matching by unum would mistakenly flag the
+        # opposing team's stationary player #1 (at default pose ~(20, 10))
+        # as if it were our robot teleporting there every step.
+        team_robots = getattr(game_state, "robot_poses", {}).get(self.team_name, [])
+        prev_team_robots = (
+            getattr(prev_game_state, "robot_poses", {}).get(self.team_name, [])
+            if prev_game_state is not None else []
+        )
+        # Build a quick lookup of prev poses by unum for matching.
+        prev_pose_by_unum: Dict[int, Tuple[float, float]] = {}
+        for entry in prev_team_robots:
+            for unum, pose in entry.items():
+                prev_pose_by_unum[int(unum)] = (float(pose[0]), float(pose[1]))
+
+        for robot in team_robots:
+            for unum, pose in robot.items():
+                if int(unum) in self.robot_ids:
+                    rx, ry = float(pose[0]), float(pose[1])
+                    if abs(rx) > FIELD_X[1] or abs(ry) > FIELD_Y[1]:
+                        return True, "robot_out_of_bounds"
+                    # Under our action mask (kick/turn only), the robot
+                    # cannot move. Any significant displacement is a
+                    # server-side teleport (e.g. dead-ball reposition).
+                    if self.disabled_actions and not self._can_robot_move():
+                        prev = prev_pose_by_unum.get(int(unum))
+                        if prev is not None:
+                            jump = math.hypot(rx - prev[0], ry - prev[1])
+                            if jump > self._ROBOT_TELEPORT_THRESHOLD:
+                                self.logger.warning(
+                                    "Robot %s teleport detected: prev=(%.2f, %.2f) "
+                                    "curr=(%.2f, %.2f) jump=%.2f",
+                                    unum, prev[0], prev[1], rx, ry, jump,
+                                )
+                                return True, "robot_teleport"
+
+        return False, ""
+
+    def _can_robot_move(self) -> bool:
+        """Return True if the current action mask allows any locomotion action."""
+        locomotion_actions = {"goto", "approach_ball"}
+        return any(a not in self.disabled_actions for a in locomotion_actions)
 
     def _send_commands(self, commands: List[str]):
         """

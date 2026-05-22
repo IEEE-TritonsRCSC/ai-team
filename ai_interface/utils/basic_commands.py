@@ -142,10 +142,13 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
 
 
 def approach_ball(self_pose: np.ndarray | Tuple | List, game_state,
-                  margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
+                  margin: float = 1.0, theta: float | None = None, speed: float = 100.0,
                   is_goalie: bool = False) -> str:
     """
     Dash or turn toward the ball from ``game_state.ball_pos`` without obstacle avoidance.
+
+    Default margin=1.0 matches kickable-distance semantics expected by the
+    JAL env (kicker cone is sized around this range).
     """
     ball_pos = getattr(game_state, "ball_pos", None)
     if ball_pos is None:

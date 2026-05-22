@@ -96,11 +96,20 @@ class Networker:
             messages = self.serializer.robot_serialize(output)
             self.commander.send_to_robots(team_name, messages)
 
-    def reset_sim(self):
-        """Reset the simulator: move all players to initial poses, reset ball, restart play."""
+    def reset_sim(self, ball_pos=None, player_poses_override=None):
+        """Reset the simulator: move all players to initial poses, reset ball, restart play.
+
+        Args:
+            ball_pos: optional (x, y) tuple for custom ball start position.
+                      Defaults to (0, 0) (centre of field).
+            player_poses_override: optional list of (obj_name, (x, y, theta)) tuples
+                      that replaces the default `desired_init_poses` for this reset.
+                      Use this to pre-position robots per-episode (e.g. spawn at ball).
+        """
         if _uses_embedded_simulator(self.environment):
             self.commander.reset_sim()
             return
+
 
         import time
 
@@ -111,8 +120,9 @@ class Networker:
         if monitor_sock is None or monitor_addr is None:
             return
 
-        # 1. Move every player back to its initial pose
-        for obj_name, pose in self.commander.desired_init_poses:
+        # 1. Move every player back to its initial pose (or the per-episode override)
+        poses_to_apply = player_poses_override if player_poses_override is not None else self.commander.desired_init_poses
+        for obj_name, pose in poses_to_apply:
             cmd = f"(move {obj_name} {pose[0]} {pose[1]} {pose[2]})\0".encode()
             try:
                 monitor_sock.sendto(cmd, monitor_addr)
@@ -121,15 +131,20 @@ class Networker:
                 pass
             time.sleep(0.02)
 
-        # 2. Reset the ball to centre
+        # 2. Restart play BEFORE placing the ball at the custom position.
+        # If we move the ball first and then call (change_mode play_on), rcssserver's
+        # before_kick_off → play_on kick-off transition resets the ball to center (0, 0),
+        # overriding our custom position. Moving the ball after play_on is active avoids
+        # that reset — the monitor can (move ...) objects freely in play_on mode.
+        self.game_watcher.restart_game()
+
+        # 3. Place the ball at the curriculum-aware position now that we are in play_on.
+        bx, by = (0.0, 0.0) if ball_pos is None else (float(ball_pos[0]), float(ball_pos[1]))
         try:
-            monitor_sock.sendto(b"(move (ball) 0 0)\0", monitor_addr)
+            monitor_sock.sendto(f"(move (ball) {bx} {by})\0".encode(), monitor_addr)
             monitor_sock.recvfrom(16)
         except Exception:
             pass
-
-        # 3. Restart play so players can act immediately
-        self.game_watcher.restart_game()
 
     def shutdown(self):
         """Cleanly shutdown all networking connections."""

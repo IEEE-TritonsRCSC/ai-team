@@ -245,10 +245,11 @@ class TD3JALAlgorithm(AlgorithmBase):
         action, _state = self.model.predict(observation, deterministic=deterministic)
         return action
 
-    def learn(self, total_timesteps: int, reset_num_timesteps: bool = False):
+    def learn(self, total_timesteps: int, reset_num_timesteps: bool = False, **kwargs):
         return self.model.learn(
             total_timesteps=total_timesteps,
             reset_num_timesteps=reset_num_timesteps,
+            **kwargs,
         )
 
     def save(self, path: str):

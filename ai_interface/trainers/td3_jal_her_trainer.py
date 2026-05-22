@@ -91,6 +91,14 @@ class TD3JALHERTrainer(BaseTrainer):
         team_config_path: Optional[str] = None,
         stage_config: Optional[Dict[str, Any]] = None,
     ) -> JALHEREnv:
+        # Reuse the existing networker across stages. Tearing it down and
+        # re-initializing UDP connections to rcssserver between stages is
+        # unreliable: Client.connect_to_sim has no socket timeout, and the
+        # (bye) → new (init) sequence races against the server, causing
+        # the new init's recvfrom to hang forever when the server is slow
+        # to release the old player slot. The networker holds a stable
+        # connection that is identical across stages anyway — only the
+        # env's behavioral knobs change.
         team_infos = self._load_team_config(team_config_path or self.config["team_config"])
         team_name = (
             (stage_config or {}).get("team_name")
@@ -98,14 +106,36 @@ class TD3JALHERTrainer(BaseTrainer):
             or team_infos[0].name
         )
 
-        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
-        self.networker = Networker(
-            team_infos,
-            self.config.get("env_mode", "sim-only"),
-            sim_host=sim_host,
-            sim_player_port=sim_player_port,
-            sim_trainer_port=sim_trainer_port,
-        )
+        if self.networker is None:
+            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
+            self.networker = Networker(
+                team_infos,
+                self.config.get("env_mode", "sim-only"),
+                sim_host=sim_host,
+                sim_player_port=sim_player_port,
+                sim_trainer_port=sim_trainer_port,
+            )
+
+        # Per-stage environment knobs. Stage-level values override top-level
+        # config values (so e.g. Stage 1 can disable approach_ball while
+        # Stage 2 re-enables it).
+        stage_config = stage_config or {}
+        def _stage_or_top(key, default):
+            if key in stage_config:
+                return stage_config[key]
+            return self.config.get(key, default)
+
+        disabled_actions = _stage_or_top("disabled_actions", [])
+        spawn_robot_at_ball = _stage_or_top("spawn_robot_at_ball", False)
+        spawn_offset_behind_ball = _stage_or_top("spawn_offset_behind_ball", 1.0)
+        random_ball_x = _stage_or_top("random_ball_x", False)
+        random_ball_x_range = _stage_or_top("random_ball_x_range", [5.0, 30.0])
+        random_ball_y = _stage_or_top("random_ball_y", False)
+        random_ball_y_range = _stage_or_top("random_ball_y_range", [-3.0, 3.0])
+        random_spawn_theta = _stage_or_top("random_spawn_theta", False)
+        random_spawn_theta_range_deg = _stage_or_top("random_spawn_theta_range_deg", [-45.0, 45.0])
+        reward_config_overrides = _stage_or_top("reward_config_overrides", None)
+        invalid_action_penalty = _stage_or_top("invalid_action_penalty", 0.2)
 
         aux_team_command_providers = build_aux_team_command_providers(
             self.policy_config,
@@ -124,6 +154,17 @@ class TD3JALHERTrainer(BaseTrainer):
             max_steps=int(self.config.get("max_steps", 200)),
             debug=bool(self.config.get("debug", False)),
             aux_team_command_providers=aux_team_command_providers,
+            invalid_action_penalty=float(invalid_action_penalty),
+            disabled_actions=list(disabled_actions) if disabled_actions else [],
+            spawn_robot_at_ball=bool(spawn_robot_at_ball),
+            spawn_offset_behind_ball=float(spawn_offset_behind_ball),
+            random_ball_x=bool(random_ball_x),
+            random_ball_x_range=tuple(random_ball_x_range),
+            random_ball_y=bool(random_ball_y),
+            random_ball_y_range=tuple(random_ball_y_range),
+            random_spawn_theta=bool(random_spawn_theta),
+            random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
+            reward_config_overrides=dict(reward_config_overrides) if reward_config_overrides else None,
         )
 
         # obs_dim is stored on the env; observation_space is now a Dict
@@ -170,7 +211,12 @@ class TD3JALHERTrainer(BaseTrainer):
             load_path = self.config["load_model"]
             self.logger.info("Loading model from %s", load_path)
             self.model = TD3.load(load_path, env=env, device=str(self.device))
-            self.logger.info("TD3+HER model loaded")
+            # Reset step counters so learning_starts applies from scratch.
+            # The replay buffer is not saved in checkpoints, so without this
+            # SB3 immediately tries to sample an empty HER buffer and crashes.
+            self.model.num_timesteps = 0
+            self.model._episode_num = 0
+            self.logger.info("TD3+HER model loaded (step counters reset for fresh buffer collection)")
             return
 
         n_actions = int(env.action_space.shape[0])
@@ -246,30 +292,54 @@ class TD3JALHERTrainer(BaseTrainer):
 
         self.logger.info("Starting %s — %d robot(s) %s", stage_name, num_robots, robot_ids)
 
-        if self.env is None or getattr(self, "_current_stage_signature", None) != stage_signature:
-            self.env = self.setup_environment(
-                num_robots,
-                robot_ids,
+        try:
+            self._run_stage_inner(
+                stage_name, num_robots, robot_ids, timesteps,
                 team_config_path=team_config_path,
                 stage_config=stage_config,
             )
-            self._current_stage_signature = stage_signature
+        except Exception:
+            self.logger.exception("Stage %s failed — see traceback above", stage_name)
+            raise
 
-        # Rebuild the model whenever num_robots changes: the policy/Q-net
-        # input dim is tied to obs_dim, which depends on num_robots.
-        # HER does not have an expandable backbone here, so the replay
-        # buffer is reset between stages.
+    def _run_stage_inner(self, stage_name: str, num_robots: int, robot_ids: list, timesteps: int,
+                         team_config_path: Optional[str] = None,
+                         stage_config: Optional[Dict[str, Any]] = None):
+        # Always rebuild the env per stage so stage_config (spawn flags,
+        # disabled_actions, reward_config_overrides, etc.) actually takes
+        # effect. The previous "only rebuild when num_robots changes" check
+        # silently dropped stage_config changes between same-sized stages.
+        self.env = self.setup_environment(
+            num_robots, robot_ids,
+            team_config_path=team_config_path,
+            stage_config=stage_config,
+        )
+
+        # Rebuild the model from scratch only when num_robots changes (obs/action
+        # dims differ). Otherwise rebind the existing model to the new env and
+        # reset the HER replay buffer + step counters, since transitions stored
+        # under the previous stage's reward and spawn distribution would bias
+        # updates under the new stage.
         needs_new_model = self.model is None or self._current_num_robots != num_robots
         if needs_new_model:
             if self.model is not None:
                 self.logger.warning(
-                    "Reinitializing model from scratch for %d robots (was %s) — "
-                    "HER replay buffer does not transfer across stage transitions.",
+                    "Reinitializing model from scratch for %d robots (was %s).",
                     num_robots, self._current_num_robots,
                 )
                 self.model = None
             self.setup_model(self.env, num_robots)
             self._current_num_robots = num_robots
+        else:
+            self.logger.info(
+                "Rebinding existing model to new %s env (num_robots=%d unchanged) "
+                "and resetting HER replay buffer + step counters.",
+                stage_name, num_robots,
+            )
+            self.model.set_env(self.env)
+            self.model.replay_buffer.reset()
+            self.model.num_timesteps = 0
+            self.model._episode_num = 0
 
         learn_batch    = int(self.config.get("learn_batch_timesteps", 2048))
         save_interval  = int(self.config.get("save_interval", 10_000))

@@ -40,5 +40,14 @@ replace_server_param "coach_w_referee" "true"
 replace_server_param "player_size" "0.9"
 replace_server_param "ball_size" "0.215"
 replace_server_param "kickable_margin" "0.1"
+# Disable the BallStuckRef "drop ball" rule. Default is 100 cycles which
+# fires inside our training episodes (model is at-ball but kicks don't
+# move the ball reliably), teleporting our robot and corrupting transitions.
+replace_server_param "drop_ball_time" "99999"
+# Extend match length so the server doesn't enter `time_over` mid-training.
+# Default half_time=300s × nr_normal_halfs=2 × 10 cycles/s = 6000 cycles (~7
+# min wall-clock), after which no goals can be scored and reward = 0.
+replace_server_param "half_time" "99999"
+replace_server_param "nr_normal_halfs" "99999"
 
 echo "Configuration file updated: $CONFIG_FILE"
