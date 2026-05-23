@@ -958,7 +958,7 @@ class JALTeamEnv(gym.Env):
                     command = approach_ball(
                         self_pose=self_pose,
                         game_state=game_state,
-                        kickable_dist=self.kickable_dist,
+                        margin=self.kickable_dist,
                     )
                     if command == "done":
                         command = "turn 0"
