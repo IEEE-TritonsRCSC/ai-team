@@ -47,7 +47,7 @@
   "learn_batch_timesteps": 2048,
   "save_interval": 10000,
   "save_path": "models/td3_jal_her",
-  "load_model": "models/td3_jal_her/stage1_9_approach_turn_kick_complete_50pct.zip",
+  "load_model": "models/td3_jal_her/stage1_complete.zip",
   "model_params": {
     "learning_rate": 0.001,
     "buffer_size": 200000,
