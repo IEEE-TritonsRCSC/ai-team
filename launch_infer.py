@@ -6,31 +6,50 @@ for them to initialise, then starts one infer.py process per model with
 matching --sim_player_port / --sim_trainer_port arguments. All child
 processes are stopped cleanly when this script exits.
 
+USAGE
+-----
+    python launch_infer.py <model1> [<model2> <model3> ...] [options]
+
+One sim + one infer process is launched per model path. N models -> N
+parallel sims on consecutive port pairs (6000/6001, 6010/6011, ...).
+
+COMMON OPTIONS
+--------------
+    --steps N            inference steps per model (default 3000)
+    --base-port PORT     base player port for env 0 (default 6000)
+    --port-stride N      gap between consecutive envs (default 10, min 3)
+    --config <path>      training config (default configs/td3_jal_her_config.json)
+    --stage <name>       curriculum stage to mirror (default stage1_9_approach_turn_kick)
+    --no-monitor         skip rcssmonitor windows (headless)
+    --debug_infer        forward debug flag to each infer.py
+
 Port layout (matches launch_train.py / base_trainer._sim_endpoint_for_env):
-  env 0 : player=BASE_PORT,          trainer=BASE_PORT+1
-  env 1 : player=BASE_PORT+STRIDE,   trainer=BASE_PORT+STRIDE+1
-  ...
+    env 0 : player=BASE_PORT,          trainer=BASE_PORT+1
+    env 1 : player=BASE_PORT+STRIDE,   trainer=BASE_PORT+STRIDE+1
+    ...
 
 Each infer.py writes to its own infer_logs/<timestamp>_env<i>_<model>/
 directory (log file + summary.json). When all inferers finish, this
 script reads each summary.json and prints a comparison table.
 
-Examples:
-  # Compare two checkpoints in parallel (the common case)
-  python launch_infer.py \\
-    models/td3_jal_her/stage1_9_approach_turn_kick_steps160000.zip \\
-    models/td3_jal_her/stage1_9_approach_turn_kick_steps180000.zip \\
-    --steps 7000
+EXAMPLES
+--------
+    # Single run with auto-launched sim + monitor window
+    python launch_infer.py models/td3_jal_her/stage1_complete.zip --steps 3000
 
-  # Compare three checkpoints
-  python launch_infer.py \\
-    models/td3_jal_her/...steps160000.zip \\
-    models/td3_jal_her/...steps180000.zip \\
-    models/td3_jal_her/...steps190000.zip \\
-    --steps 5000
+    # Headless single run, 7000 steps
+    python launch_infer.py models/td3_jal_her/stage1_complete.zip \\
+        --steps 7000 --no-monitor
 
-  # Single run that also launches its own sim
-  python launch_infer.py models/td3_jal_her/...steps180000.zip --steps 3000
+    # Compare two checkpoints in parallel
+    python launch_infer.py \\
+        models/td3_jal_her/stage1_complete.zip \\
+        models/td3_jal_her/<other_checkpoint>.zip \\
+        --steps 7000
+
+    # Run alongside another sim already on 6000 - use a different base port
+    python launch_infer.py models/td3_jal_her/stage1_complete.zip \\
+        --steps 7000 --base-port 7000
 """
 
 from __future__ import annotations
