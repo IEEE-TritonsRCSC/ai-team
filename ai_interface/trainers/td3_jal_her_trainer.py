@@ -23,6 +23,7 @@ from ai_interface.envs.JAL_her_env import JALHEREnv
 from ai_interface.trainers.base_trainer import BaseTrainer
 from ai_interface.trainers.policy_control import build_aux_team_command_providers, load_json_config
 from networking.networker import Networker, TeamInfo
+from ai_interface.algorithms.td3_jal_expandable import ExpandableJALFeatureExtractor
 
 
 class _EpisodeStatsCallback(BaseCallback):
@@ -187,7 +188,7 @@ class TD3JALHERTrainer(BaseTrainer):
     # Model
     # ------------------------------------------------------------------
 
-    def setup_model(self, env: JALHEREnv, num_robots: int):
+    def setup_model(self, env: JALHEREnv, num_robots: int, reuse_model: Optional[TD3] = None):
         self.logger.info("Setting up TD3+HER model on device: %s", self.device)
         model_params = self.config.get("model_params", {})
 
@@ -212,7 +213,7 @@ class TD3JALHERTrainer(BaseTrainer):
             n_sampled_goal, goal_selection_strategy,
         )
 
-        if self.config.get("load_model"):
+        if self.config.get("load_model") and reuse_model is None:
             load_path = self.config["load_model"]
             self.logger.info("Loading model from %s", load_path)
             self.model = TD3.load(load_path, env=env, device=str(self.device))
@@ -237,7 +238,19 @@ class TD3JALHERTrainer(BaseTrainer):
         if "net_arch" not in user_policy_kwargs:
             user_policy_kwargs["net_arch"] = [256, 256]
 
-        self.model = TD3(
+        # Optionally use the expandable encoder as the SB3 features extractor.
+        if bool(self.config.get("use_expandable_backbone", False)):
+            feature_dim = int(model_params.get("feature_dim", 64))
+            user_policy_kwargs["features_extractor_class"] = ExpandableJALFeatureExtractor
+            user_policy_kwargs["features_extractor_kwargs"] = {
+                "global_dim": int(env.non_robot_obs_dim),
+                "per_robot_dim": int(env.obs_dim_per_robot),
+                "max_robots": int(num_robots),
+                "feature_dim": feature_dim,
+                "num_heads": int(model_params.get("num_heads", 4)),
+            }
+
+        new_model = TD3(
             policy="MultiInputPolicy",       # required for Dict observation spaces
             env=env,
             replay_buffer_class=HerReplayBuffer,
@@ -262,6 +275,33 @@ class TD3JALHERTrainer(BaseTrainer):
             device=str(self.device),
             tensorboard_log=str(self.run_dir / "tensorboard"),
         )
+        # If caller supplied an existing model to reuse, transfer matching
+        # parameters into the newly constructed model (strict=False so
+        # mismatched shapes are ignored and new output heads initialize
+        # randomly). This preserves learned weights where possible while
+        # allowing action/observation dims to grow.
+        if reuse_model is not None:
+            try:
+                old_num = int(self._current_num_robots) if self._current_num_robots is not None else 1
+                action_dim_per_robot = None
+                try:
+                    action_dim_per_robot = int(new_model.env.action_space.shape[0]) // int(num_robots)
+                except Exception:
+                    action_dim_per_robot = None
+                self._transfer_policy_weights(
+                    reuse_model, new_model, old_num, int(num_robots), source_robot_idx=0,
+                    action_dim_per_robot=action_dim_per_robot,
+                )
+                # If expandable extractor is used, call its expand helper.
+                new_policy = getattr(new_model, "policy")
+                fe = getattr(new_policy, "features_extractor", None)
+                if hasattr(fe, "expand_robots"):
+                    fe.expand_robots(num_robots)
+                self.logger.info("Transferred parameters from previous model (with mapping)")
+            except Exception as e:
+                self.logger.warning("Failed to transfer parameters from previous model: %s", e)
+
+        self.model = new_model
         self.logger.info("TD3+HER model setup complete")
 
     # ------------------------------------------------------------------
@@ -327,14 +367,31 @@ class TD3JALHERTrainer(BaseTrainer):
         # updates under the new stage.
         needs_new_model = self.model is None or self._current_num_robots != num_robots
         if needs_new_model:
-            if self.model is not None:
-                self.logger.warning(
-                    "Reinitializing model from scratch for %d robots (was %s).",
-                    num_robots, self._current_num_robots,
+            # If model exists and we're expanding robot count, attempt to
+            # transfer weights into a new model constructed for the larger
+            # action/observation sizes rather than training from scratch.
+            if self.model is not None and self._current_num_robots is not None and self._current_num_robots < num_robots:
+                self.logger.info(
+                    "Expanding existing model from %d -> %d robots; attempting parameter transfer.",
+                    self._current_num_robots, num_robots,
                 )
-                self.model = None
-            self.setup_model(self.env, num_robots)
-            self._current_num_robots = num_robots
+                try:
+                    self.setup_model(self.env, num_robots, reuse_model=self.model)
+                    self._current_num_robots = num_robots
+                except Exception:
+                    self.logger.exception("Parameter transfer failed; falling back to rebuild from scratch")
+                    self.model = None
+                    self.setup_model(self.env, num_robots)
+                    self._current_num_robots = num_robots
+            else:
+                if self.model is not None:
+                    self.logger.warning(
+                        "Reinitializing model from scratch for %d robots (was %s).",
+                        num_robots, self._current_num_robots,
+                    )
+                    self.model = None
+                self.setup_model(self.env, num_robots)
+                self._current_num_robots = num_robots
         else:
             self.logger.info(
                 "Rebinding existing model to new %s env (num_robots=%d unchanged) "
@@ -451,3 +508,118 @@ class TD3JALHERTrainer(BaseTrainer):
             raise ValueError("Each team configuration must have name, n_players, and goalie_id.")
 
         return [TeamInfo(*team1_info), TeamInfo(*team2_info)]
+
+    def _transfer_policy_weights(
+        self,
+        old_model: TD3,
+        new_model: TD3,
+        old_num_robots: int,
+        new_num_robots: int,
+        source_robot_idx: int = 0,
+        action_dim_per_robot: Optional[int] = None,
+    ) -> None:
+        """Transfer and expand compatible policy weights from old_model -> new_model.
+
+        Strategy:
+        - Copy identically-shaped tensors directly.
+        - For 2D weight tensors with expanded rows (output dim growth), copy
+          old rows into the top of the new tensor and fill new rows by
+          cloning the source robot's block.
+        - For 2D weight tensors with expanded columns (input dim growth), copy
+          old columns into the left of the new tensor and fill new columns by
+          cloning source robot action columns when possible.
+        - Finally load the patched state dict into the new model policy
+          with strict=False.
+        """
+        old_policy = getattr(old_model, "policy")
+        new_policy = getattr(new_model, "policy")
+
+        old_state = old_policy.state_dict()
+        new_state = new_policy.state_dict()
+
+        # Determine some dims
+        try:
+            old_action_dim = int(old_model.action_space.shape[0])
+        except Exception:
+            old_action_dim = old_num_robots * (action_dim_per_robot or 1)
+        try:
+            new_action_dim = int(new_model.action_space.shape[0])
+        except Exception:
+            new_action_dim = new_num_robots * (action_dim_per_robot or 1)
+
+        for k, old_tensor in old_state.items():
+            if k not in new_state:
+                continue
+            new_tensor = new_state[k]
+            try:
+                if old_tensor.shape == new_tensor.shape:
+                    new_state[k] = old_tensor.clone()
+                    continue
+
+                # Handle 2D weight mismatches by expanding rows (outputs)
+                if old_tensor.ndim == 2 and new_tensor.ndim == 2:
+                    o0, o1 = old_tensor.shape
+                    n0, n1 = new_tensor.shape
+                    # row-expand case
+                    if o0 <= n0 and o1 == n1:
+                        patched = new_tensor.clone()
+                        patched[:o0, :] = old_tensor
+                        # fill extra rows by cloning source robot block when possible
+                        if action_dim_per_robot and old_action_dim % old_num_robots == 0:
+                            adpr = action_dim_per_robot
+                            src_start = source_robot_idx * adpr
+                            src_block = old_tensor[src_start:src_start + adpr, :].clone()
+                            r = o0
+                            while r < n0:
+                                patched[r, :] = src_block[(r - o0) % adpr, :]
+                                r += 1
+                        new_state[k] = patched
+                        continue
+
+                    # column-expand case
+                    if o1 <= n1 and o0 == n0:
+                        patched = new_tensor.clone()
+                        patched[:, :o1] = old_tensor
+                        if action_dim_per_robot and old_action_dim % old_num_robots == 0:
+                            adpr = action_dim_per_robot
+                            src_start = source_robot_idx * adpr
+                            src_cols = old_tensor[:, src_start:src_start + adpr].clone()
+                            c = o1
+                            while c < n1:
+                                # copy column by column from src_cols
+                                patched[:, c] = src_cols[:, (c - o1) % adpr]
+                                c += 1
+                        new_state[k] = patched
+                        continue
+
+                # Bias vectors: expand by copying source robot bias entries
+                if old_tensor.ndim == 1 and new_tensor.ndim == 1:
+                    olen = old_tensor.shape[0]
+                    nlen = new_tensor.shape[0]
+                    if olen <= nlen:
+                        patched = new_tensor.clone()
+                        patched[:olen] = old_tensor
+                        if action_dim_per_robot and old_action_dim % old_num_robots == 0:
+                            adpr = action_dim_per_robot
+                            src_start = source_robot_idx * adpr
+                            src_block = old_tensor[src_start:src_start + adpr].clone()
+                            i = olen
+                            while i < nlen:
+                                patched[i] = src_block[(i - olen) % adpr]
+                                i += 1
+                        new_state[k] = patched
+                        continue
+
+            except Exception:
+                # Skip any tensors we cannot handle; strict=False will ignore mismatches
+                continue
+
+        # Load patched params
+        try:
+            new_policy.load_state_dict(new_state, strict=False)
+        except Exception:
+            # Final fallback: non-strict load of old state
+            try:
+                new_policy.load_state_dict(old_state, strict=False)
+            except Exception as e:
+                self.logger.warning("Policy weight transfer: fallback load_state_dict failed: %s", e)

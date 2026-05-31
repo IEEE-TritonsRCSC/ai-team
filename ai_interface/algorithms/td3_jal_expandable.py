@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from gymnasium import spaces
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
 class GlobalEncoder(nn.Module):
@@ -301,4 +302,80 @@ class ExpandableJALBackbone(nn.Module):
         """Expand to support more robots."""
         self.encoder.expand_robots(new_num_robots)
         self.decoder.expand_robots(new_num_robots)
+        self.max_robots = max(self.max_robots, new_num_robots)
+
+
+class ExpandableJALFeatureExtractor(BaseFeaturesExtractor):
+    """SB3-compatible features extractor wrapping the expandable encoder.
+
+    Expects an observation Space that is a Dict with key "observation" mapping
+    to a flat Box of shape (global_dim + num_robots * per_robot_dim,).
+    The extractor returns a fixed-size feature vector of `feature_dim`.
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        global_dim: int = 4,
+        per_robot_dim: int = 8,
+        max_robots: int = 1,
+        feature_dim: int = 64,
+        num_heads: int = 4,
+        **kwargs,
+    ):
+        # features_dim is the output dimension expected by SB3 policies
+        super().__init__(observation_space, features_dim=feature_dim)
+
+        # Accept either a Dict observation_space or a Box directly.
+        if isinstance(observation_space, spaces.Dict):
+            obs_space = observation_space.spaces.get("observation")
+            if obs_space is None:
+                raise ValueError("Dict observation_space must contain 'observation' key")
+        else:
+            obs_space = observation_space
+
+        input_dim = int(obs_space.shape[0])
+
+        self.global_dim = int(global_dim)
+        self.per_robot_dim = int(per_robot_dim)
+        self.max_robots = int(max_robots)
+        self.feature_dim = int(feature_dim)
+
+        # Build the expandable encoder only — the policy heads (actor/critic)
+        # remain the SB3 default MLPs fed by this extractor's output.
+        self.encoder = ExpandableJALEncoder(
+            global_dim=self.global_dim,
+            per_robot_dim=self.per_robot_dim,
+            max_robots=self.max_robots,
+            feature_dim=self.feature_dim,
+            num_heads=int(num_heads),
+        )
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # observations passed here are the flattened 'observation' tensor when
+        # MultiInputPolicy/CombinedExtractor delegates to this extractor.
+        # If SB3 passes a dict, ensure we extract the 'observation' key.
+        if isinstance(observations, dict):
+            obs = observations["observation"]
+        else:
+            obs = observations
+
+        # SB3 will provide batch-first tensors.
+        # Determine active robots from input size at runtime if possible.
+        # Fall back to max_robots if ambiguous.
+        try:
+            batch_dim = obs.shape[0]
+            total_dim = obs.shape[1]
+            num_active = max(1, (total_dim - self.global_dim) // self.per_robot_dim)
+        except Exception:
+            num_active = self.max_robots
+
+        # Encoder returns (global_feat, aggregated_feat, per_robot_feats)
+        _g, aggregated, _per = self.encoder(obs, num_active)
+
+        return aggregated
+
+    def expand_robots(self, new_num_robots: int):
+        """Expand internal encoder to handle additional robots."""
+        self.encoder.expand_robots(new_num_robots)
         self.max_robots = max(self.max_robots, new_num_robots)
