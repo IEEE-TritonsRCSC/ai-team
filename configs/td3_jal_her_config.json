@@ -1,7 +1,7 @@
 {
   "trainer_type": "td3_jal_her",
   "team_config": "team_config.json",
-  "env_mode": "sim-only",
+  "env_mode": "sim-embedded",
   "team_name": "TritonBots",
   "curriculum": {
     "stage1_9_approach_turn_kick": {

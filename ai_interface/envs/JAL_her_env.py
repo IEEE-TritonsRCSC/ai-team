@@ -10,6 +10,10 @@ by SB3's HerReplayBuffer:
 
 Three methods are overridden relative to JALTeamEnv:
 
+    This wrapper is backend-agnostic: it works with the regular socket-based
+    simulator path and with the embedded simulator backend selected by
+    ``env_mode = "sim-embedded"``.
+
   _game_state_to_obs  — returns a dict instead of a flat array; parent's
                         reset() and step() both call this, so returning a
                         dict here is enough to make both hand back HER-style

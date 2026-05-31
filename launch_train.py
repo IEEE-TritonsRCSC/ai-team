@@ -16,6 +16,7 @@ Examples:
   python launch_train.py --num-envs 3 --trainer qlearning -- --episodes 5000 --lr 1e-3
   python launch_train.py --num-envs 2 --sim-cmd "rcssserver" --sim-port-flag "server::port="
   python launch_train.py --num-envs 2 --env sim-embedded --trainer discrete_ppo
+    python launch_train.py --num-envs 1 --env sim-embedded --trainer td3_jal_her
 """
 
 from __future__ import annotations
@@ -60,8 +61,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         choices=["sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"],
         default="sim-only",
         help="Environment mode forwarded to train.py (default: sim-only). "
-             "sim-embedded runs the synchronous embedded simulator in-process "
-             "and does not launch external rcssserver instances.",
+             "sim-embedded runs the synchronous embedded rcssserver_embedded backend "
+             "in-process and does not launch external rcssserver instances.",
     )
 
     # Simulator / monitor commands

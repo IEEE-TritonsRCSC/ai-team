@@ -11,6 +11,7 @@ import json
 import torch
 from stable_baselines3 import TD3
 
+from ai_interface.naive import SoccerAI as HeuristicSoccerAI
 from ai_interface.envs.JAL_env import JALTeamEnv
 from ai_interface.envs.JAL_her_env import JALHEREnv
 from networking.data_utils import GameState
@@ -93,6 +94,33 @@ class FrozenTD3JALPolicyController:
         return commands
 
 
+class ScriptedTeamCommandProvider:
+    """Wrap a hard-coded AI implementation behind the TeamCommandProvider protocol."""
+
+    def __init__(self, team_infos: list[Any], team_name: str, num_robots: int, controller_type: str):
+        controller_type = str(controller_type).lower()
+        if controller_type not in {"naive", "scripted_naive"}:
+            raise ValueError(f"Unsupported scripted controller_type: {controller_type!r}")
+
+        self.team_name = team_name
+        self.num_robots = int(num_robots)
+        self.controller_type = controller_type
+        self._ai = HeuristicSoccerAI(team_infos)
+
+    def predict_commands(self, game_state: GameState) -> list[str]:
+        actions = self._ai.decide_action(game_state, self.team_name)
+        return self._ai.translate_ai_output(actions)
+
+
+def _networker_team_infos(networker: Networker) -> list[Any]:
+    commander = getattr(networker, "commander", None)
+    if commander is not None and hasattr(commander, "team_infos"):
+        return list(commander.team_infos)
+    if hasattr(networker, "team_infos"):
+        return list(networker.team_infos)
+    raise AttributeError("Networker does not expose team information for scripted controllers")
+
+
 def build_aux_team_command_providers(
     policy_config: Any,
     networker: Networker,
@@ -124,6 +152,7 @@ def build_aux_team_command_providers(
 
     stage_specs = stage_config.get("aux_team_policies", [])
     controllers: Dict[str, TeamCommandProvider] = {}
+    team_infos = _networker_team_infos(networker)
 
     for raw_spec in stage_specs:
         if isinstance(raw_spec, str):
@@ -136,6 +165,23 @@ def build_aux_team_command_providers(
             spec_data.setdefault("name", spec_data.get("team_name", "aux_policy"))
         else:
             raise TypeError(f"Unsupported aux_team_policies entry: {type(raw_spec)!r}")
+
+        controller_type = str(spec_data.get("controller_type", "frozen_td3")).lower()
+        if controller_type in {"naive", "scripted_naive"}:
+            required_keys = ["team_name", "robot_ids"]
+            missing = [key for key in required_keys if key not in spec_data]
+            if missing:
+                raise ValueError(f"Scripted policy spec '{spec_data.get('name', '<unnamed>')}' is missing keys: {missing}")
+
+            team_name = str(spec_data["team_name"])
+            robot_ids = list(spec_data["robot_ids"])
+            controllers[team_name] = ScriptedTeamCommandProvider(
+                team_infos=team_infos,
+                team_name=team_name,
+                num_robots=len(robot_ids),
+                controller_type=controller_type,
+            )
+            continue
 
         required_keys = ["model_path", "team_name", "robot_ids"]
         missing = [key for key in required_keys if key not in spec_data]

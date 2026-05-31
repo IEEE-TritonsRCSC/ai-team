@@ -10,7 +10,7 @@ trainers share no state and write to separate log/model directories.
 import json
 import gymnasium as gym
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 
 import numpy as np
 import torch
@@ -88,9 +88,10 @@ class TD3JALHERTrainer(BaseTrainer):
         self,
         num_robots: int,
         robot_ids: List[int],
-        team_config_path: Optional[str] = None,
+        team_config_path: Optional[Any] = None,
         stage_config: Optional[Dict[str, Any]] = None,
     ) -> JALHEREnv:
+        team_config_spec = team_config_path or self.config["team_config"]
         # Reuse the existing networker across stages. Tearing it down and
         # re-initializing UDP connections to rcssserver between stages is
         # unreliable: Client.connect_to_sim has no socket timeout, and the
@@ -99,18 +100,21 @@ class TD3JALHERTrainer(BaseTrainer):
         # to release the old player slot. The networker holds a stable
         # connection that is identical across stages anyway — only the
         # env's behavioral knobs change.
-        team_infos = self._load_team_config(team_config_path or self.config["team_config"])
+        team_infos = self._load_team_config(team_config_spec)
         team_name = (
             (stage_config or {}).get("team_name")
             or self.config.get("team_name")
             or team_infos[0].name
         )
 
+        env_mode = str((stage_config or {}).get("env_mode", self.config.get("env_mode", "sim-embedded")))
+
+
         if self.networker is None:
             sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
             self.networker = Networker(
                 team_infos,
-                self.config.get("env_mode", "sim-only"),
+                env_mode,
                 sim_host=sim_host,
                 sim_player_port=sim_player_port,
                 sim_trainer_port=sim_trainer_port,
@@ -170,7 +174,8 @@ class TD3JALHERTrainer(BaseTrainer):
         # obs_dim is stored on the env; observation_space is now a Dict
         obs_dim = self.env.obs_dim
         self.logger.info(
-            "JAL HER environment setup — Team: %s, robots=%s, obs_dim=%d, action_dim=%d",
+            "JAL HER environment setup — env_mode=%s, Team: %s, robots=%s, obs_dim=%d, action_dim=%d",
+            env_mode,
             team_name,
             robot_ids,
             obs_dim,
@@ -280,11 +285,11 @@ class TD3JALHERTrainer(BaseTrainer):
         team_config_path = stage_config.get("team_config", self.config["team_config"])
         stage_signature = (
             stage_name,
-            team_config_path,
+            self._stage_signature_value(team_config_path),
             tuple(robot_ids),
             tuple(
                 sorted(
-                    str(item)
+                    self._stage_signature_value(item)
                     for item in stage_config.get("aux_team_policies", [])
                 )
             ),
@@ -418,14 +423,30 @@ class TD3JALHERTrainer(BaseTrainer):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _load_team_config(self, file_path: str) -> List[TeamInfo]:
-        with open(file_path, "r") as f:
-            config = json.load(f)["teams"]
+    @staticmethod
+    def _stage_signature_value(value: Any) -> str:
+        if isinstance(value, Mapping):
+            return json.dumps(value, sort_keys=True)
+        if isinstance(value, (list, tuple)):
+            return json.dumps(value)
+        return str(value)
 
-        if len(config) != 2:
+    def _load_team_config(self, team_config: Any) -> List[TeamInfo]:
+        if isinstance(team_config, Mapping):
+            config = dict(team_config)
+        else:
+            with open(team_config, "r") as f:
+                config = json.load(f)
+
+        if "teams" not in config:
+            raise ValueError("Team configuration must contain a 'teams' key.")
+
+        teams = config["teams"]
+
+        if len(teams) != 2:
             raise ValueError("Team configuration must contain exactly two teams.")
 
-        team1_info, team2_info = config
+        team1_info, team2_info = teams
         if len(team1_info) != 3 or len(team2_info) != 3:
             raise ValueError("Each team configuration must have name, n_players, and goalie_id.")
 
