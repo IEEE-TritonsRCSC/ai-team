@@ -112,6 +112,91 @@ class ScriptedTeamCommandProvider:
         return self._ai.translate_ai_output(actions)
 
 
+class MixedTeamCommandProvider:
+    """Compose a team controller from a frozen policy for some robots and a
+    scripted controller for others.
+
+    Config expects a full `robot_ids` ordering for the team and two sub-specs:
+      - `frozen_spec`: dict acceptable to FrozenTD3JALPolicySpec (model_path, robot_ids, ...)
+      - `scripted_spec`: dict acceptable to ScriptedTeamCommandProvider (team_name, robot_ids, controller_type)
+
+    predict_commands() returns a list of commands ordered according to the
+    provided `robot_ids` so it can be passed directly to Networker.execute_ai_output().
+    """
+
+    def __init__(
+        self,
+        team_name: str,
+        robot_ids: list[int],
+        frozen_spec: Optional[Dict[str, Any]],
+        scripted_spec: Optional[Dict[str, Any]],
+        networker: Networker,
+        device: torch.device | str,
+    ):
+        self.team_name = team_name
+        self.robot_ids = list(robot_ids)
+
+        self.frozen_ctrl: Optional[FrozenTD3JALPolicyController] = None
+        if frozen_spec:
+            fs = dict(frozen_spec)
+            # Ensure robot_ids list exists on frozen_spec
+            if "robot_ids" not in fs:
+                raise ValueError("frozen_spec must include 'robot_ids' list")
+            frozen_dt = FrozenTD3JALPolicySpec(
+                name=fs.get("name", "frozen"),
+                model_path=str(fs["model_path"]),
+                team_name=str(fs.get("team_name", team_name)),
+                robot_ids=list(fs["robot_ids"]),
+                obs_mode=str(fs.get("obs_mode", "her")),
+                obs_dim_per_robot=int(fs.get("obs_dim_per_robot", 8)),
+                non_robot_obs_dim=int(fs.get("non_robot_obs_dim", 4)),
+                her_distance_threshold=float(fs.get("her_distance_threshold", 0.1)),
+                max_steps=int(fs.get("max_steps", 200)),
+                debug=bool(fs.get("debug", False)),
+                deterministic=bool(fs.get("deterministic", True)),
+            )
+            self.frozen_ctrl = FrozenTD3JALPolicyController(frozen_dt, networker, device=device)
+
+        self.scripted_ctrl: Optional[ScriptedTeamCommandProvider] = None
+        if scripted_spec:
+            ss = dict(scripted_spec)
+            if "robot_ids" not in ss:
+                raise ValueError("scripted_spec must include 'robot_ids' list")
+            controller_type = ss.get("controller_type", "scripted_naive")
+            # build ScriptedTeamCommandProvider using networker team infos
+            team_infos = _networker_team_infos(networker)
+            self.scripted_ctrl = ScriptedTeamCommandProvider(
+                team_infos=team_infos,
+                team_name=str(ss.get("team_name", team_name)),
+                num_robots=len(ss["robot_ids"]),
+                controller_type=controller_type,
+            )
+        self._frozen_ids = list(frozen_spec["robot_ids"]) if frozen_spec else []
+        self._scripted_ids = list(scripted_spec["robot_ids"]) if scripted_spec else []
+
+    def predict_commands(self, game_state: GameState) -> list[str]:
+        # Collect commands from each sub-controller and map them to robot ids.
+        cmd_map: dict[int, str] = {}
+
+        if self.frozen_ctrl is not None:
+            frozen_cmds = self.frozen_ctrl.predict_commands(game_state)
+            # frozen_ctrl was constructed with its own robot_ids; zip accordingly
+            for rid, cmd in zip(self._frozen_ids, frozen_cmds):
+                cmd_map[int(rid)] = cmd
+
+        if self.scripted_ctrl is not None:
+            scripted_cmds = self.scripted_ctrl.predict_commands(game_state)
+            for rid, cmd in zip(self._scripted_ids, scripted_cmds):
+                cmd_map[int(rid)] = cmd
+
+        # Fill missing robot commands with a safe no-op (turn 0)
+        merged: list[str] = []
+        for rid in self.robot_ids:
+            merged.append(cmd_map.get(int(rid), "turn 0"))
+
+        return merged
+
+
 def _networker_team_infos(networker: Networker) -> list[Any]:
     commander = getattr(networker, "commander", None)
     if commander is not None and hasattr(commander, "team_infos"):
@@ -167,6 +252,25 @@ def build_aux_team_command_providers(
             raise TypeError(f"Unsupported aux_team_policies entry: {type(raw_spec)!r}")
 
         controller_type = str(spec_data.get("controller_type", "frozen_td3")).lower()
+        if controller_type == "mixed":
+            required_keys = ["team_name", "robot_ids"]
+            missing = [key for key in required_keys if key not in spec_data]
+            if missing:
+                raise ValueError(f"Mixed policy spec '{spec_data.get('name', '<unnamed>')}' is missing keys: {missing}")
+
+            team_name = str(spec_data["team_name"])
+            robot_ids = list(spec_data["robot_ids"])
+            frozen_spec = spec_data.get("frozen_spec")
+            scripted_spec = spec_data.get("scripted_spec")
+            controllers[team_name] = MixedTeamCommandProvider(
+                team_name=team_name,
+                robot_ids=robot_ids,
+                frozen_spec=frozen_spec,
+                scripted_spec=scripted_spec,
+                networker=networker,
+                device=device,
+            )
+            continue
         if controller_type in {"naive", "scripted_naive"}:
             required_keys = ["team_name", "robot_ids"]
             missing = [key for key in required_keys if key not in spec_data]

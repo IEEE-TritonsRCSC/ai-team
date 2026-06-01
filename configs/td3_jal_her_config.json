@@ -38,6 +38,31 @@
       }
     }
   },
+    "stage2_mixed_opponent": {
+      "description": "Example stage demonstrating a mixed opponent: scripted goalie + frozen policy for other robots.",
+      "num_robots": 1,
+      "timesteps": 50000,
+      "robot_ids": [1],
+      "aux_team_policies": [
+        {
+          "controller_type": "mixed",
+          "name": "opp_mixed",
+          "team_name": "OpponentTeam",
+          "robot_ids": [1, 2],
+          "frozen_spec": {
+            "model_path": "models/td3_jal_her/opp_frozen_checkpoint.zip",
+            "team_name": "OpponentTeam",
+            "robot_ids": [2],
+            "obs_mode": "her"
+          },
+          "scripted_spec": {
+            "team_name": "OpponentTeam",
+            "robot_ids": [1],
+            "controller_type": "scripted_naive"
+          }
+        }
+      ]
+    },
   "_removed_stages_note": "Previous Stage 1 curriculum (stage1_015_warm, stage1_060_warm, stage1_090_mid, stage1_120_mid, stage1_180_full) and the old stage3 (num_robots=3) were dropped 2026-05-20 in favor of a single approach+turn+kick stage warm-started from stage1_6_final_58pct.zip. Git history preserves the prior curriculum if it needs to be replayed. When re-adding a multi-robot stage, ensure the load_model checkpoint matches the new env's obs/action dims to avoid the shape-mismatch crash that previously hit at stage transitions.",
   "obs_dim_per_robot": 8,
   "non_robot_obs_dim": 4,
