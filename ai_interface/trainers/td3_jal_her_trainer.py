@@ -405,7 +405,9 @@ class TD3JALHERTrainer(BaseTrainer):
 
         learn_batch    = int(self.config.get("learn_batch_timesteps", 2048))
         save_interval  = int(self.config.get("save_interval", 10_000))
-        checkpoint_dir = Path(self.config.get("save_path", "models/td3_jal_her"))
+        # Keep checkpoints inside this run's datetime model directory to
+        # match BaseTrainer's per-run artifact layout used by other trainers.
+        checkpoint_dir = Path(self.model_dir)
 
         remaining         = timesteps
         stage_timesteps   = 0

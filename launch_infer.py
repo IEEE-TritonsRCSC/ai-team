@@ -35,20 +35,20 @@ script reads each summary.json and prints a comparison table.
 EXAMPLES
 --------
     # Single run with auto-launched sim + monitor window
-    python launch_infer.py models/td3_jal_her/stage1_complete.zip --steps 3000
+    python launch_infer.py models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip --steps 3000
 
     # Headless single run, 7000 steps
-    python launch_infer.py models/td3_jal_her/stage1_complete.zip \\
+    python launch_infer.py models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip \\
         --steps 7000 --no-monitor
 
     # Compare two checkpoints in parallel
     python launch_infer.py \\
-        models/td3_jal_her/stage1_complete.zip \\
-        models/td3_jal_her/<other_checkpoint>.zip \\
+        models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip \\
+        models/<datetime>_td3_jal_her/<other_checkpoint>.zip \\
         --steps 7000
 
     # Run alongside another sim already on 6000 - use a different base port
-    python launch_infer.py models/td3_jal_her/stage1_complete.zip \\
+    python launch_infer.py models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip \\
         --steps 7000 --base-port 7000
 """
 
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
 
     # Inference args forwarded to each infer.py
     parser.add_argument("--trainer", default="td3_jal_her",
-                        help="Trainer type for infer.py (default: td3_jal_her)")
+                        help="Trainer type for infer.py (default: td3_jal_her, expandable HER path)")
     parser.add_argument("--config", default="configs/td3_jal_her_config.json",
                         help="Training config for stage settings (default: "
                              "configs/td3_jal_her_config.json)")
