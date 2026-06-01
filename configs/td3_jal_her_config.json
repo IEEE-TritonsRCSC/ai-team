@@ -3,9 +3,106 @@
   "team_config": "team_config.json",
   "env_mode": "sim-embedded",
   "team_name": "TritonBots",
+  "use_expandable_backbone": true,
   "curriculum": {
-    "stage1_9_approach_turn_kick": {
-      "description": "ACTIVE (timesteps=200000). 1v0 approach + turn + kick. Warm-starts from stage1_6_final_58pct.zip (action_dim=9), which already learned turn (slot 2) and kick (slot 3). Robot now spawns at its default position (away from ball) with random orientation, and the ball is placed randomly in the opponent half — the policy must learn to use `approach_ball` (slot 1, masked during the 58% run, so its weights are essentially untrained) to navigate to the ball before turning and kicking. The kicker-cone gate was removed (2026-05-20): kicks fire whenever the ball is in kickable range regardless of orientation, matching the 58% checkpoint's training regime and rcssserver's actual kick semantics. HER `future` strategy supplies goal-conditioned relabeling so the agent sees virtual successes throughout every episode, not only on real goals.",
+    "stage1_1_kick": {
+      "description": "Stage 1.1 — learn to kick (timesteps=25000). Robot spawns AT the ball (0.5 behind, on the ball-goal axis) facing the goal with ±15° jitter; ball near the centre line (y∈[-3,3]). `turn` is DISABLED so the only meaningful skill is firing `kick` from the at-ball state. The ±15° spread (≈ the goal's angular width from x∈[5,30]) makes the kick robust to small aim error and seeds the critic with 'better alignment → more reward', which the turn stages build on. From scratch (top-level load_model=null).",
+      "num_robots": 1,
+      "timesteps": 25000,
+      "robot_ids": [1],
+      "disabled_actions": ["goto", "turn", "start_dribble", "stop_dribble"],
+      "spawn_robot_at_ball": true,
+      "random_ball_x": true,
+      "random_ball_x_range": [5.0, 30.0],
+      "random_ball_y": true,
+      "random_ball_y_range": [-3.0, 3.0],
+      "random_spawn_theta": true,
+      "random_spawn_theta_range_deg": [-15.0, 15.0],
+      "invalid_action_penalty": 0.5,
+      "reward_config_overrides": {
+        "has_ball_bonus": 0.0,
+        "near_ball_bonus": 0.0,
+        "approach_weight": 0.0,
+        "step_bonus": 0.0,
+        "goal_progress_weight": 3.0,
+        "goal_progress_clip": 2.0,
+        "ball_speed_bonus_weight": 2.0,
+        "ball_speed_threshold": 0.2,
+        "ball_speed_clip": 2.0,
+        "goal_reward": 150.0,
+        "alignment_weight": 0.0,
+        "alignment_near_ball_only": false,
+        "alignment_has_ball_only": true,
+        "kick_aim_bonus_weight": 20.0,
+        "bad_aim_kick_penalty": 0.0
+      }
+    },
+    "stage1_2_turn_warmup": {
+      "description": "Stage 1.2 — turn warmup (timesteps=35000). Introduces `turn` at a modest ±60° spawn range with the wide ball-y (y∈[-15,15]); `approach_ball` stays disabled and the robot still spawns at the ball. Bridges the pure-kick skill to turning before the ±180° jump. goal_reward normalized 70→150 and invalid_action_penalty set to 0.5 to match the surrounding stages (the logged 70/none was an older-era value that would otherwise create a goal-scale jump mid-curriculum). alignment_weight kept at 0 — alignment shaping is introduced in 1.3.",
+      "num_robots": 1,
+      "timesteps": 35000,
+      "robot_ids": [1],
+      "disabled_actions": ["goto", "approach_ball", "start_dribble", "stop_dribble"],
+      "spawn_robot_at_ball": true,
+      "random_ball_x": true,
+      "random_ball_x_range": [5.0, 30.0],
+      "random_ball_y": true,
+      "random_ball_y_range": [-15.0, 15.0],
+      "random_spawn_theta": true,
+      "random_spawn_theta_range_deg": [-60.0, 60.0],
+      "invalid_action_penalty": 0.5,
+      "reward_config_overrides": {
+        "has_ball_bonus": 0.0,
+        "near_ball_bonus": 0.0,
+        "approach_weight": 0.0,
+        "step_bonus": 0.0,
+        "goal_progress_weight": 3.0,
+        "goal_progress_clip": 2.0,
+        "ball_speed_bonus_weight": 2.0,
+        "ball_speed_threshold": 0.2,
+        "ball_speed_clip": 2.0,
+        "goal_reward": 150.0,
+        "alignment_weight": 0.0,
+        "alignment_near_ball_only": false,
+        "alignment_has_ball_only": true,
+        "kick_aim_bonus_weight": 20.0,
+        "bad_aim_kick_penalty": 0.0
+      }
+    },
+    "stage1_3_full_turn": {
+      "description": "Stage 1.3 — full ±180° turn (timesteps=150000). Robot spawns at the ball facing a random ±180° direction with wide ball-y (y∈[-15,15]); must turn to face the goal then kick. `approach_ball` re-enabled (harmless at spawn-at-ball), alignment_weight=2 provides a dense gradient toward facing the goal. This is the stage that produced the ~58% 'stage 1.6' model. Inherits weights from stage1_2_turn_warmup.",
+      "num_robots": 1,
+      "timesteps": 150000,
+      "robot_ids": [1],
+      "disabled_actions": ["goto", "start_dribble", "stop_dribble"],
+      "spawn_robot_at_ball": true,
+      "random_ball_x": true,
+      "random_ball_x_range": [5.0, 30.0],
+      "random_ball_y": true,
+      "random_ball_y_range": [-15.0, 15.0],
+      "random_spawn_theta": true,
+      "random_spawn_theta_range_deg": [-180.0, 180.0],
+      "invalid_action_penalty": 0.5,
+      "reward_config_overrides": {
+        "has_ball_bonus": 0.0,
+        "near_ball_bonus": 0.0,
+        "approach_weight": 0.0,
+        "step_bonus": 0.0,
+        "goal_progress_weight": 3.0,
+        "goal_progress_clip": 2.0,
+        "ball_speed_bonus_weight": 2.0,
+        "ball_speed_threshold": 0.2,
+        "ball_speed_clip": 2.0,
+        "goal_reward": 150.0,
+        "alignment_weight": 2.0,
+        "alignment_near_ball_only": false,
+        "alignment_has_ball_only": true,
+        "kick_aim_bonus_weight": 20.0,
+        "bad_aim_kick_penalty": 0.0
+      }
+    },
+    "stage1_4_approach_turn_kick": {
+      "description": "Stage 1.4 — approach + turn + kick (timesteps=200000). Robot now spawns at its default position AWAY from the ball with random ±180° orientation; the ball is placed randomly in the opponent half. Must use `approach_ball` to navigate to the ball, then turn and kick. approach_weight=2/clip=0.5 + near_ball_bonus=0.1 + step_bonus=-0.2 shape the navigation; alignment_weight=4 and kick_aim_bonus_weight=25 sharpen aim. This is the previous stage1_9 block, unchanged. Inherits weights from stage1_3_full_turn. HER `future` relabeling supplies goal-conditioned virtual successes throughout each episode.",
       "num_robots": 1,
       "timesteps": 200000,
       "robot_ids": [1],
@@ -38,32 +135,32 @@
       }
     }
   },
-    "stage2_mixed_opponent": {
-      "description": "Example stage demonstrating a mixed opponent: scripted goalie + frozen policy for other robots.",
-      "num_robots": 1,
-      "timesteps": 50000,
-      "robot_ids": [1],
-      "aux_team_policies": [
-        {
-          "controller_type": "mixed",
-          "name": "opp_mixed",
+  "stage2_mixed_opponent": {
+    "description": "Reference only (NOT in curriculum, so not run by the trainer). Example stage demonstrating a mixed opponent: scripted goalie + frozen policy for other robots. Move into 'curriculum' and provide opp_frozen_checkpoint.zip to activate.",
+    "num_robots": 1,
+    "timesteps": 50000,
+    "robot_ids": [1],
+    "aux_team_policies": [
+      {
+        "controller_type": "mixed",
+        "name": "opp_mixed",
+        "team_name": "OpponentTeam",
+        "robot_ids": [1, 2],
+        "frozen_spec": {
+          "model_path": "models/td3_jal_her/opp_frozen_checkpoint.zip",
           "team_name": "OpponentTeam",
-          "robot_ids": [1, 2],
-          "frozen_spec": {
-            "model_path": "models/td3_jal_her/opp_frozen_checkpoint.zip",
-            "team_name": "OpponentTeam",
-            "robot_ids": [2],
-            "obs_mode": "her"
-          },
-          "scripted_spec": {
-            "team_name": "OpponentTeam",
-            "robot_ids": [1],
-            "controller_type": "scripted_naive"
-          }
+          "robot_ids": [2],
+          "obs_mode": "her"
+        },
+        "scripted_spec": {
+          "team_name": "OpponentTeam",
+          "robot_ids": [1],
+          "controller_type": "scripted_naive"
         }
-      ]
-    },
-  "_removed_stages_note": "Previous Stage 1 curriculum (stage1_015_warm, stage1_060_warm, stage1_090_mid, stage1_120_mid, stage1_180_full) and the old stage3 (num_robots=3) were dropped 2026-05-20 in favor of a single approach+turn+kick stage warm-started from stage1_6_final_58pct.zip. Git history preserves the prior curriculum if it needs to be replayed. When re-adding a multi-robot stage, ensure the load_model checkpoint matches the new env's obs/action dims to avoid the shape-mismatch crash that previously hit at stage transitions.",
+      }
+    ]
+  },
+  "_curriculum_note": "Stage 1 is retrained from scratch (load_model=null) on the expandable backbone (use_expandable_backbone=true) as four sub-stages run in order: 1.1 learn-to-kick (turn off, ±15°) → 1.2 turn warmup (±60°) → 1.3 full ±180° turn → 1.4 approach+turn+kick (spawn away). num_robots=1 throughout, so weights carry across sub-stages (HER buffer resets each stage). The gradual 90→120 angle ramp was dropped — it learned worse than jumping ±60°→±180°. Reward configs are the authentic values recovered from the original td3_jal_her run logs; stage 1.2's goal_reward was normalized 70→150 for cross-stage scale consistency.",
   "obs_dim_per_robot": 8,
   "non_robot_obs_dim": 4,
   "max_steps": 300,
@@ -72,7 +169,7 @@
   "learn_batch_timesteps": 2048,
   "save_interval": 10000,
   "save_path": "models/td3_jal_her",
-  "load_model": "models/td3_jal_her/stage1_complete.zip",
+  "load_model": null,
   "model_params": {
     "learning_rate": 0.001,
     "buffer_size": 200000,
@@ -83,11 +180,15 @@
     "target_policy_noise": 0.2,
     "target_noise_clip": 0.5,
     "action_noise_std": 0.3,
-    "_action_noise_note": "Bumped from 0.2 → 0.3 for stage1_9 so the untrained approach_ball logit at slot 1 gets explored. The 58% checkpoint has logits near 0.8 for turn (slot 2) / kick (slot 3) and ~0 for the previously-disabled slots; with sigma=0.2 the argmax almost never flips to slot 1, and approach_ball would never be sampled. 0.3 keeps trained behaviors mostly intact (turn/kick logits ~0.8 still dominate post-noise on average) while opening a real exploration tail toward the new action.",
+    "_action_noise_note": "Global exploration sigma on the action vector. 0.3 keeps trained primitives mostly intact while leaving an exploration tail for under-trained action slots (e.g. approach_ball, unlocked in stage 1.4).",
     "learning_starts": 5000,
     "her_n_sampled_goal": 4,
     "her_goal_selection_strategy": "future",
-    "_her_strategy_note": "Switched back to 'future' (2026-05-19) after locally patching SB3 2.7.1's HerReplayBuffer._sample_goals to clamp the upper bound of the randint call — fixes the 'low >= high' crash that previously forced us onto 'final'. 'final' relabels every transition with the episode's terminal ball position, which on a 75%-off-target run reinforces the off-target behavior (HER tells the policy 'you achieved your goal' even when the ball ended up missing). 'future' relabels with diverse intermediate points and is essential for the policy to learn aim precision.",
+    "_her_strategy_note": "'future' relabels stored transitions with diverse intermediate ball positions (essential for aim precision) rather than only the episode's terminal position. Requires the local patch to SB3 2.7.1 HerReplayBuffer._sample_goals that clamps the randint upper bound.",
+    "feature_dim": 64,
+    "num_heads": 4,
+    "include_goal": true,
+    "_expandable_note": "feature_dim/num_heads configure ExpandableJALFeatureExtractor (active because top-level use_expandable_backbone=true). include_goal feeds the HER desired_goal into the encoder's global branch so a later variable-target stage (e.g. passing) can fine-tune instead of needing an architecture change. Constant goal during stage 1, so harmless now.",
     "policy_kwargs": {
       "net_arch": [256, 256]
     }

@@ -248,6 +248,11 @@ class TD3JALHERTrainer(BaseTrainer):
                 "max_robots": int(num_robots),
                 "feature_dim": feature_dim,
                 "num_heads": int(model_params.get("num_heads", 4)),
+                # Feed HER desired_goal into the encoder so a later
+                # variable-target stage (e.g. passing) can fine-tune instead
+                # of needing an architecture change. Constant during fixed-goal
+                # training, so harmless now. Default on.
+                "include_goal": bool(model_params.get("include_goal", True)),
             }
 
         new_model = TD3(
