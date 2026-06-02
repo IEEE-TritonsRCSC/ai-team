@@ -6,6 +6,7 @@ and commanding both simulated and physical robots through various network protoc
 """
 
 import re
+import math
 import random
 import time
 import socket
@@ -207,10 +208,13 @@ class EmbeddedSimulatorBackend:
             if teamname is None:
                 continue
 
+            # The embedded engine reports body_angle in radians; the rest of
+            # the stack (UDP deserializer, JAL_env) works in degrees, so convert
+            # here to keep the two backends interchangeable.
             pose = (
                 float(player.pos.x),
                 float(player.pos.y),
-                float(player.body_angle),
+                math.degrees(float(player.body_angle)),
             )
             robot_entries[teamname].append((int(player.unum), pose))
 
@@ -246,26 +250,54 @@ class EmbeddedSimulatorBackend:
 
             return self._to_game_state(self._last_state)
 
-    def reset(self) -> bool:
-        """Soft-reset players without recreating the embedded server.
+    def reset(self, ball_pos=None, player_poses_override=None) -> bool:
+        """Soft-reset the episode without recreating the embedded server.
 
         Reinitializing the native simulator every episode causes repeated
         server-side player-type logs and transient socket bind failures inside
-        the embedded module. The embedded API available here does not expose a
-        trainer-style reset, so we reposition players with `(move x y)` commands
-        and keep the existing simulator instance alive.
+        the embedded module, so we keep the simulator instance alive and use the
+        trainer-style teleports (`move_player` / `move_ball`) exposed by the
+        binding to reposition objects.
+
+        Unlike a player `(move x y)` command — which rcssserver only honours in
+        before_kick_off and which left the robot stuck out of bounds during
+        play_on — these teleports place objects directly in any play mode. We
+        force PM_PlayOn so the placed positions persist (a kick-off transition
+        would otherwise reset the ball to centre) and physics runs immediately.
+
+        Args:
+            ball_pos: optional (x, y) for the ball. Defaults to centre (0, 0).
+            player_poses_override: optional list parallel to `desired_init_poses`
+                of (obj_name, (x, y, theta_deg)) tuples. When provided, each
+                player is placed at its override pose; otherwise the fixed
+                formation init poses are used. theta is in degrees (project
+                convention) and converted to radians for the engine.
         """
         with self._lock:
-            commands = [
-                embedded_sim.PlayerCommand(
-                    side_enum,
-                    unum,
-                    f"(move {init_pose[0]} {init_pose[1]})",
-                )
-                for side_enum, unum, init_pose in self._iter_player_slots()
-            ]
+            # PlayOn first so subsequent teleports are not overwritten by a
+            # kick-off ball reset, and so the next step advances real physics.
+            self._sim.set_play_mode(embedded_sim.PlayMode.PM_PlayOn)
+
+            override_poses = None
+            if player_poses_override is not None:
+                override_poses = [pose for _obj_name, pose in player_poses_override]
+
+            for idx, (side_enum, unum, init_pose) in enumerate(self._iter_player_slots()):
+                if override_poses is not None and idx < len(override_poses):
+                    pose = override_poses[idx]
+                else:
+                    pose = init_pose
+                x, y = float(pose[0]), float(pose[1])
+                theta_deg = float(pose[2]) if len(pose) > 2 else 0.0
+                self._sim.move_player(side_enum, unum, x, y, math.radians(theta_deg))
+
+            bx, by = (0.0, 0.0) if ball_pos is None else (float(ball_pos[0]), float(ball_pos[1]))
+            self._sim.move_ball(bx, by, 0.0, 0.0)
+
+            # Refresh the cached state so the next watch_game/snapshot reflects
+            # the teleported positions without consuming a simulator step.
             self._pending_commands.clear()
-            self._last_state = self._sim.step(commands)
+            self._last_state = self._sim.snapshot()
         return True
 
     def shutdown(self):
@@ -616,14 +648,22 @@ class Commander:
         sock.sendto(command, addr)
         print(command, addr)
 
-    def reset_sim(self) -> bool:
+    def reset_sim(self, ball_pos=None, player_poses_override=None) -> bool:
         """Reset simulator by moving players to initial positions.
-        
+
+        Args:
+            ball_pos: optional (x, y) ball start (embedded backend only).
+            player_poses_override: optional per-episode poses parallel to
+                desired_init_poses (embedded backend only).
+
         Returns:
             True if at least one player reset command was sent successfully.
         """
         if self.embedded_backend is not None:
-            return self.embedded_backend.reset()
+            return self.embedded_backend.reset(
+                ball_pos=ball_pos,
+                player_poses_override=player_poses_override,
+            )
 
         if not hasattr(self, "sim_clients"):
             return False

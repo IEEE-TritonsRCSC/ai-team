@@ -6,11 +6,11 @@
   "use_expandable_backbone": true,
   "curriculum": {
     "stage1_1_kick": {
-      "description": "Stage 1.1 — learn to kick (timesteps=25000). Robot spawns AT the ball (0.5 behind, on the ball-goal axis) facing the goal with ±15° jitter; ball near the centre line (y∈[-3,3]). `turn` is DISABLED so the only meaningful skill is firing `kick` from the at-ball state. The ±15° spread (≈ the goal's angular width from x∈[5,30]) makes the kick robust to small aim error and seeds the critic with 'better alignment → more reward', which the turn stages build on. From scratch (top-level load_model=null).",
+      "description": "Stage 1.1 — learn to kick (timesteps=25000). Robot spawns AT the ball (0.5 behind, on the ball-goal axis) facing the goal with ±15° jitter; ball near the centre line (y∈[-3,3]). `turn` and `approach_ball` are DISABLED so the only selectable action is firing `kick` from the at-ball state. The ±15° spread (≈ the goal's angular width from x∈[5,30]) makes the kick robust to small aim error and seeds the critic with 'better alignment → more reward', which the turn stages build on. From scratch (top-level load_model=null).",
       "num_robots": 1,
       "timesteps": 25000,
       "robot_ids": [1],
-      "disabled_actions": ["goto", "turn", "start_dribble", "stop_dribble"],
+      "disabled_actions": ["goto", "approach_ball", "turn", "start_dribble", "stop_dribble"],
       "spawn_robot_at_ball": true,
       "random_ball_x": true,
       "random_ball_x_range": [5.0, 30.0],
