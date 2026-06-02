@@ -5,4 +5,4 @@ game_logs/
 train_logs/
 text_logs/
 .DS_Store
-**/*.Identifier
+**/*.IdentifierCHANGES.md
