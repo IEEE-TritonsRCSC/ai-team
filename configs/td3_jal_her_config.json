@@ -3,6 +3,7 @@
   "team_config": "team_config.json",
   "env_mode": "sim-embedded",
   "team_name": "TritonBots",
+  "device": "cpu",
   "use_expandable_backbone": true,
   "curriculum": {
     "stage1_1_kick": {
