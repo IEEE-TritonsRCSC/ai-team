@@ -49,5 +49,15 @@ replace_server_param "drop_ball_time" "99999"
 # min wall-clock), after which no goals can be scored and reward = 0.
 replace_server_param "half_time" "99999"
 replace_server_param "nr_normal_halfs" "99999"
+# Match the real robots' kick exit speed (~5.75 m/s, per mechanical-team video
+# analysis). Scale: 1 sim unit = 0.1 m, 1 cycle = 0.1 s, so units/cycle = m/s.
+# A power-100 kick imparts eff_power = 100*kick_power_rate at ideal contact,
+# clipped by ball_accel_max then ball_speed_max. 100*0.0575 = 5.75 units/cycle,
+# with accel/speed ceilings raised above it so they don't clip.
+# NOTE: ball_decay (friction) left at default 0.94 for now — refine once the
+# mechanical team provides velocity-loss-per-meter (matters for Stage 2+).
+replace_server_param "kick_power_rate" "0.0575"
+replace_server_param "ball_accel_max" "5.8"
+replace_server_param "ball_speed_max" "6"
 
 echo "Configuration file updated: $CONFIG_FILE"
