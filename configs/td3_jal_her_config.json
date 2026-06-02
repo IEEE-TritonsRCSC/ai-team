@@ -6,6 +6,41 @@
   "device": "cpu",
   "use_expandable_backbone": true,
   "curriculum": {
+    "stage1_2_turn_warmup": {
+      "description": "[ACTIVE] Stage 1.2 — turn warmup (timesteps=35000). Introduces `turn` at a modest ±60° spawn range with the wide ball-y (y∈[-15,15]); `approach_ball` stays disabled and the robot still spawns at the ball. Bridges the pure-kick skill to turning before the ±180° jump. goal_reward normalized 70→150 and invalid_action_penalty set to 0.5 to match the surrounding stages. alignment_weight kept at 0 — alignment shaping is introduced in 1.3. Warm-started from Stage 1.1 via top-level load_model.",
+      "num_robots": 1,
+      "timesteps": 35000,
+      "robot_ids": [1],
+      "disabled_actions": ["goto", "approach_ball", "start_dribble", "stop_dribble"],
+      "spawn_robot_at_ball": true,
+      "random_ball_x": true,
+      "random_ball_x_range": [5.0, 30.0],
+      "random_ball_y": true,
+      "random_ball_y_range": [-15.0, 15.0],
+      "random_spawn_theta": true,
+      "random_spawn_theta_range_deg": [-60.0, 60.0],
+      "invalid_action_penalty": 0.5,
+      "reward_config_overrides": {
+        "has_ball_bonus": 0.0,
+        "near_ball_bonus": 0.0,
+        "approach_weight": 0.0,
+        "step_bonus": 0.0,
+        "goal_progress_weight": 3.0,
+        "goal_progress_clip": 2.0,
+        "ball_speed_bonus_weight": 2.0,
+        "ball_speed_threshold": 0.2,
+        "ball_speed_clip": 2.0,
+        "goal_reward": 150.0,
+        "alignment_weight": 0.0,
+        "alignment_near_ball_only": false,
+        "alignment_has_ball_only": true,
+        "kick_aim_bonus_weight": 20.0,
+        "bad_aim_kick_penalty": 0.0
+      }
+    }
+  },
+  "_completed_substages": {
+    "_note": "Finished sub-stages, archived with their full config for reference. The trainer ONLY runs blocks under 'curriculum', so nothing here re-runs. stage1_1_kick: completed run 20260602_132531 — 65% goal rate (see TRAINING.md §11); checkpoint models/20260602_132531_672811_td3_jal_her/stage1_1_kick_complete.zip.",
     "stage1_1_kick": {
       "description": "Stage 1.1 — learn to kick (timesteps=25000). Robot spawns AT the ball (0.5 behind, on the ball-goal axis) facing the goal with ±15° jitter; ball near the centre line (y∈[-3,3]). `turn` and `approach_ball` are DISABLED so the only selectable action is firing `kick` from the at-ball state. The ±15° spread (≈ the goal's angular width from x∈[5,30]) makes the kick robust to small aim error and seeds the critic with 'better alignment → more reward', which the turn stages build on. From scratch (top-level load_model=null).",
       "num_robots": 1,
@@ -40,39 +75,7 @@
     }
   },
   "_pending_substages": {
-    "_how_to_advance": "Run one sub-stage at a time. After a stage finishes, inspect the run, make any tweaks, then advance: (1) move the next stage's block from here into 'curriculum' (and remove the finished one), (2) set top-level 'load_model' to the finished stage's checkpoint, e.g. models/td3_jal_her/stage1_1_kick_complete.zip, (3) re-run the same launch command. num_robots stays 1 across all four, so TD3.load restores the expandable policy and the weights carry; the HER buffer is collected fresh each run.",
-    "stage1_2_turn_warmup": {
-      "description": "Stage 1.2 — turn warmup (timesteps=35000). Introduces `turn` at a modest ±60° spawn range with the wide ball-y (y∈[-15,15]); `approach_ball` stays disabled and the robot still spawns at the ball. Bridges the pure-kick skill to turning before the ±180° jump. goal_reward normalized 70→150 and invalid_action_penalty set to 0.5 to match the surrounding stages (the logged 70/none was an older-era value that would otherwise create a goal-scale jump mid-curriculum). alignment_weight kept at 0 — alignment shaping is introduced in 1.3. Set load_model to stage1_1_kick_complete.zip before running.",
-      "num_robots": 1,
-      "timesteps": 35000,
-      "robot_ids": [1],
-      "disabled_actions": ["goto", "approach_ball", "start_dribble", "stop_dribble"],
-      "spawn_robot_at_ball": true,
-      "random_ball_x": true,
-      "random_ball_x_range": [5.0, 30.0],
-      "random_ball_y": true,
-      "random_ball_y_range": [-15.0, 15.0],
-      "random_spawn_theta": true,
-      "random_spawn_theta_range_deg": [-60.0, 60.0],
-      "invalid_action_penalty": 0.5,
-      "reward_config_overrides": {
-        "has_ball_bonus": 0.0,
-        "near_ball_bonus": 0.0,
-        "approach_weight": 0.0,
-        "step_bonus": 0.0,
-        "goal_progress_weight": 3.0,
-        "goal_progress_clip": 2.0,
-        "ball_speed_bonus_weight": 2.0,
-        "ball_speed_threshold": 0.2,
-        "ball_speed_clip": 2.0,
-        "goal_reward": 150.0,
-        "alignment_weight": 0.0,
-        "alignment_near_ball_only": false,
-        "alignment_has_ball_only": true,
-        "kick_aim_bonus_weight": 20.0,
-        "bad_aim_kick_penalty": 0.0
-      }
-    },
+    "_how_to_advance": "Run one sub-stage at a time. After a stage finishes, inspect the run, make any tweaks, then advance: (1) move the next stage's block from here into 'curriculum', and move the FINISHED stage's block into '_completed_substages' (archived, not deleted — the trainer only runs 'curriculum'), (2) set top-level 'load_model' to the finished stage's checkpoint — note checkpoints land in a timestamped dir, e.g. models/<TIMESTAMP>_td3_jal_her/<stage>_complete.zip, (3) re-run the same launch command. num_robots stays 1 across all four, so TD3.load restores the expandable policy and the weights carry; the HER buffer is collected fresh each run.",
     "stage1_3_full_turn": {
       "description": "Stage 1.3 — full ±180° turn (timesteps=150000). Robot spawns at the ball facing a random ±180° direction with wide ball-y (y∈[-15,15]); must turn to face the goal then kick. `approach_ball` re-enabled (harmless at spawn-at-ball), alignment_weight=2 provides a dense gradient toward facing the goal. This is the stage that produced the ~58% 'stage 1.6' model. Set load_model to stage1_2_turn_warmup_complete.zip before running.",
       "num_robots": 1,
@@ -173,7 +176,7 @@
   "learn_batch_timesteps": 2048,
   "save_interval": 10000,
   "save_path": "models/td3_jal_her",
-  "load_model": null,
+  "load_model": "models/20260602_132531_672811_td3_jal_her/stage1_1_kick_complete.zip",
   "model_params": {
     "learning_rate": 0.001,
     "buffer_size": 200000,
