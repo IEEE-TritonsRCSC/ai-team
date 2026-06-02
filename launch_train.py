@@ -225,6 +225,13 @@ def wait_for_exit(procs: list[subprocess.Popen]) -> int:
 def main() -> int:
     args, extra_train_args = parse_args()
 
+    # argparse's parse_known_args leaves the "--" separator in the extras when
+    # callers use the documented `... -- --config x` form. Strip a leading "--"
+    # so it isn't forwarded to train.py (which has no positionals and would
+    # error on "unrecognized arguments: --").
+    if extra_train_args and extra_train_args[0] == "--":
+        extra_train_args = extra_train_args[1:]
+
     # Validate inputs
     if args.num_envs < 1:
         print("--num-envs must be >= 1", file=sys.stderr)
