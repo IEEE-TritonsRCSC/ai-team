@@ -368,14 +368,32 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
             f"Failed to load trainer '{trainer_type}' from {module_name}.{class_name}: {e}"
         ) from e
     
-    # Determine device and pass to trainer so models/data can be placed on CUDA when available
-    device = torch.device("cpu")
+    # Determine device and pass to trainer so models/data can be placed on CUDA when available.
+    # An explicit config["device"] (set via --device) overrides auto-selection — useful for
+    # benchmarking cpu vs mps, since for small nets + small batch MPS overhead can lose to CPU.
+    requested = config.get("device")
+    if requested:
+        requested = str(requested).lower()
+        if requested == "cuda" and not torch.cuda.is_available():
+            print("WARNING: device='cuda' requested but CUDA unavailable; falling back to auto-select.")
+            requested = None
+        elif requested == "mps" and not torch.backends.mps.is_available():
+            print("WARNING: device='mps' requested but MPS unavailable; falling back to auto-select.")
+            requested = None
+        elif requested not in ("cpu", "cuda", "mps"):
+            print(f"WARNING: unknown device='{requested}'; falling back to auto-select.")
+            requested = None
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
+    if requested:
+        device = torch.device(requested)
+    else:
+        device = torch.device("cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
 
+    print(f"Using device: {device}")
     return trainer_cls(config, device=device)
 
 
@@ -423,7 +441,10 @@ Examples:
                         help="Base simulator player port (env0; default: 6000). Trainer port uses player_port+1")
     parser.add_argument("--sim_port_stride", type=int, default=None,
                         help="Port stride between parallel envs (default: 10, recommended >= 3)")
-    
+    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps"],
+                        help="Force the torch device (default: auto-select cuda>mps>cpu). "
+                             "Use to benchmark cpu vs mps — for small nets + small batch, cpu often wins.")
+
     # Episode-based trainers (hier_ppo, discrete_ppo, mappo)
     parser.add_argument("--episodes", type=int, default=1000,
                         help="Number of episodes to train (hier_ppo, discrete_ppo, mappo)")
@@ -523,12 +544,14 @@ Examples:
             "sim_host": args.sim_host,
             "sim_player_port": args.sim_player_port,
             "sim_port_stride": args.sim_port_stride,
+            "device": args.device,
         }
         runtime_defaults = {
             "num_envs": 1,
             "sim_host": "127.0.0.1",
             "sim_player_port": 6000,
             "sim_port_stride": 10,
+            "device": None,
         }
         for key, value in runtime_overrides.items():
             if value is not None:
