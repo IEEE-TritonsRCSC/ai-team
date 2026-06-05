@@ -1165,11 +1165,17 @@ class JALTeamEnv(gym.Env):
     # shaping signal: "kicks past x=35 must hit the goal mouth, not the sides".
     _RIGHT_PENALTY_AREA_X: float = 35.0
 
-    # Position-jump tolerances for the teleport backstop. A ball under any
-    # normal physics moves at most ~3 units/cycle (and decays fast). The robot,
-    # under our Stage 1 action mask, cannot move at all (only kick/turn are
-    # selectable). Anything beyond these is a server-side teleport.
-    _BALL_TELEPORT_THRESHOLD: float = 5.0
+    # Position-jump tolerances for the teleport backstop. A ball cannot move
+    # more than `ball_speed_max` units in one cycle (position advances by the
+    # velocity, which the server clips to ball_speed_max). This threshold MUST
+    # stay above ball_speed_max (server.conf) or legitimate kicks get flagged as
+    # teleports and episodes die after one step. ball_speed_max is currently 6
+    # (raised from 3 to give a ~5.75 m/s kick exit), so 8.0 leaves headroom for
+    # noise/wind while still catching real server teleports (which jump the ball
+    # tens of units). If you raise ball_speed_max again, raise this too.
+    # The robot, under our Stage 1 action mask, cannot move at all (only kick is
+    # selectable), so its tolerance stays tight.
+    _BALL_TELEPORT_THRESHOLD: float = 8.0
     _ROBOT_TELEPORT_THRESHOLD: float = 1.0
 
     # Ball-stopped detection. Speed under this threshold for N consecutive

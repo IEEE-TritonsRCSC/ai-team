@@ -107,7 +107,12 @@ class Networker:
                       Use this to pre-position robots per-episode (e.g. spawn at ball).
         """
         if _uses_embedded_simulator(self.environment):
-            self.commander.reset_sim()
+            # Embedded backend now honours per-episode ball/player placement via
+            # trainer-style teleports, matching the UDP path below.
+            self.commander.reset_sim(
+                ball_pos=ball_pos,
+                player_poses_override=player_poses_override,
+            )
             return
 
 

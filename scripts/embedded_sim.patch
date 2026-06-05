@@ -1,0 +1,130 @@
+diff --git a/EMBEDDED_SIMULATOR_INTERFACE.md b/EMBEDDED_SIMULATOR_INTERFACE.md
+index 776412d..23d3b3a 100644
+--- a/EMBEDDED_SIMULATOR_INTERFACE.md
++++ b/EMBEDDED_SIMULATOR_INTERFACE.md
+@@ -18,9 +18,31 @@ public:
+     void startMatch();
+     EmbeddedGameState step( const std::vector< EmbeddedPlayerCommand > & commands );
+     EmbeddedGameState snapshot() const;
++
++    // Trainer-style teleports (work in any play mode), for per-episode resets.
++    bool moveBall( double x, double y, double vx = 0.0, double vy = 0.0 );
++    bool movePlayer( Side side, int unum, double x, double y, double body_angle );
++    void setPlayMode( PlayMode pm );
+ };
+ ```
+ 
++## Per-episode reset / teleport
++
++Player `(move x y)` commands are only honoured by the engine in
++`before_kick_off`. For RL curricula that re-place the ball and robots every
++episode while staying in `play_on`, use the trainer-style teleports, which
++place objects directly regardless of play mode:
++
++```python
++sim.set_play_mode(rcssserver_embedded.PlayMode.PM_PlayOn)  # so placements persist
++sim.move_player(side, unum, x, y, body_angle_radians)      # angle in RADIANS
++sim.move_ball(ball_x, ball_y)                              # vx, vy default to 0
++```
++
++Note: `move_player` takes the body angle in **radians** (native engine unit),
++and `EmbeddedPlayerState.body_angle` from `snapshot()` is also in radians —
++callers working in degrees must convert at the boundary.
++
+ ## Inputs
+ 
+ ### Team setup
+diff --git a/src/embedded_simulator/embeddedsimulator.cpp b/src/embedded_simulator/embeddedsimulator.cpp
+index 56312dc..747893c 100644
+--- a/src/embedded_simulator/embeddedsimulator.cpp
++++ b/src/embedded_simulator/embeddedsimulator.cpp
+@@ -161,6 +161,43 @@ EmbeddedSimulator::step( const std::vector< EmbeddedPlayerCommand > & commands )
+     return snapshot();
+ }
+ 
++bool
++EmbeddedSimulator::moveBall( double x, double y, double vx, double vy )
++{
++    if ( ! M_initialized )
++    {
++        return false;
++    }
++
++    M_stadium.moveBall( PVector( x, y ), PVector( vx, vy ) );
++    return true;
++}
++
++bool
++EmbeddedSimulator::movePlayer( Side side,
++                               int unum,
++                               double x,
++                               double y,
++                               double body_angle )
++{
++    if ( ! M_initialized )
++    {
++        return false;
++    }
++
++    const PVector pos( x, y );
++    return M_stadium.movePlayer( side, unum, pos, &body_angle, nullptr );
++}
++
++void
++EmbeddedSimulator::setPlayMode( PlayMode pm )
++{
++    if ( M_initialized )
++    {
++        M_stadium.changePlayMode( pm );
++    }
++}
++
+ EmbeddedGameState
+ EmbeddedSimulator::snapshot() const
+ {
+diff --git a/src/embedded_simulator/embeddedsimulator.h b/src/embedded_simulator/embeddedsimulator.h
+index bfc1c77..b7a4c62 100644
+--- a/src/embedded_simulator/embeddedsimulator.h
++++ b/src/embedded_simulator/embeddedsimulator.h
+@@ -54,6 +54,14 @@ public:
+     EmbeddedGameState step( const std::vector< EmbeddedPlayerCommand > & commands );
+     EmbeddedGameState snapshot() const;
+ 
++    // Trainer-style teleports for per-episode curriculum resets. Unlike a
++    // player "(move x y)" command (only honoured in before_kick_off), these
++    // place objects directly regardless of the current play mode. Angles are
++    // in radians, matching the native engine convention.
++    bool moveBall( double x, double y, double vx = 0.0, double vy = 0.0 );
++    bool movePlayer( Side side, int unum, double x, double y, double body_angle );
++    void setPlayMode( PlayMode pm );
++
+ private:
+     Stadium M_stadium;
+     bool M_initialized = false;
+diff --git a/src/embedded_simulator/pybind_embeddedsimulator.cpp b/src/embedded_simulator/pybind_embeddedsimulator.cpp
+index de88289..f0bc8ab 100644
+--- a/src/embedded_simulator/pybind_embeddedsimulator.cpp
++++ b/src/embedded_simulator/pybind_embeddedsimulator.cpp
+@@ -155,5 +155,21 @@ PYBIND11_MODULE( _core, module )
+               py::arg( "version" ) = 18.0 )
+         .def( "start_match", &EmbeddedSimulator::startMatch )
+         .def( "step", &EmbeddedSimulator::step, py::arg( "commands" ) )
+-        .def( "snapshot", &EmbeddedSimulator::snapshot );
++        .def( "snapshot", &EmbeddedSimulator::snapshot )
++        .def( "move_ball", &EmbeddedSimulator::moveBall,
++              py::arg( "x" ),
++              py::arg( "y" ),
++              py::arg( "vx" ) = 0.0,
++              py::arg( "vy" ) = 0.0,
++              "Teleport the ball to (x, y) with optional velocity. Works in any play mode." )
++        .def( "move_player", &EmbeddedSimulator::movePlayer,
++              py::arg( "side" ),
++              py::arg( "unum" ),
++              py::arg( "x" ),
++              py::arg( "y" ),
++              py::arg( "body_angle" ),
++              "Teleport a player to (x, y) facing body_angle (radians). Works in any play mode." )
++        .def( "set_play_mode", &EmbeddedSimulator::setPlayMode,
++              py::arg( "playmode" ),
++              "Force the current play mode (e.g. PM_PlayOn) so teleported positions persist." );
+ }

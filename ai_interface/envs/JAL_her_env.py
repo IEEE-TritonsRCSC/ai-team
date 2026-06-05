@@ -116,47 +116,43 @@ class JALHEREnv(JALTeamEnv):
         self._prev_ball_to_desired_dist = None
         return obs, info
 
+    # ------------------------------------------------------------------
+    # step — send frozen-policy teammates (if any), then delegate to parent
+    #
+    # The ONLY thing this override adds over JALTeamEnv.step() is sending
+    # commands for auxiliary frozen/scripted teams in the same simulator
+    # cycle as the learner's own commands. Everything else — goal detection
+    # via _check_terminal, the kick-aim bonus, ball-dead / max_steps
+    # penalties, "Episode N ended" logging, single-fetch cycle reuse via
+    # _cached_game_state — is handled by the parent. A previous version of
+    # this method re-implemented step() and hardcoded `terminated = False`,
+    # so goals never ended an episode (every episode ran the full max_steps,
+    # reward pinned at step_bonus*max_steps) and the policy collapsed to
+    # inaction. Delegating to super() keeps those bugs from coming back.
+    # ------------------------------------------------------------------
+
     def step(
         self,
         action: np.ndarray,
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Step the HER env while optionally sending frozen-policy teammates."""
-        self.current_step += 1
+        """Send frozen-policy teammate commands, then run the parent step."""
+        if self.aux_team_command_providers:
+            # Use the state the parent will reuse this cycle so the aux
+            # commands are built from the same frame and we avoid a second
+            # fetch (which would consume an extra simulator cycle).
+            current_game_state = self._cached_game_state
+            if current_game_state is None:
+                current_game_state = self._get_game_state(
+                    retries=self.state_retry_count,
+                    sleep_s=self.state_retry_sleep_s,
+                )
+                self._cached_game_state = current_game_state
 
-        current_game_state = self._get_game_state(
-            retries=self.state_retry_count,
-            sleep_s=self.state_retry_sleep_s,
-        )
+            aux_team_commands = self._build_aux_team_commands(current_game_state)
+            for team_name, team_commands in aux_team_commands.items():
+                self._send_team_commands(team_name, team_commands)
 
-        aux_team_commands = self._build_aux_team_commands(current_game_state)
-        commands, action_info = self._action_to_commands(action, current_game_state)
-
-        self.episode_actions.append(action_info["action_type"])
-
-        for team_name, team_commands in aux_team_commands.items():
-            self._send_team_commands(team_name, team_commands)
-        self._send_commands(commands)
-
-        next_game_state = self._get_game_state(
-            retries=self.state_retry_count,
-            sleep_s=self.state_retry_sleep_s,
-        )
-        obs = self._game_state_to_obs(next_game_state)
-
-        reward = self._calculate_reward(next_game_state)
-        invalid_action_count = int(action_info.get("invalid_action_count", 0))
-        if invalid_action_count > 0 and self.invalid_action_penalty > 0.0:
-            reward -= self.invalid_action_penalty * invalid_action_count
-        self.total_rewards += reward
-        terminated = False
-        truncated = self.current_step >= self.max_steps
-        info = {
-            "action_info": action_info,
-            "reward": reward,
-            "total_reward": self.total_rewards,
-            "invalid_action_count": invalid_action_count,
-        }
-        return obs, reward, terminated, truncated, info
+        return super().step(action)
 
     # ------------------------------------------------------------------
     # _game_state_to_obs override
