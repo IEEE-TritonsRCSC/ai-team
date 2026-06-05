@@ -102,6 +102,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
             "td3_jal_curriculum",
             "td3_jal_her",
             "qlearning",
+            "attention_mappo",
         ],
         default="discrete_ppo",
         help="Trainer type forwarded to train.py (default: discrete_ppo)",

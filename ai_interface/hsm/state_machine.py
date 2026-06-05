@@ -126,7 +126,13 @@ class AgentHSM:
 
 
 class TeamCoordinator:
-    """Assign deterministic roles to agents from global game state."""
+    """Assign deterministic roles to agents from global game state.
+
+    For teams larger than 4 agents, pass an explicit role_budget dict, e.g.:
+        role_budget={Role.STRIKER: 2, Role.SUPPORT: 1, Role.DEFENDER: 2, Role.GOALIE: 1}
+    When role_budget is None (default) the legacy single-striker logic is used,
+    preserving backwards compatibility with all existing 4-agent environments.
+    """
 
     def __init__(
         self,
@@ -135,12 +141,14 @@ class TeamCoordinator:
         possession_distance: float = POSSESSION_DISTANCE,
         defensive_x_boundary: float = DEFENSIVE_X_BOUNDARY,
         attacking_x_boundary: float = ATTACKING_X_BOUNDARY,
+        role_budget: Optional[Dict[Role, int]] = None,
     ):
         self.num_agents = num_agents
         self.role_switch_cooldown = role_switch_cooldown
         self.possession_distance = possession_distance
         self.defensive_x_boundary = defensive_x_boundary
         self.attacking_x_boundary = attacking_x_boundary
+        self.role_budget = role_budget  # None → legacy single-striker behaviour
         self._last_roles: Dict[int, Role] = {i: Role.SUPPORT for i in range(num_agents)}
         self._last_switch_step: Dict[int, int] = {i: -10_000 for i in range(num_agents)}
 
@@ -213,7 +221,12 @@ class TeamCoordinator:
                     else:
                         assignments[agent_id] = Role.SUPPORT
 
-        assignments = self._resolve_conflicts(assignments, team_positions, (ball_x, ball_y), goalie_id)
+        if self.role_budget is not None:
+            assignments = self._resolve_conflicts_budgeted(
+                assignments, team_positions, (ball_x, ball_y), goalie_id
+            )
+        else:
+            assignments = self._resolve_conflicts(assignments, team_positions, (ball_x, ball_y), goalie_id)
         assignments = self._apply_switch_cooldown(assignments, step, forced_roles)
 
         self._last_roles = dict(assignments)
@@ -266,6 +279,55 @@ class TeamCoordinator:
         assignments[goalie_id] = Role.GOALIE
 
         return assignments
+
+    def _resolve_conflicts_budgeted(
+        self,
+        assignments: Dict[int, Role],
+        team_positions: Dict[int, Tuple[float, float]],
+        ball_pos: Tuple[float, float],
+        goalie_id: int,
+    ) -> Dict[int, Role]:
+        """Enforce an explicit role budget (e.g. 2 strikers, 2 defenders for 6 agents).
+
+        Assignment order:
+          1. Goalie: agent nearest own goal (already fixed).
+          2. STRIKERs: N closest non-goalie agents to ball.
+          3. DEFENDERs: N agents with lowest x-coordinate (deepest in own half).
+          4. SUPPORTs: remaining agents.
+        """
+        budget = dict(self.role_budget)
+        result: Dict[int, Role] = {goalie_id: Role.GOALIE}
+
+        non_goalie = [i for i in team_positions if i != goalie_id]
+
+        # Strikers: closest to ball
+        n_strikers = budget.get(Role.STRIKER, 1)
+        sorted_by_ball = sorted(
+            non_goalie, key=lambda i: self._distance(team_positions[i], ball_pos)
+        )
+        strikers = sorted_by_ball[:n_strikers]
+        for i in strikers:
+            result[i] = Role.STRIKER
+        remaining = [i for i in sorted_by_ball if i not in result]
+
+        # Defenders: deepest in own half (lowest x) among remaining
+        n_defenders = budget.get(Role.DEFENDER, 1)
+        sorted_by_x = sorted(remaining, key=lambda i: team_positions[i][0])
+        defenders = sorted_by_x[:n_defenders]
+        for i in defenders:
+            result[i] = Role.DEFENDER
+        remaining = [i for i in remaining if i not in result]
+
+        # Support: everyone left
+        for i in remaining:
+            result[i] = Role.SUPPORT
+
+        # Honor forced assignments that weren't already set
+        for agent_id, role in assignments.items():
+            if agent_id not in result:
+                result[agent_id] = role
+
+        return result
 
     def _apply_switch_cooldown(
         self,

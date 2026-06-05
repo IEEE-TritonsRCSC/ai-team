@@ -334,6 +334,64 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
                 "kl_lr_halve_factor": 2.0,
             },
         }
+    elif trainer_type == "attention_mappo":
+        return {
+            **base_config,
+            "obs_dim": 57,
+            "max_steps": args.max_steps,
+            "save_interval": args.save_interval,
+            "load_model": args.load_model or args.resume_checkpoint,
+            "algorithm": {
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "lr_actor": 3e-4,
+                "lr_critic": 1e-3,
+                "lr_encoder": 5e-4,
+                "clip_eps": 0.2,
+                "entropy_coef": 0.01,
+                "value_coef": 0.5,
+                "max_grad_norm": 0.5,
+                "ppo_epochs": 4,
+                "rollout_length": 2048,
+                "minibatch_size": 256,
+                "min_std": 0.1,
+                "agent_embed_dim": 128,
+                "num_attn_heads": 4,
+                "num_attn_layers": 2,
+                "actor_hidden": [256, 256],
+                "selfplay_swap_interval": 200,
+            },
+            "hsm_thresholds": {
+                "possession_distance": 1.35,
+                "defensive_x_boundary": -10.0,
+                "attacking_x_boundary": 10.0,
+                "role_switch_cooldown": 8,
+            },
+            "curriculum": {
+                "stage1": {"num_agents": 1, "episodes": 300, "max_steps": 200,
+                           "opponent_type": "none", "warm_start_from_previous": False,
+                           "forced_roles": {"0": "STRIKER"},
+                           "reward_weights": {"formation_spread_weight": 0.0}},
+                "stage2": {"num_agents": 3, "episodes": 400, "opponent_type": "none",
+                           "warm_start_from_previous": True,
+                           "reward_weights": {"formation_spread_weight": 0.05}},
+                "stage3": {"num_agents": 6, "episodes": 500, "opponent_type": "none",
+                           "warm_start_from_previous": True,
+                           "reward_weights": {"formation_spread_weight": 0.1,
+                                              "striker_coord_weight": 0.1,
+                                              "defender_coverage_weight": 0.1}},
+                "stage4": {"num_agents": 6, "episodes": 600, "opponent_type": "scripted",
+                           "warm_start_from_previous": True,
+                           "reward_weights": {"formation_spread_weight": 0.1,
+                                              "striker_coord_weight": 0.15,
+                                              "defender_coverage_weight": 0.15}},
+                "stage5": {"num_agents": 6, "episodes": 1500, "opponent_type": "self_play",
+                           "warm_start_from_previous": True, "selfplay_swap_interval": 200,
+                           "reward_weights": {"formation_spread_weight": 0.1,
+                                              "striker_coord_weight": 0.2,
+                                              "defender_coverage_weight": 0.2}},
+            },
+        }
     else:
         raise ValueError(f"Unknown trainer type: {trainer_type}")
 
@@ -354,6 +412,7 @@ def get_trainer(trainer_type: str, config: Dict[str, Any]) -> "BaseTrainer":
         "td3_jal_curriculum": ("ai_interface.trainers.td3_jal_curriculum_trainer", "TD3JALCurriculumTrainer"),
         "td3_jal_her": ("ai_interface.trainers.td3_jal_her_trainer", "TD3JALHERTrainer"),
         "ppo_jal_curriculum": ("ai_interface.trainers.ppo_jal_curriculum_trainer", "PPOJALCurriculumTrainer"),
+        "attention_mappo": ("ai_interface.trainers.attention_mappo_trainer", "AttentionMAPPOTrainer"),
     }
     
     if trainer_type not in trainers:
@@ -404,7 +463,7 @@ Examples:
     parser.add_argument("--config", type=str, 
                         help="Path to JSON configuration file")
     parser.add_argument("--trainer", type=str,
-                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "ppo_jal_curriculum", "qlearning"],
+                        choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "ppo_jal_curriculum", "qlearning", "attention_mappo"],
                         default="hier_ppo", help="Type of trainer to use")
     
     # Environment options

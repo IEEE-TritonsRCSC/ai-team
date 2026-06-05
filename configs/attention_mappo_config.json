@@ -1,0 +1,116 @@
+{
+  "trainer_type": "attention_mappo",
+  "team_config": "team_config.json",
+  "env_mode": "sim-embedded",
+  "team_name": "TritonBots",
+  "obs_dim": 57,
+  "max_steps": 400,
+  "save_interval": 100,
+
+  "algorithm": {
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "lr_actor": 3e-4,
+    "lr_critic": 1e-3,
+    "lr_encoder": 5e-4,
+    "clip_eps": 0.2,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "ppo_epochs": 4,
+    "rollout_length": 2048,
+    "minibatch_size": 256,
+    "min_std": 0.1,
+    "agent_embed_dim": 128,
+    "num_attn_heads": 4,
+    "num_attn_layers": 2,
+    "actor_hidden": [256, 256],
+    "selfplay_swap_interval": 200
+  },
+
+  "hsm_thresholds": {
+    "possession_distance": 1.35,
+    "defensive_x_boundary": -10.0,
+    "attacking_x_boundary": 10.0,
+    "role_switch_cooldown": 8
+  },
+
+  "curriculum": {
+    "stage1": {
+      "_comment": "1v0 — single striker learns approach + shoot. No formation bonuses yet.",
+      "num_agents": 1,
+      "opponent_type": "none",
+      "episodes": 300,
+      "max_steps": 200,
+      "warm_start_from_previous": false,
+      "forced_roles": {"0": "STRIKER"},
+      "reward_weights": {
+        "formation_spread_weight": 0.0,
+        "striker_coord_weight": 0.0,
+        "defender_coverage_weight": 0.0
+      },
+      "spawn_config": {
+        "ball_x_range": [5.0, 30.0],
+        "ball_y_range": [-5.0, 5.0]
+      }
+    },
+
+    "stage2": {
+      "_comment": "3v0 — striker + support + defender triangle. Attention now sees 2 teammates.",
+      "num_agents": 3,
+      "opponent_type": "none",
+      "episodes": 400,
+      "max_steps": 300,
+      "warm_start_from_previous": true,
+      "forced_roles": {"0": "STRIKER", "1": "SUPPORT", "2": "DEFENDER"},
+      "reward_weights": {
+        "formation_spread_weight": 0.05,
+        "striker_coord_weight": 0.0,
+        "defender_coverage_weight": 0.0
+      }
+    },
+
+    "stage3": {
+      "_comment": "6v0 — full team, no opponents. Formation bonuses active at full weight.",
+      "num_agents": 6,
+      "opponent_type": "none",
+      "episodes": 500,
+      "max_steps": 400,
+      "warm_start_from_previous": true,
+      "reward_weights": {
+        "formation_spread_weight": 0.1,
+        "striker_coord_weight": 0.1,
+        "defender_coverage_weight": 0.1
+      }
+    },
+
+    "stage4": {
+      "_comment": "6v3 — full team vs 3 scripted opponents. Introduces defensive pressure.",
+      "num_agents": 6,
+      "opponent_type": "scripted",
+      "episodes": 600,
+      "max_steps": 400,
+      "warm_start_from_previous": true,
+      "reward_weights": {
+        "formation_spread_weight": 0.1,
+        "striker_coord_weight": 0.15,
+        "defender_coverage_weight": 0.15
+      }
+    },
+
+    "stage5": {
+      "_comment": "6v6 self-play. Frozen opponent snapshot updated every selfplay_swap_interval episodes.",
+      "num_agents": 6,
+      "opponent_type": "self_play",
+      "episodes": 1500,
+      "max_steps": 400,
+      "warm_start_from_previous": true,
+      "selfplay_swap_interval": 200,
+      "reward_weights": {
+        "formation_spread_weight": 0.1,
+        "striker_coord_weight": 0.2,
+        "defender_coverage_weight": 0.2
+      }
+    }
+  }
+}
