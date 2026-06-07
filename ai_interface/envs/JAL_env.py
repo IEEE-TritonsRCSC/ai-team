@@ -7,7 +7,7 @@ from __future__ import annotations
 # 2. Robot velocity estimation is a simple finite difference which can be noisy. We could maintain a short history of robot poses and use a more robust method like least squares to estimate velocity, similar to the ball velocity estimation.
 # 3. Past 5 planned actions per robot are intentionally deferred for now. A future update should add a fixed-size action-history encoding to the observation.
 
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Sequence
 import logging
 import math
 import time
@@ -20,7 +20,13 @@ from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
 from ai_interface.utils.basic_commands import goto, approach_ball
 from ai_interface.constants.field_constants import *
 from ai_interface.constants.player_constants import *
-from ai_interface.envs.reward import RewardConfig, RewardInputs, evaluate_reward, extract_opponent_positions
+from ai_interface.envs.reward import (
+    RewardConfig,
+    RewardInputs,
+    aim_quality_from_prediction,
+    evaluate_reward,
+    extract_opponent_positions,
+)
 from networking.networker import Networker
 from networking.data_utils import GameState
 
@@ -35,6 +41,11 @@ class JALTeamEnv(gym.Env):
         robot_ids: Optional[List[int]] = None,
         obs_dim_per_robot: int = 8,
         non_robot_obs_dim: int = 4,
+        a_max: int = 5,
+        c_max: int = 7,
+        global_dim: int = 6,
+        per_agent_dim: int = 10,
+        d_ctx: int = 7,
         max_steps: int = 200,
         debug: bool = False,
         state_retry_count: int = 10,
@@ -52,6 +63,14 @@ class JALTeamEnv(gym.Env):
         random_ball_y_range: Tuple[float, float] = (-3.0, 3.0),
         random_spawn_theta: bool = False,
         random_spawn_theta_range_deg: Tuple[float, float] = (-45.0, 45.0),
+        spawn_theta_relative_to_goal: bool = False,
+        spawn_theta_min_abs_deg: float = 0.0,
+        kick_requires_aim: bool = False,
+        kick_min_aim_quality: float = 0.0,
+        kick_tie_break_when_aimed: bool = False,
+        kick_tie_break_epsilon: float = 0.0,
+        approach_defer_when_has_ball: bool = False,
+        approach_defer_epsilon: float = 0.0,
         reward_config_overrides: Optional[Dict[str, float]] = None,
         some_arg=None
         ):
@@ -92,6 +111,21 @@ class JALTeamEnv(gym.Env):
             float(random_spawn_theta_range_deg[0]),
             float(random_spawn_theta_range_deg[1]),
         )
+        # When True, the sampled spawn heading is interpreted as an OFFSET from
+        # the ball→goal direction (so 0° = aimed at goal center, independent of
+        # ball_y), rather than an absolute field heading. spawn_theta_min_abs_deg
+        # forces a minimum |offset| so the robot always spawns misaligned enough
+        # that an immediate kick provably misses — making turn-to-align the only
+        # path to a goal, which removes the "free goals" that let the warm kicker
+        # win without ever turning. See TRAINING.md §19.
+        self.spawn_theta_relative_to_goal: bool = bool(spawn_theta_relative_to_goal)
+        self.spawn_theta_min_abs_deg: float = float(spawn_theta_min_abs_deg)
+        self.kick_requires_aim: bool = bool(kick_requires_aim)
+        self.kick_min_aim_quality: float = max(0.0, float(kick_min_aim_quality))
+        self.kick_tie_break_when_aimed: bool = bool(kick_tie_break_when_aimed)
+        self.kick_tie_break_epsilon: float = max(0.0, float(kick_tie_break_epsilon))
+        self.approach_defer_when_has_ball: bool = bool(approach_defer_when_has_ball)
+        self.approach_defer_epsilon: float = max(0.0, float(approach_defer_epsilon))
 
         # Build a RewardConfig with optional overrides from caller. Field names
         # must match the RewardConfig dataclass attributes in reward.py.
@@ -113,22 +147,39 @@ class JALTeamEnv(gym.Env):
         if self.debug:
             self.logger.setLevel(logging.DEBUG)
 
-        # Observation design:
-        # global: [ball_x, ball_y, ball_vx, ball_vy] (4)
-        # per robot: [robot_x, robot_y, robot_theta, robot_vx, robot_vy, is_dribbling, start_dribble_x, start_dribble_y] (8)
-        # Matches the 58% checkpoint (`stage1_6_final_58pct.zip`) obs shape so
-        # warm-starting from that model is straight-forward; the cone-related
-        # cos_to_ball / cos_to_goal / sin_to_goal channels were removed along
-        # with the kicker-cone gate (2026-05-20).
-        self.obs_dim_per_robot = obs_dim_per_robot
-        self.non_robot_obs_dim = non_robot_obs_dim
-        self.obs_dim = obs_dim_per_robot * self.num_robots + non_robot_obs_dim
+        # Observation design (expandable backbone — see PPO_EXPANDABLE_PLAN.md):
+        # FIXED-MAX, COUNT-AGNOSTIC obs of constant size across the whole
+        # curriculum, so adding teammates/opponents/features later never forces
+        # a network rebuild. Layout:
+        #   global block (global_dim, 4 live): [ball_x, ball_y, ball_vx, ball_vy] + reserved
+        #   a_max agent slots (per_agent_dim, 8 live):
+        #       [x, y, theta, vx, vy, is_dribbling, start_dribble_x, start_dribble_y] + reserved
+        #   c_max context slots (d_ctx, 5 live, ALL ZERO for now — stub):
+        #       [x, y, theta, vx, vy] + reserved   (our goalie / opp goalie / opponents)
+        # All live values are analytically normalized (see _NORM_* below). Absent
+        # entities are zero-filled and flagged via the active masks in info.
+        self.obs_dim_per_robot = obs_dim_per_robot   # LIVE per-agent dims written (8)
+        self.non_robot_obs_dim = non_robot_obs_dim   # LIVE global dims written (4)
+        self.a_max = int(a_max)
+        self.c_max = int(c_max)
+        self.global_dim = int(global_dim)            # global slot width (>= 4 live)
+        self.per_agent_dim = int(per_agent_dim)      # agent slot width (>= 8 live)
+        self.d_ctx = int(d_ctx)                      # context slot width (>= 5 live)
+        if self.num_robots > self.a_max:
+            raise ValueError(f"num_robots={self.num_robots} exceeds a_max={self.a_max}")
+        self.obs_dim = self.global_dim + self.per_agent_dim * self.a_max + self.d_ctx * self.c_max
         self.observation_space = spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(self.obs_dim,), 
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.obs_dim,),
             dtype=np.float32
             )
+        # Active masks: which agent slots are controlled robots, which context
+        # slots are present. Static within Stage 1 (1 robot, no context); later
+        # stages / foul-randomization will vary them per episode.
+        self.agent_active_mask = np.zeros(self.a_max, dtype=np.float32)
+        self.agent_active_mask[: self.num_robots] = 1.0
+        self.context_active_mask = np.zeros(self.c_max, dtype=np.float32)  # TODO(opponent-stage)
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
         self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
         
@@ -159,6 +210,14 @@ class JALTeamEnv(gym.Env):
         # Field dimensions (from your existing code)
         self.field_half_width = 45.0
         self.field_half_height = 30.0
+
+        # Fixed analytic observation normalization (LOCKED — changing these is a
+        # distribution shift = retrain; see PPO_EXPANDABLE_PLAN.md). Constant
+        # divisors (not running stats), so reserved/masked zero dims stay zero.
+        self._NORM_POS_X = self.field_half_width    # 45.0
+        self._NORM_POS_Y = self.field_half_height   # 30.0
+        self._NORM_THETA = float(np.pi)             # heading in radians → ~[-1, 1]
+        self._NORM_VEL = 10.0                        # per-cycle position delta; covers ball_speed_max
 
         self.kickable_dist = KICKABLE_MARGIN + BALL_SIZE + PLAYER_SIZE
         # Kicker cone gate removed (2026-05-20): the cone restriction caused
@@ -246,9 +305,30 @@ class JALTeamEnv(gym.Env):
                 first_obj_name, default_pose = default_poses[0]
                 if self.random_spawn_theta:
                     theta_min, theta_max = self.random_spawn_theta_range_deg
-                    spawn_theta_deg = float(np.random.uniform(theta_min, theta_max))
+                    theta_offset_deg = float(np.random.uniform(theta_min, theta_max))
+                    # Force a minimum |offset| so the spawn is never near-aligned:
+                    # an immediate kick then provably misses and turning is the
+                    # only path to a goal (TRAINING.md §19).
+                    min_abs = self.spawn_theta_min_abs_deg
+                    if min_abs > 0.0 and abs(theta_offset_deg) < min_abs:
+                        if theta_offset_deg == 0.0:
+                            sign = 1.0 if np.random.random() < 0.5 else -1.0
+                        else:
+                            sign = math.copysign(1.0, theta_offset_deg)
+                        theta_offset_deg = sign * min_abs
                 else:
-                    spawn_theta_deg = 0.0
+                    theta_offset_deg = 0.0
+                if self.spawn_theta_relative_to_goal:
+                    # Offset is measured from the ball→goal-center direction, so
+                    # 0° = aimed at the goal regardless of ball_y, giving a
+                    # consistent "turn this much to align" target every episode.
+                    bx0, by0 = float(ball_pos[0]), float(ball_pos[1])
+                    goal_angle_deg = math.degrees(
+                        math.atan2(float(GOAL_R[1]) - by0, float(GOAL_R[0]) - bx0)
+                    )
+                    spawn_theta_deg = goal_angle_deg + theta_offset_deg
+                else:
+                    spawn_theta_deg = theta_offset_deg
                 if self.spawn_robot_at_ball:
                     # Place robot behind ball on the ball-goal axis so that
                     # ball direction ≈ goal direction from robot's spawn pos.
@@ -327,9 +407,11 @@ class JALTeamEnv(gym.Env):
         
         info = {
             "episode_num": self.episode_num,
-            "step": self.current_step
+            "step": self.current_step,
+            "agent_active_mask": self.agent_active_mask.copy(),
+            "context_active_mask": self.context_active_mask.copy(),
         }
-        
+
         if self.debug:
             self.logger.debug(f"Episode {self.episode_num} started")
 
@@ -442,6 +524,20 @@ class JALTeamEnv(gym.Env):
         bad_aim_penalty = float(
             getattr(self.reward_config, "bad_aim_kick_penalty", 0.0)
         )
+        # When > 0, the miss penalty ramps linearly with how far past the
+        # goalpost the kick projects (0 at the post → bad_aim_penalty at this
+        # many units beyond, capped), instead of a flat cliff. Gives an aim
+        # gradient on every miss. See TRAINING.md §18.
+        bad_aim_grad_scale = float(
+            getattr(self.reward_config, "bad_aim_grad_scale", 0.0)
+        )
+
+        def _miss_penalty(predicted_y: Optional[float]) -> float:
+            """Penalty magnitude for a missed kick. Graded when grad_scale>0."""
+            if bad_aim_grad_scale <= 0.0 or predicted_y is None:
+                return bad_aim_penalty
+            miss = abs(predicted_y) - goal_half_height
+            return bad_aim_penalty * min(1.0, max(0.0, miss) / bad_aim_grad_scale)
         if (kick_aim_weight > 0.0 or bad_aim_penalty > 0.0) and current_game_state is not None:
             per_robot = action_info.get("per_robot", [])
             pose_by_id: Dict[int, Any] = {}
@@ -462,12 +558,11 @@ class JALTeamEnv(gym.Env):
                 if pose is None:
                     continue
                 rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
-                theta_rad = math.radians(theta_deg)
-                cos_t = math.cos(theta_rad)
+                aim_quality, predicted_y_at_goal_line = self._kick_aim_quality_from_pose(pose)
                 # Facing away from / parallel to the goal line: kick can
                 # never cross x=FIELD_X[1]. Guaranteed miss — apply the
                 # bad-aim penalty and move on.
-                if cos_t <= 1e-3:
+                if predicted_y_at_goal_line is None:
                     if bad_aim_penalty > 0.0:
                         reward -= bad_aim_penalty
                     self.logger.info(
@@ -476,16 +571,10 @@ class JALTeamEnv(gym.Env):
                         rx, ry, theta_deg,
                     )
                     continue
-                predicted_y_at_goal_line = ry + (FIELD_X[1] - rx) * (
-                    math.sin(theta_rad) / cos_t
-                )
-                aim_quality = max(
-                    0.0, 1.0 - abs(predicted_y_at_goal_line) / goal_half_height
-                )
                 bad_aim = aim_quality <= 0.0
                 if bad_aim:
                     if bad_aim_penalty > 0.0:
-                        reward -= bad_aim_penalty
+                        reward -= _miss_penalty(predicted_y_at_goal_line)
                 else:
                     reward += aim_quality * kick_aim_weight
                 # Diagnostic log: confirms predicted_y vs the actual episode
@@ -568,6 +657,8 @@ class JALTeamEnv(gym.Env):
             "total_reward": self.total_rewards,
             "invalid_action_count": invalid_action_count,
             "termination_reason": term_reason if terminated else ("max_steps" if truncated else ""),
+            "agent_active_mask": self.agent_active_mask.copy(),
+            "context_active_mask": self.context_active_mask.copy(),
         }
         return obs, reward, terminated, truncated, info
     
@@ -712,20 +803,26 @@ class JALTeamEnv(gym.Env):
                 if isinstance(entry, dict):
                     pose_by_robot_id.update(entry)
 
-            # Build flattened observation list directly.
-            obs_values: list[float] = [
-                float(ball_x),
-                float(ball_y),
-                float(ball_vx),
-                float(ball_vy),
-            ]
+            # Fixed-max, count-agnostic, analytically-normalized observation.
+            # Build a zero vector and fill the live dims of each block; reserved
+            # dims, inactive agent slots, and context slots stay 0.
+            obs = np.zeros(self.obs_dim, dtype=np.float32)
 
-            for robot_id in self.robot_ids:
+            # --- global / ball block (4 live, normalized) ---
+            obs[0] = float(ball_x) / self._NORM_POS_X
+            obs[1] = float(ball_y) / self._NORM_POS_Y
+            obs[2] = float(ball_vx) / self._NORM_VEL
+            obs[3] = float(ball_vy) / self._NORM_VEL
+
+            # --- agent slots (a_max × per_agent_dim; 8 live, normalized) ---
+            agent_base = self.global_dim
+            for slot in range(self.a_max):
+                if slot >= self.num_robots:
+                    continue  # inactive slot → zeros (masked off)
+                robot_id = self.robot_ids[slot]
                 pose = pose_by_robot_id.get(robot_id)
-
                 if pose is None:
-                    obs_values.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0])
-                    continue
+                    continue  # active but unobserved this step → zeros
 
                 robot_x = float(pose[0])
                 robot_y = float(pose[1])
@@ -750,19 +847,22 @@ class JALTeamEnv(gym.Env):
 
                 is_dribbling = self.is_dribbling.get(robot_id, False)
                 start_dribble_pos = self.start_dribble_pos.get(robot_id, [-1.0, -1.0])
-
                 self.prev_robot_pose_by_id[robot_id] = current_pose_xy
 
-                obs_values.extend([robot_x, robot_y, robot_theta, robot_vx, robot_vy, float(is_dribbling), float(start_dribble_pos[0]), float(start_dribble_pos[1])])
+                off = agent_base + slot * self.per_agent_dim
+                obs[off + 0] = robot_x / self._NORM_POS_X
+                obs[off + 1] = robot_y / self._NORM_POS_Y
+                obs[off + 2] = robot_theta / self._NORM_THETA
+                obs[off + 3] = robot_vx / self._NORM_VEL
+                obs[off + 4] = robot_vy / self._NORM_VEL
+                obs[off + 5] = float(is_dribbling)
+                obs[off + 6] = float(start_dribble_pos[0]) / self._NORM_POS_X
+                obs[off + 7] = float(start_dribble_pos[1]) / self._NORM_POS_Y
+                # dims 8..per_agent_dim-1 reserved → stay 0
 
-            obs = np.array(obs_values, dtype=np.float32)
-
-            # Keep output shape consistent with observation_space.
-            if obs.shape[0] != self.obs_dim:
-                if obs.shape[0] > self.obs_dim:
-                    obs = obs[:self.obs_dim]
-                else:
-                    obs = np.pad(obs, (0, self.obs_dim - obs.shape[0]))
+            # --- context slots (c_max × d_ctx): ALL ZERO for now ---
+            # TODO(opponent-stage): fill from extract_opponent_positions / our
+            # goalie pose, set context_active_mask accordingly. See reward.py.
 
             return obs
             
@@ -806,16 +906,23 @@ class JALTeamEnv(gym.Env):
         is_ppo_dict = isinstance(action, dict) and "primitive_idx" in action
 
         if is_ppo_dict:
+            # The expandable policy emits actions for all a_max agent slots, each
+            # with a param_dim_max-wide param vector. Only the first num_robots
+            # slots are active controlled robots (slot i ↔ robot_ids[i]); extra
+            # slots are inactive/no-op. We read the env-relevant params (goto_x,
+            # goto_y, turn_theta) from the first 3 entries of each slot's vector;
+            # any reserved params are ignored until a future primitive uses them.
             primitive_idx_arr = np.asarray(action["primitive_idx"], dtype=np.int64).flatten()
             params_arr = np.asarray(action.get("params", []), dtype=np.float32).flatten()
-            if primitive_idx_arr.shape[0] != self.num_robots:
+            n_slots = primitive_idx_arr.shape[0]
+            if n_slots < self.num_robots:
                 raise ValueError(
-                    f"Expected primitive_idx shape ({self.num_robots},), got {primitive_idx_arr.shape}"
+                    f"primitive_idx has {n_slots} slots < num_robots {self.num_robots}"
                 )
-            expected_params = self.num_robots * 3
-            if params_arr.shape[0] != expected_params:
+            params_per_slot = (params_arr.shape[0] // n_slots) if n_slots else 0
+            if params_per_slot < 3:
                 raise ValueError(
-                    f"Expected params dim {expected_params}, got {params_arr.shape[0]}"
+                    f"params has {params_arr.shape[0]} for {n_slots} slots; need >=3 per slot"
                 )
             for i in range(self.num_robots):
                 idx = int(primitive_idx_arr[i])
@@ -833,7 +940,7 @@ class JALTeamEnv(gym.Env):
                     action_type = "turn"
                     goto_x_raw, goto_y_raw, turn_theta_raw = 0.0, 0.0, 0.0
                 else:
-                    base = i * 3
+                    base = i * params_per_slot
                     goto_x_raw = float(params_arr[base + 0])
                     goto_y_raw = float(params_arr[base + 1])
                     turn_theta_raw = float(params_arr[base + 2])
@@ -896,6 +1003,10 @@ class JALTeamEnv(gym.Env):
             decoded = per_robot_decoded[i]
             action_idx = decoded["action_idx"]
             action_type = decoded["action_type"]
+            raw_action_idx = action_idx
+            raw_action_type = action_type
+            requested_action_type = action_type
+            executed_action_type = action_type
             goto_x_raw = decoded["goto_x_raw"]
             goto_y_raw = decoded["goto_y_raw"]
             turn_theta_raw = decoded["turn_theta_raw"]
@@ -915,22 +1026,90 @@ class JALTeamEnv(gym.Env):
 
             can_kick = has_ball_now
             kick_fired = False
+            kick_blocked_bad_aim = False
+            kick_tie_break_applied = False
+            approach_defer_applied = False
+            kick_aim_quality: Optional[float] = None
+            kick_predicted_y_at_goal_line: Optional[float] = None
+
+            # TD3 exposes discrete primitive choice as continuous logits, then
+            # uses argmax. When turn and kick saturate at the same bound,
+            # np.argmax always picks turn because it appears first. In the
+            # aim-gated curriculum, a tied kick logit is deployable once the
+            # robot is holding the ball and the projected shot is on target.
+            if (
+                self.kick_tie_break_when_aimed
+                and self.kick_requires_aim
+                and can_kick
+                and pose is not None
+                and decoded["logits"] is not None
+            ):
+                logits_arr = np.asarray(decoded["logits"], dtype=np.float32)
+                turn_logit = float(logits_arr[2])
+                kick_logit = float(logits_arr[3])
+                turn_enabled = turn_logit > -1e8
+                kick_enabled = kick_logit > -1e8
+                if turn_enabled and kick_enabled:
+                    kick_aim_quality, kick_predicted_y_at_goal_line = (
+                        self._kick_aim_quality_from_pose(pose)
+                    )
+                    if (
+                        kick_aim_quality >= self.kick_min_aim_quality
+                        and kick_logit >= turn_logit - self.kick_tie_break_epsilon
+                    ):
+                        action_idx = 3
+                        action_type = "kick"
+                        requested_action_type = action_type
+                        executed_action_type = action_type
+                        kick_tie_break_applied = raw_action_type != "kick"
+
+            # In approach+turn+kick stages, the approach primitive is useful
+            # until possession is reached. Once the robot already has the ball,
+            # a raw approach selection is a no-op ("done" -> turn 0), which can
+            # trap deterministic TD3 when the newly unmasked approach logit ties
+            # with turn. If turn is effectively tied, hand off to the actor's
+            # turn parameter so the policy can continue aiming.
+            if (
+                action_type == "approach_ball"
+                and self.approach_defer_when_has_ball
+                and has_ball_now
+                and decoded["logits"] is not None
+            ):
+                logits_arr = np.asarray(decoded["logits"], dtype=np.float32)
+                approach_logit = float(logits_arr[1])
+                turn_logit = float(logits_arr[2])
+                turn_enabled = turn_logit > -1e8
+                if turn_enabled and turn_logit >= approach_logit - self.approach_defer_epsilon:
+                    action_idx = 2
+                    action_type = "turn"
+                    requested_action_type = action_type
+                    executed_action_type = action_type
+                    approach_defer_applied = raw_action_type == "approach_ball"
+
+            if action_type == "kick" and can_kick and self.kick_requires_aim and pose is not None:
+                if kick_aim_quality is None:
+                    kick_aim_quality, kick_predicted_y_at_goal_line = self._kick_aim_quality_from_pose(pose)
+                if kick_aim_quality < self.kick_min_aim_quality:
+                    kick_blocked_bad_aim = True
 
             invalid_action_requested = (
                 (action_type == "kick" and not can_kick)
                 or (action_type == "start_dribble" and not has_ball_now)
                 or (action_type == "stop_dribble" and not has_ball_now)
+                or kick_blocked_bad_aim
             )
             if invalid_action_requested:
                 invalid_action_count += 1
 
             if action_type == "kick":
-                if not can_kick:
+                if not can_kick or kick_blocked_bad_aim:
                     # Use the policy's own turn_theta rather than "turn 0" so
                     # the state changes each step, allowing Q(kick) to receive
                     # proper TD targets instead of bootstrapping off itself in
                     # a stationary (s == s') loop.
                     command = f"turn {turn_theta:.2f}"
+                    if kick_blocked_bad_aim:
+                        executed_action_type = "turn"
                 else:
                     command = "kick 100 0"
                     kick_fired = True
@@ -984,8 +1163,13 @@ class JALTeamEnv(gym.Env):
             per_robot_info.append(
                 {
                     "robot_id": robot_id,
-                    "action_type": action_type,
+                    "action_type": executed_action_type,
+                    "requested_action_type": requested_action_type,
                     "action_idx": action_idx,
+                    "raw_action_type": raw_action_type,
+                    "raw_action_idx": raw_action_idx,
+                    "kick_tie_break_applied": kick_tie_break_applied,
+                    "approach_defer_applied": approach_defer_applied,
                     "probs": decoded["probs"],
                     "logits": decoded["logits"],
                     "goto_x": goto_x,
@@ -993,6 +1177,9 @@ class JALTeamEnv(gym.Env):
                     "turn_theta": turn_theta,
                     "has_ball_now": has_ball_now,
                     "kick_fired": kick_fired,
+                    "kick_blocked_bad_aim": kick_blocked_bad_aim,
+                    "kick_aim_quality": kick_aim_quality,
+                    "kick_predicted_y_at_goal_line": kick_predicted_y_at_goal_line,
                     "invalid_action_requested": invalid_action_requested,
                     "command": command,
                 }
@@ -1072,6 +1259,29 @@ class JALTeamEnv(gym.Env):
         if has_ball:
             return "secure_possession"
         return "chase_ball"
+
+    @staticmethod
+    def _project_kick_y_at_goal_line(pose: Sequence[float]) -> Optional[float]:
+        """Project a straight kick from robot pose to the opponent goal line."""
+
+        rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
+        theta_rad = math.radians(theta_deg)
+        cos_t = math.cos(theta_rad)
+        if cos_t <= 1e-3:
+            return None
+        return float(ry + (FIELD_X[1] - rx) * (math.sin(theta_rad) / cos_t))
+
+    def _kick_aim_quality_from_pose(self, pose: Sequence[float]) -> Tuple[float, Optional[float]]:
+        """Return aim quality and projected goal-line y for a straight kick."""
+
+        predicted_y = self._project_kick_y_at_goal_line(pose)
+        return (
+            aim_quality_from_prediction(
+                predicted_y,
+                float(getattr(self.reward_config, "goal_half_height", 5.0)),
+            ),
+            predicted_y,
+        )
 
     def _calculate_reward(self, current_game_state: Optional[GameState]) -> float:
         """Calculate the shared team reward from the latest game state."""

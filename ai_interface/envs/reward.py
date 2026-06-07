@@ -58,6 +58,14 @@ class RewardConfig:
     # cannot collect zero-reward "free kicks" by firing on step 1 of every
     # episode; forces it to delay-and-aim. Set per stage via reward_config_overrides.
     bad_aim_kick_penalty: float = 0.0
+    # Distance (in sim units of |predicted_y| BEYOND the goalpost) over which the
+    # bad-aim penalty ramps from 0 (at the post) to its full value (capped). When
+    # > 0, JAL_env applies a GRADED miss penalty instead of the flat cliff: a kick
+    # that lands 12 wide is punished less than one 20 wide, giving the policy a
+    # gradient toward better aim on EVERY kick — not just the ~12% that hit the
+    # mouth. 0.0 keeps the legacy binary cliff (flat penalty for any miss). See
+    # TRAINING.md §18.
+    bad_aim_grad_scale: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -112,6 +120,19 @@ class RewardResult:
     robot_out_of_bounds: bool
     ball_out_of_bounds: bool
     intermediates: RewardIntermediates
+
+
+def aim_quality_from_prediction(
+    predicted_y_at_goal_line: Optional[float],
+    goal_half_height: float,
+    target_y: float = 0.0,
+) -> float:
+    """Return 0..1 linear aim quality for a projected goal-line crossing."""
+
+    if predicted_y_at_goal_line is None or goal_half_height <= 0.0:
+        return 0.0
+    miss_from_target = abs(float(predicted_y_at_goal_line) - float(target_y))
+    return float(max(0.0, 1.0 - miss_from_target / float(goal_half_height)))
 
 
 def extract_opponent_positions(
@@ -239,7 +260,17 @@ def calculate_reward(
         reward += intermediates.approach * config.approach_weight
 
     if intermediates.goal_progress is not None:
-        reward += intermediates.goal_progress * config.goal_progress_weight
+        goal_progress = float(intermediates.goal_progress)
+        if (
+            goal_progress > 0.0
+            and intermediates.ball_speed is not None
+            and intermediates.ball_speed > config.ball_speed_threshold
+        ):
+            goal_progress *= aim_quality_from_prediction(
+                intermediates.predicted_y_at_goal_line,
+                config.goal_half_height,
+            )
+        reward += goal_progress * config.goal_progress_weight
 
     # Aim-gated ball-speed reward: a fast ball only counts toward reward to the
     # extent that its current velocity would carry it through the goal mouth.
@@ -251,9 +282,9 @@ def calculate_reward(
         if intermediates.predicted_y_at_goal_line is None:
             aim_quality = 0.0  # ball not moving toward goal
         else:
-            aim_quality = max(
-                0.0,
-                1.0 - abs(intermediates.predicted_y_at_goal_line) / config.goal_half_height,
+            aim_quality = aim_quality_from_prediction(
+                intermediates.predicted_y_at_goal_line,
+                config.goal_half_height,
             )
         reward += (
             min(intermediates.ball_speed, config.ball_speed_clip)

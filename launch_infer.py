@@ -106,6 +106,11 @@ def parse_args() -> argparse.Namespace:
                         choices=["sim-only", "sim-mixed", "field-practice",
                                  "field-tournament"])
     parser.add_argument("--debug_infer", action="store_true")
+    parser.add_argument("--ppo_stochastic", action="store_true",
+                        help="PPO JAL: forward --ppo_stochastic (sample primitive + params).")
+    parser.add_argument("--ppo_param_noise_std", type=float, default=None,
+                        help="PPO JAL: override the turn param-noise std forwarded to "
+                             "infer.py. If unset, infer.py's default (0.3) applies.")
 
     # Port layout (mirrors launch_train.py)
     parser.add_argument("--base-port", type=int, default=6000)
@@ -336,6 +341,10 @@ def main() -> int:
             ]
             if args.debug_infer:
                 infer_cmd.append("--debug_infer")
+            if args.ppo_stochastic:
+                infer_cmd.append("--ppo_stochastic")
+            if args.ppo_param_noise_std is not None:
+                infer_cmd += ["--ppo_param_noise_std", str(args.ppo_param_noise_std)]
 
             # Let infer output go straight to the launcher's terminal so the
             # user sees live progress. infer.py's FileHandler still writes the

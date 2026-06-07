@@ -17,6 +17,7 @@ import argparse
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import re
 from collections import Counter
@@ -392,6 +393,14 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
         random_ball_y_range=tuple(stage_config.get("random_ball_y_range", [-3.0, 3.0])),
         random_spawn_theta=bool(stage_config.get("random_spawn_theta", False)),
         random_spawn_theta_range_deg=tuple(stage_config.get("random_spawn_theta_range_deg", [-45.0, 45.0])),
+        spawn_theta_relative_to_goal=bool(stage_config.get("spawn_theta_relative_to_goal", False)),
+        spawn_theta_min_abs_deg=float(stage_config.get("spawn_theta_min_abs_deg", 0.0)),
+        kick_requires_aim=bool(stage_config.get("kick_requires_aim", False)),
+        kick_min_aim_quality=float(stage_config.get("kick_min_aim_quality", 0.0)),
+        kick_tie_break_when_aimed=bool(stage_config.get("kick_tie_break_when_aimed", False)),
+        kick_tie_break_epsilon=float(stage_config.get("kick_tie_break_epsilon", 0.0)),
+        approach_defer_when_has_ball=bool(stage_config.get("approach_defer_when_has_ball", False)),
+        approach_defer_epsilon=float(stage_config.get("approach_defer_epsilon", 0.0)),
         reward_config_overrides=dict(reward_overrides) if reward_overrides else None,
         debug=bool(args.debug_infer),
     )
@@ -420,22 +429,82 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
     episode_rewards: list[float] = []
     actions_total: Counter = Counter()
     actions_window: Counter = Counter()
+    requested_actions_total: Counter = Counter()
+    requested_actions_window: Counter = Counter()
+    invalid_action_total = 0
+    invalid_action_window = 0
+    blocked_bad_aim_total = 0
+    blocked_bad_aim_window = 0
+    action_samples: list[dict] = []
     last_kick_idx = 0  # marker into collector.kicks for window slicing
 
     WINDOW = 20
+    eval_noise_std = float(getattr(args, "td3_eval_noise_std", 0.0) or 0.0)
+    eval_logit_noise_std = getattr(args, "td3_eval_logit_noise_std", None)
+    eval_param_noise_std = getattr(args, "td3_eval_param_noise_std", None)
+    use_split_eval_noise = eval_logit_noise_std is not None or eval_param_noise_std is not None
+    rng = np.random.default_rng(0)
+
+    def _add_eval_noise(action):
+        action_arr = np.asarray(action, dtype=np.float32)
+        if use_split_eval_noise:
+            per_robot_dim = int(getattr(env, "action_dim_per_robot", 9))
+            logit_sigma = float(eval_logit_noise_std if eval_logit_noise_std is not None else eval_noise_std)
+            param_sigma = float(eval_param_noise_std if eval_param_noise_std is not None else eval_noise_std)
+            per_robot_sigma = np.array(
+                [logit_sigma] * 6 + [param_sigma] * (per_robot_dim - 6),
+                dtype=np.float32,
+            )
+            sigma = np.tile(per_robot_sigma, action_arr.size // per_robot_dim).reshape(action_arr.shape)
+        elif eval_noise_std > 0.0:
+            sigma = np.full(action_arr.shape, eval_noise_std, dtype=np.float32)
+        else:
+            return action
+        return np.clip(action_arr + rng.normal(0.0, sigma, size=action_arr.shape), -1.0, 1.0).astype(np.float32)
 
     for step in range(int(args.steps)):
         action, _state = model.predict(obs, deterministic=True)
+        action = _add_eval_noise(action)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
         elapsed_steps += 1
 
+        invalid_this_step = 0
+        blocked_this_step = 0
         if isinstance(info, dict):
             ai = info.get("action_info") or {}
             atype = ai.get("action_type")
             if atype:
                 actions_total[atype] += 1
                 actions_window[atype] += 1
+            invalid_this_step = int(ai.get("invalid_action_count", 0) or 0)
+            invalid_action_total += invalid_this_step
+            invalid_action_window += invalid_this_step
+            for robot_info in ai.get("per_robot", []) or []:
+                requested = robot_info.get("requested_action_type") or robot_info.get("action_type")
+                if requested:
+                    requested_actions_total[requested] += 1
+                    requested_actions_window[requested] += 1
+                if robot_info.get("kick_blocked_bad_aim", False):
+                    blocked_this_step += 1
+                if len(action_samples) < 20:
+                    action_samples.append({
+                        "step": elapsed_steps,
+                        "raw": robot_info.get("raw_action_type"),
+                        "requested": requested,
+                        "executed": robot_info.get("action_type"),
+                        "command": robot_info.get("command"),
+                        "invalid": bool(robot_info.get("invalid_action_requested", False)),
+                        "kick_tie_break_applied": bool(robot_info.get("kick_tie_break_applied", False)),
+                        "approach_defer_applied": bool(robot_info.get("approach_defer_applied", False)),
+                        "kick_blocked_bad_aim": bool(robot_info.get("kick_blocked_bad_aim", False)),
+                        "kick_aim_quality": robot_info.get("kick_aim_quality"),
+                        "kick_predicted_y_at_goal_line": robot_info.get("kick_predicted_y_at_goal_line"),
+                        "logits": robot_info.get("logits"),
+                        "turn_theta": robot_info.get("turn_theta"),
+                    })
+            blocked_bad_aim_total += blocked_this_step
+            blocked_bad_aim_window += blocked_this_step
 
         if terminated or truncated:
             episode_count += 1
@@ -460,7 +529,18 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
                     kicks=window_kicks,
                     actions=actions_window,
                 )
+                _SUMMARY_LOG.info(
+                    "[eps %d-%d] requested: %s | invalid_actions=%d | blocked_bad_aim=%d",
+                    episode_count - WINDOW + 1,
+                    episode_count,
+                    " ".join(f"{k}={v}" for k, v in sorted(requested_actions_window.items())) or "—",
+                    invalid_action_window,
+                    blocked_bad_aim_window,
+                )
                 actions_window = Counter()
+                requested_actions_window = Counter()
+                invalid_action_window = 0
+                blocked_bad_aim_window = 0
 
             total_reward = 0.0
             obs, _ = env.reset()
@@ -478,6 +558,12 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
         rewards=episode_rewards,
         kicks=collector.kicks,
         actions=actions_total,
+    )
+    _SUMMARY_LOG.info(
+        "[ALL] requested: %s | invalid_actions=%d | blocked_bad_aim=%d",
+        " ".join(f"{k}={v}" for k, v in sorted(requested_actions_total.items())) or "—",
+        invalid_action_total,
+        blocked_bad_aim_total,
     )
     last_stats = None
     if len(outcomes) > 100:
@@ -498,12 +584,305 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
         "episodes": episode_count,
         "all": all_stats,
         "last_100": last_stats,
+        "requested_actions": dict(requested_actions_total),
+        "executed_actions": dict(actions_total),
+        "invalid_action_total": invalid_action_total,
+        "blocked_bad_aim_total": blocked_bad_aim_total,
+        "td3_eval_noise_std": eval_noise_std,
+        "td3_eval_logit_noise_std": eval_logit_noise_std,
+        "td3_eval_param_noise_std": eval_param_noise_std,
+        "action_samples": action_samples,
     }
     summary_file = log_dir / "summary.json"
     with summary_file.open("w") as f:
         json.dump(summary_payload, f, indent=2, default=str)
     _SUMMARY_LOG.info("Saved summary to %s", summary_file)
     _SUMMARY_LOG.info("Full log: %s", log_file)
+
+
+def _run_ppo_jal(args, networker: Networker, team_name: str):
+    """Run inference with the hybrid-PPO JAL policy (PPOJALAgent + JALTeamEnv).
+
+    Loads env settings (disabled_actions, spawn flags, randomization, reward
+    overrides) from the training config so the inference env matches what the
+    model was trained on. Specify which stage's settings to use via --stage.
+
+    Actions are sampled deterministically (argmax primitive + Gaussian mean),
+    matching the policy the curriculum trainer learned.
+    """
+    from ai_interface.algorithms.ppo_jal import PPOJALAgent, PRIMITIVE_NAMES
+    from ai_interface.envs.JAL_env import JALTeamEnv
+
+    device = _resolve_device()
+
+    with open(args.config, "r") as f:
+        config = json.load(f)
+    stage_config = config["curriculum"][args.stage]
+
+    num_robots = int(stage_config.get("num_robots", 1))
+    robot_ids = stage_config.get("robot_ids", list(range(1, num_robots + 1)))
+    reward_overrides = stage_config.get("reward_config_overrides")
+
+    # Mirror PPOJALCurriculumTrainer.setup_environment exactly so the obs the
+    # policy sees at inference matches training (same spawn / reward / mask).
+    env = JALTeamEnv(
+        networker=networker,
+        team_name=team_name,
+        robot_ids=robot_ids,
+        obs_dim_per_robot=int(config.get("obs_dim_per_robot", 8)),
+        non_robot_obs_dim=int(config.get("non_robot_obs_dim", 4)),
+        a_max=int(config.get("a_max", 5)),
+        c_max=int(config.get("c_max", 7)),
+        global_dim=int(config.get("global_dim", 6)),
+        per_agent_dim=int(config.get("per_agent_dim", 10)),
+        d_ctx=int(config.get("d_ctx", 7)),
+        max_steps=int(config.get("max_steps", 300)),
+        debug=bool(args.debug_infer),
+        invalid_action_penalty=float(stage_config.get("invalid_action_penalty", 0.2)),
+        disabled_actions=list(stage_config.get("disabled_actions", [])),
+        spawn_robot_at_ball=bool(stage_config.get("spawn_robot_at_ball", False)),
+        spawn_offset_behind_ball=float(stage_config.get("spawn_offset_behind_ball", 1.0)),
+        random_ball_x=bool(stage_config.get("random_ball_x", False)),
+        random_ball_x_range=tuple(stage_config.get("random_ball_x_range", [5.0, 30.0])),
+        random_ball_y=bool(stage_config.get("random_ball_y", False)),
+        random_ball_y_range=tuple(stage_config.get("random_ball_y_range", [-3.0, 3.0])),
+        random_spawn_theta=bool(stage_config.get("random_spawn_theta", False)),
+        random_spawn_theta_range_deg=tuple(stage_config.get("random_spawn_theta_range_deg", [-45.0, 45.0])),
+        reward_config_overrides=dict(reward_overrides) if reward_overrides else None,
+    )
+
+    disabled_actions = list(stage_config.get("disabled_actions", []))
+
+    log_dir = (
+        Path(args.log_dir)
+        if args.log_dir
+        else _make_infer_log_dir(args.model_path)
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    collector, log_file = _setup_inference_logging(
+        log_dir=log_dir, debug=bool(args.debug_infer)
+    )
+    _SUMMARY_LOG.info("Inference log dir: %s", log_dir)
+
+    # Build hparams from model_params so the network shape (encoder_hidden) and
+    # agent config match the checkpoint, then load weights.
+    model_params = config.get("model_params", {})
+    hparams: dict = {}
+    for k in [
+        "gamma", "gae_lambda", "clip_range", "target_kl", "n_epochs",
+        "minibatch_size", "rollout_size",
+        "learning_rate_initial", "learning_rate_final",
+        "ent_coef_initial", "ent_coef_final",
+        "vf_coef", "max_grad_norm",
+        "value_clip_range", "advantage_clip", "entropy_tripwire",
+        "kl_lr_halve_factor", "feature_dim", "num_heads",
+    ]:
+        if k in model_params:
+            hparams[k] = model_params[k]
+
+    obs_dim = int(env.observation_space.shape[0])
+    agent = PPOJALAgent(
+        obs_dim=obs_dim,
+        num_robots=num_robots,
+        a_max=int(config.get("a_max", 5)),
+        c_max=int(config.get("c_max", 7)),
+        global_dim=int(config.get("global_dim", 6)),
+        per_agent_dim=int(config.get("per_agent_dim", 10)),
+        d_ctx=int(config.get("d_ctx", 7)),
+        num_primitives=int(config.get("num_primitives", 8)),
+        param_dim=int(config.get("param_dim", 5)),
+        device=device,
+        hparams=hparams,
+    )
+    print(f"Loading PPO JAL model from {args.model_path} (stage={args.stage})")
+    agent.load(args.model_path)
+    agent.model.eval()
+
+    # Param-active mask (matches training): Dx,Dy ← goto, Dtheta ← turn.
+    param_active_mask = np.zeros(agent.param_dim, dtype=np.float32)
+    if "goto" not in disabled_actions:
+        param_active_mask[0] = 1.0
+        param_active_mask[1] = 1.0
+    if "turn" not in disabled_actions:
+        param_active_mask[2] = 1.0
+
+    obs, info = env.reset()
+    agent_mask = info.get("agent_active_mask")
+    context_mask = info.get("context_active_mask")
+    total_reward = 0.0
+    episode_count = 0
+    elapsed_steps = 0
+    ep_step = 0
+
+    outcomes: list[str] = []
+    episode_rewards: list[float] = []
+    actions_total: Counter = Counter()
+    actions_window: Counter = Counter()
+    last_kick_idx = 0
+    WINDOW = 20
+
+    # Per-step diagnostic trace (debug only) — one JSON line per step capturing
+    # the turn-vs-kick decision so we can confirm/deny the "continuous turning"
+    # fixed-point hypothesis: when has_ball is True, is turn_logit >= kick_logit
+    # and is turn_theta ~ 0 (the policy fine-tuning an angle that's already
+    # correct, especially near the goal center line where ball_y ~ 0)?
+    trace_file = None
+    if bool(args.debug_infer):
+        trace_path = log_dir / "step_trace.jsonl"
+        trace_file = trace_path.open("w")
+        _SUMMARY_LOG.info("Per-step debug trace: %s", trace_path)
+
+    for step in range(int(args.steps)):
+        action, _transition = agent.sample_action(
+            obs=obs,
+            disabled_actions=disabled_actions,
+            agent_active_mask=agent_mask,
+            context_active_mask=context_mask,
+            param_active_mask=param_active_mask,
+            deterministic=not bool(args.ppo_stochastic),
+        )
+        # Deployment-friendly variant: deterministic argmax primitive, but inject
+        # Gaussian noise on the param MEAN to supply the fine turn corrections the
+        # bang-bang mean cannot. Only meaningful when not already fully stochastic.
+        if not bool(args.ppo_stochastic) and float(args.ppo_param_noise_std) > 0.0:
+            params = np.asarray(action["params"], dtype=np.float32)
+            params = params + np.random.normal(
+                0.0, float(args.ppo_param_noise_std), size=params.shape
+            ).astype(np.float32)
+            action["params"] = np.clip(params, -1.0, 1.0)
+        for p in np.asarray(action["primitive_idx"]).reshape(-1):
+            name = PRIMITIVE_NAMES[int(p)]
+            actions_total[name] += 1
+            actions_window[name] += 1
+
+        obs, reward, terminated, truncated, info = env.step(action)
+        if isinstance(info, dict):
+            agent_mask = info.get("agent_active_mask", agent_mask)
+            context_mask = info.get("context_active_mask", context_mask)
+        total_reward += float(reward)
+        elapsed_steps += 1
+        ep_step += 1
+
+        if trace_file is not None and isinstance(info, dict):
+            ai = info.get("action_info") or {}
+            # Pull post-step robot pose (degrees) + ball pos from the env's
+            # cached game state so we can measure how many degrees a "turn X"
+            # command actually rotates the body, and the robot->goal heading
+            # error. Goal center is at (+FIELD_X, 0) for the left team.
+            gs = getattr(env, "_cached_game_state", None)
+            pose_by_id = {}
+            ball_xy = None
+            if gs is not None:
+                for entry in getattr(gs, "robot_poses", {}).get(team_name, []) or []:
+                    if isinstance(entry, dict):
+                        pose_by_id.update(entry)
+                bp = getattr(gs, "ball_pos", None)
+                if bp is not None:
+                    ball_xy = [float(bp[0]), float(bp[1])]
+            for ri, robot_info in enumerate(ai.get("per_robot", []) or []):
+                logits = robot_info.get("logits")
+                turn_logit = kick_logit = None
+                if logits is not None and len(logits) > 3:
+                    turn_logit = float(logits[2])
+                    kick_logit = float(logits[3])
+                rx = ry = theta_deg = head_err_goal = head_err_ball = None
+                pose = pose_by_id.get(robot_info.get("robot_id"))
+                if pose is not None:
+                    rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
+                    gx, gy = 52.5, 0.0  # right goal center (left team attacks +x)
+                    ang_to_goal = math.degrees(math.atan2(gy - ry, gx - rx))
+                    head_err_goal = (ang_to_goal - theta_deg + 180.0) % 360.0 - 180.0
+                    if ball_xy is not None:
+                        ang_to_ball = math.degrees(math.atan2(ball_xy[1] - ry, ball_xy[0] - rx))
+                        head_err_ball = (ang_to_ball - theta_deg + 180.0) % 360.0 - 180.0
+                trace_file.write(json.dumps({
+                    "ep": episode_count,
+                    "ep_step": ep_step,
+                    "robot": ri,
+                    "primitive": robot_info.get("action_type"),
+                    "has_ball": bool(robot_info.get("has_ball_now", False)),
+                    "turn_theta": robot_info.get("turn_theta"),
+                    "theta_deg": theta_deg,
+                    "head_err_goal": head_err_goal,
+                    "head_err_ball": head_err_ball,
+                    "rx": rx, "ry": ry, "ball": ball_xy,
+                    "turn_logit": turn_logit,
+                    "kick_logit": kick_logit,
+                    "kick_margin": (kick_logit - turn_logit)
+                    if (turn_logit is not None and kick_logit is not None) else None,
+                    "kick_fired": bool(robot_info.get("kick_fired", False)),
+                    "kick_aim_quality": robot_info.get("kick_aim_quality"),
+                    "command": robot_info.get("command"),
+                }, default=str) + "\n")
+
+        if terminated or truncated:
+            episode_count += 1
+            ep_step = 0
+            reason = info.get("termination_reason") if isinstance(info, dict) else None
+            if not reason:
+                reason = "max_steps" if truncated else "unknown"
+            outcomes.append(reason)
+            episode_rewards.append(total_reward)
+
+            if episode_count % WINDOW == 0:
+                window_kicks = collector.kicks[last_kick_idx:]
+                last_kick_idx = len(collector.kicks)
+                _print_window_summary(
+                    label=f"eps {episode_count - WINDOW + 1}-{episode_count}",
+                    outcomes=outcomes[-WINDOW:],
+                    rewards=episode_rewards[-WINDOW:],
+                    kicks=window_kicks,
+                    actions=actions_window,
+                )
+                actions_window = Counter()
+
+            total_reward = 0.0
+            obs, info = env.reset()
+            agent_mask = info.get("agent_active_mask", agent_mask)
+            context_mask = info.get("context_active_mask", context_mask)
+
+    # Final summary.
+    _SUMMARY_LOG.info("=" * 72)
+    _SUMMARY_LOG.info(
+        "PPO JAL inference complete — %d episodes, %d steps (%s)",
+        episode_count, elapsed_steps, args.model_path,
+    )
+    _SUMMARY_LOG.info("=" * 72)
+    all_stats = _print_window_summary(
+        label="ALL",
+        outcomes=outcomes,
+        rewards=episode_rewards,
+        kicks=collector.kicks,
+        actions=actions_total,
+    )
+    last_stats = None
+    if len(outcomes) > 100:
+        last_stats = _print_window_summary(
+            label="last 100",
+            outcomes=outcomes[-100:],
+            rewards=episode_rewards[-100:],
+            kicks=[],
+            actions=Counter(),
+        )
+
+    summary_payload = {
+        "model_path": args.model_path,
+        "stage": args.stage,
+        "config_path": args.config,
+        "requested_steps": int(args.steps),
+        "elapsed_steps": elapsed_steps,
+        "episodes": episode_count,
+        "all": all_stats,
+        "last_100": last_stats,
+        "executed_actions": dict(actions_total),
+    }
+    summary_file = log_dir / "summary.json"
+    with summary_file.open("w") as f:
+        json.dump(summary_payload, f, indent=2, default=str)
+    _SUMMARY_LOG.info("Saved summary to %s", summary_file)
+    _SUMMARY_LOG.info("Full log: %s", log_file)
+    if trace_file is not None:
+        trace_file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +896,7 @@ _TRAINER_RUNNERS = {
     "sb3_ppo": _run_sb3_ppo,
     "td3_jal": _run_td3_jal,
     "td3_jal_her": _run_td3_jal_her,
+    "ppo_jal": _run_ppo_jal,
 }
 
 
@@ -560,6 +940,24 @@ def main():
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Directory to write infer_log.log + summary.json. "
                              "Defaults to infer_logs/<timestamp>_<model_stem>/")
+    parser.add_argument("--td3_eval_noise_std", type=float, default=0.0,
+                        help="Optional Gaussian action noise for TD3+HER inference. "
+                             "Default 0 keeps deterministic evaluation.")
+    parser.add_argument("--td3_eval_logit_noise_std", type=float, default=None,
+                        help="Optional TD3+HER eval noise for primitive logits only.")
+    parser.add_argument("--td3_eval_param_noise_std", type=float, default=None,
+                        help="Optional TD3+HER eval noise for continuous params only.")
+    parser.add_argument("--ppo_stochastic", action="store_true",
+                        help="PPO JAL: sample primitive + params (deterministic=False), "
+                             "exactly as during training. Confirms the saturated-mean "
+                             "turn diagnosis vs the default argmax+mean inference.")
+    parser.add_argument("--ppo_param_noise_std", type=float, default=0.3,
+                        help="PPO JAL: keep argmax primitive but add Gaussian noise of this "
+                             "std to the deterministic param mean (then re-clamp to [-1,1]). "
+                             "Supplies the fine turn corrections the saturated bang-bang mean "
+                             "cannot, breaking the continuous-turning loop (see CHANGES.md #26). "
+                             "Default 0.3 (validated: 94.4%% goal, 1.4%% timeout vs 73.6%%/19%% "
+                             "at 0.0). Set 0 for pure deterministic mean (debug only).")
     parser.add_argument("--sim_host", type=str, default="127.0.0.1",
                         help="rcssserver host (default 127.0.0.1). Use to target "
                              "a remote sim or a non-default loopback alias.")
