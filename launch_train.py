@@ -101,6 +101,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
             "td3_jal",
             "td3_jal_curriculum",
             "td3_jal_her",
+            "ppo_jal_curriculum",
             "qlearning",
             "attention_mappo",
         ],
