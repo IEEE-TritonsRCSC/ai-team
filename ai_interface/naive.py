@@ -13,6 +13,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from networking.data_utils import TeamInfo, GameState
 from ai_interface.goalie import goalie_action
+from ai_interface.constants.player_constants import PLAYER_SIZE, BALL_SIZE, KICKABLE_MARGIN
 
 class SoccerAI:
     """
@@ -96,7 +97,7 @@ class SoccerAI:
         Returns:
             True if robot has the ball, False otherwise
         """
-        return abs(robot_to_ball_dist - 1.115) < 1e-4
+        return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < KICKABLE_MARGIN / 2
     
     def get_robot1_action(self, i: int, ball_pos: tuple, robot_pose: tuple, side: str) -> str:
         """

@@ -1,7 +1,6 @@
 import sys
 import os
 import time
-from turtle import distance
 
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 import numpy as np

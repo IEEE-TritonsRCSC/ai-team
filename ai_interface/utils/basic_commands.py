@@ -125,7 +125,6 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
             obstacles.append((_as_float_array([ox, oy]), float(radius)))
         waypoint = _select_detour(origin, destination, obstacles, detour_margin)
         if waypoint is not None:
-            print('Going to', destination, 'Detouring via', waypoint)
             destination = waypoint
 
     distance = np.linalg.norm(destination - origin)
