@@ -94,6 +94,40 @@ class FrozenTD3JALPolicyController:
         return commands
 
 
+class GoalieCommandProvider:
+    """Drive a single scripted Goalie robot via the Goalie state machine."""
+
+    def __init__(self, team_name: str, robot_id: int, side: str = "right"):
+        from ai_interface.goalie import Goalie
+        self.team_name = team_name
+        self.robot_id = int(robot_id)
+        self.num_robots = 1
+        self._goalie = Goalie(teamname=team_name, unum=self.robot_id, side=side)
+
+    def predict_commands(self, game_state: GameState) -> list[str]:
+        if game_state is None:
+            return ["turn 0"]
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is None:
+            return ["turn 0"]
+        goalie_pose = None
+        for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []):
+            if not isinstance(entry, dict):
+                continue
+            pose = entry.get(self.robot_id)
+            if pose is not None and len(pose) >= 3:
+                goalie_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                break
+        if goalie_pose is None:
+            return ["turn 0"]
+        cmd = self._goalie.action(
+            ball_pos=ball_pos,
+            goalie_pose=goalie_pose,
+            game_state=game_state,
+        )
+        return [cmd]
+
+
 class ScriptedTeamCommandProvider:
     """Wrap a hard-coded AI implementation behind the TeamCommandProvider protocol."""
 

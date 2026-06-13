@@ -598,56 +598,47 @@ class PPOJALAgent:
         returns = advantages + np.asarray(values, dtype=np.float32)
         return advantages, returns
 
-    def update(self, last_obs: Optional[np.ndarray] = None,
-               last_agent_active_mask: Optional[np.ndarray] = None,
-               last_context_active_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """Run a PPO update using buffered transitions."""
-        if len(self.buffer) == 0:
-            return {}
+    def _bootstrap_value(
+        self,
+        last_obs: Optional[np.ndarray],
+        last_agent_mask: Optional[np.ndarray],
+        last_context_mask: Optional[np.ndarray],
+    ) -> float:
+        """Compute bootstrap value for a non-terminal last observation."""
+        if last_obs is None:
+            return 0.0
+        if last_agent_mask is None:
+            last_agent_mask = np.zeros(self.a_max, dtype=np.float32)
+        if last_context_mask is None:
+            last_context_mask = np.zeros(self.c_max, dtype=np.float32)
+        with torch.no_grad():
+            last_t = torch.as_tensor(last_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            la = torch.as_tensor(last_agent_mask, dtype=torch.float32, device=self.device)
+            lc = torch.as_tensor(last_context_mask, dtype=torch.float32, device=self.device)
+            _, _, _, lv = self.model(last_t, la, lc)
+        return float(lv.squeeze().item())
 
-        # Bootstrap value for the last observation if not terminal — use the
-        # most recent stored masks if the trainer didn't supply them.
-        if last_obs is not None:
-            if last_agent_active_mask is None:
-                last_agent_active_mask = self.buffer.agent_active_masks[-1]
-            if last_context_active_mask is None:
-                last_context_active_mask = self.buffer.context_active_masks[-1]
-            with torch.no_grad():
-                last_t = torch.as_tensor(last_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-                la = torch.as_tensor(last_agent_active_mask, dtype=torch.float32, device=self.device)
-                lc = torch.as_tensor(last_context_active_mask, dtype=torch.float32, device=self.device)
-                _, _, _, last_value_t = self.model(last_t, la, lc)
-            last_value = float(last_value_t.squeeze().item())
-        else:
-            last_value = 0.0
-
-        # Pull tensors from buffer.
-        obs = torch.as_tensor(np.stack(self.buffer.observations), dtype=torch.float32, device=self.device)
-        prim_actions = torch.as_tensor(np.stack(self.buffer.primitive_actions), dtype=torch.long, device=self.device)
-        param_actions = torch.as_tensor(np.stack(self.buffer.param_actions), dtype=torch.float32, device=self.device)
-        old_prim_logp = torch.as_tensor(np.stack(self.buffer.primitive_logprobs), dtype=torch.float32, device=self.device)
-        old_param_logp = torch.as_tensor(np.stack(self.buffer.param_logprobs), dtype=torch.float32, device=self.device)
-        old_values = torch.as_tensor(np.asarray(self.buffer.values, dtype=np.float32), device=self.device)
-        disabled_masks = torch.as_tensor(np.stack(self.buffer.disabled_masks), dtype=torch.float32, device=self.device)
-        agent_masks = torch.as_tensor(np.stack(self.buffer.agent_active_masks), dtype=torch.float32, device=self.device)
-        context_masks = torch.as_tensor(np.stack(self.buffer.context_active_masks), dtype=torch.float32, device=self.device)
-        param_masks = torch.as_tensor(np.stack(self.buffer.param_active_masks), dtype=torch.float32, device=self.device)
-
-        advantages_np, returns_np = self._compute_gae(
-            rewards=self.buffer.rewards,
-            values=self.buffer.values,
-            masks=self.buffer.masks,
-            last_value=last_value,
-        )
-        advantages = torch.as_tensor(advantages_np, device=self.device)
-        returns = torch.as_tensor(returns_np, device=self.device)
-
+    def _ppo_update_from_tensors(
+        self,
+        obs: torch.Tensor,
+        prim_actions: torch.Tensor,
+        param_actions: torch.Tensor,
+        old_prim_logp: torch.Tensor,
+        old_param_logp: torch.Tensor,
+        old_values: torch.Tensor,
+        disabled_masks: torch.Tensor,
+        agent_masks: torch.Tensor,
+        context_masks: torch.Tensor,
+        param_masks: torch.Tensor,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Run the PPO minibatch update loop on pre-assembled tensors with pre-computed GAE."""
         # Normalize + clip advantages.
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = torch.clamp(advantages, -float(self.hparams["advantage_clip"]), float(self.hparams["advantage_clip"]))
 
-        # Apply current LR schedule.
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self._current_lr()
         ent_coef = self._current_ent_coef()
@@ -673,18 +664,17 @@ class PPOJALAgent:
 
         def _joint_logp(prim_logits, param_mean_b, param_std_b1, b_prim, b_param,
                         b_disabled, b_agent, b_param_active, want_entropy=False):
-            # prim_logits: (bs, a_max, P); apply disabled mask (finite offset).
             prim_logits = prim_logits + torch.log(b_disabled + 1e-45)
             prim_dist = Categorical(logits=prim_logits)
-            prim_logp = prim_dist.log_prob(b_prim)                      # (bs, a_max)
+            prim_logp = prim_dist.log_prob(b_prim)
             std_b = param_std_b1.unsqueeze(0).expand_as(param_mean_b)
             param_dist = Normal(param_mean_b, std_b)
-            param_logp = (param_dist.log_prob(b_param) * b_param_active.unsqueeze(1)).sum(dim=-1)  # (bs, a_max)
-            logp = ((prim_logp + param_logp) * b_agent).sum(dim=-1)     # mask + sum over agents
+            param_logp = (param_dist.log_prob(b_param) * b_param_active.unsqueeze(1)).sum(dim=-1)
+            logp = ((prim_logp + param_logp) * b_agent).sum(dim=-1)
             if not want_entropy:
                 return logp
-            prim_ent = prim_dist.entropy()                              # (bs, a_max)
-            param_ent = (param_dist.entropy() * b_param_active.unsqueeze(1)).sum(dim=-1)  # (bs, a_max)
+            prim_ent = prim_dist.entropy()
+            param_ent = (param_dist.entropy() * b_param_active.unsqueeze(1)).sum(dim=-1)
             entropy = (((prim_ent + param_ent) * b_agent).sum(dim=-1)).mean()
             return logp, entropy, prim_ent.mean()
 
@@ -719,7 +709,6 @@ class PPOJALAgent:
                 surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * b_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss with clipping.
                 value = value.squeeze(-1)
                 v_unclipped = (value - b_returns).pow(2)
                 v_clipped_pred = b_old_values + torch.clamp(value - b_old_values, -vclip_range, vclip_range)
@@ -738,7 +727,6 @@ class PPOJALAgent:
                 last_entropy = float(entropy.item())
                 last_prim_entropy = float(prim_entropy_mean.item())
 
-            # Approx KL after this epoch (for early stop + LR adapt).
             with torch.no_grad():
                 prim_logits_a, param_mean_a, param_std_a, _ = self.model(obs, agent_masks, context_masks)
                 logp_new_a = _joint_logp(
@@ -755,7 +743,6 @@ class PPOJALAgent:
                 early_stop = True
                 break
 
-        self.buffer.clear()
         self.last_metrics = {
             "policy_loss": last_policy_loss,
             "value_loss": last_value_loss,
@@ -767,6 +754,117 @@ class PPOJALAgent:
             "early_stop": float(1.0 if early_stop else 0.0),
         }
         return self.last_metrics
+
+    def update_from_rollout_segments(
+        self,
+        segments: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        """PPO update from N independent env rollouts, computing GAE per segment.
+
+        Each segment dict must contain:
+            obs, primitive_actions, param_actions, primitive_logprobs,
+            param_logprobs, values (List[float]), rewards (List[float]),
+            masks (List[float]), disabled_masks, agent_active_masks,
+            context_active_masks, param_active_masks
+        Optional keys:
+            last_obs (np.ndarray or None) — current obs if mid-episode at segment end
+            last_agent_mask, last_context_mask — active masks for last_obs
+        """
+        if not segments:
+            return {}
+
+        all_obs, all_prim, all_param = [], [], []
+        all_old_prim_logp, all_old_param_logp = [], []
+        all_old_values: List[float] = []
+        all_advantages: List[float] = []
+        all_returns: List[float] = []
+        all_disabled, all_agent, all_context, all_param_active = [], [], [], []
+
+        for seg in segments:
+            last_value = self._bootstrap_value(
+                seg.get("last_obs"),
+                seg.get("last_agent_mask"),
+                seg.get("last_context_mask"),
+            )
+            adv_np, ret_np = self._compute_gae(
+                rewards=seg["rewards"],
+                values=seg["values"],
+                masks=seg["masks"],
+                last_value=last_value,
+            )
+            all_advantages.extend(adv_np.tolist())
+            all_returns.extend(ret_np.tolist())
+            all_obs.extend(seg["obs"])
+            all_prim.extend(seg["primitive_actions"])
+            all_param.extend(seg["param_actions"])
+            all_old_prim_logp.extend(seg["primitive_logprobs"])
+            all_old_param_logp.extend(seg["param_logprobs"])
+            all_old_values.extend(seg["values"])
+            all_disabled.extend(seg["disabled_masks"])
+            all_agent.extend(seg["agent_active_masks"])
+            all_context.extend(seg["context_active_masks"])
+            all_param_active.extend(seg["param_active_masks"])
+
+        obs_t = torch.as_tensor(np.stack(all_obs), dtype=torch.float32, device=self.device)
+        prim_t = torch.as_tensor(np.stack(all_prim), dtype=torch.long, device=self.device)
+        param_t = torch.as_tensor(np.stack(all_param), dtype=torch.float32, device=self.device)
+        old_prim_logp_t = torch.as_tensor(np.stack(all_old_prim_logp), dtype=torch.float32, device=self.device)
+        old_param_logp_t = torch.as_tensor(np.stack(all_old_param_logp), dtype=torch.float32, device=self.device)
+        old_val_t = torch.as_tensor(np.asarray(all_old_values, dtype=np.float32), device=self.device)
+        disabled_t = torch.as_tensor(np.stack(all_disabled), dtype=torch.float32, device=self.device)
+        agent_t = torch.as_tensor(np.stack(all_agent), dtype=torch.float32, device=self.device)
+        context_t = torch.as_tensor(np.stack(all_context), dtype=torch.float32, device=self.device)
+        param_active_t = torch.as_tensor(np.stack(all_param_active), dtype=torch.float32, device=self.device)
+        adv_t = torch.as_tensor(np.asarray(all_advantages, dtype=np.float32), device=self.device)
+        ret_t = torch.as_tensor(np.asarray(all_returns, dtype=np.float32), device=self.device)
+
+        return self._ppo_update_from_tensors(
+            obs_t, prim_t, param_t, old_prim_logp_t, old_param_logp_t, old_val_t,
+            disabled_t, agent_t, context_t, param_active_t, adv_t, ret_t,
+        )
+
+    def update(self, last_obs: Optional[np.ndarray] = None,
+               last_agent_active_mask: Optional[np.ndarray] = None,
+               last_context_active_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """Run a PPO update using buffered transitions."""
+        if len(self.buffer) == 0:
+            return {}
+
+        if last_agent_active_mask is None and self.buffer.agent_active_masks:
+            last_agent_active_mask = self.buffer.agent_active_masks[-1]
+        if last_context_active_mask is None and self.buffer.context_active_masks:
+            last_context_active_mask = self.buffer.context_active_masks[-1]
+        last_value = self._bootstrap_value(last_obs, last_agent_active_mask, last_context_active_mask)
+
+        # Pull tensors from buffer.
+        obs = torch.as_tensor(np.stack(self.buffer.observations), dtype=torch.float32, device=self.device)
+        prim_actions = torch.as_tensor(np.stack(self.buffer.primitive_actions), dtype=torch.long, device=self.device)
+        param_actions = torch.as_tensor(np.stack(self.buffer.param_actions), dtype=torch.float32, device=self.device)
+        old_prim_logp = torch.as_tensor(np.stack(self.buffer.primitive_logprobs), dtype=torch.float32, device=self.device)
+        old_param_logp = torch.as_tensor(np.stack(self.buffer.param_logprobs), dtype=torch.float32, device=self.device)
+        old_values = torch.as_tensor(np.asarray(self.buffer.values, dtype=np.float32), device=self.device)
+        disabled_masks = torch.as_tensor(np.stack(self.buffer.disabled_masks), dtype=torch.float32, device=self.device)
+        agent_masks = torch.as_tensor(np.stack(self.buffer.agent_active_masks), dtype=torch.float32, device=self.device)
+        context_masks = torch.as_tensor(np.stack(self.buffer.context_active_masks), dtype=torch.float32, device=self.device)
+        param_masks = torch.as_tensor(np.stack(self.buffer.param_active_masks), dtype=torch.float32, device=self.device)
+
+        advantages_np, returns_np = self._compute_gae(
+            rewards=self.buffer.rewards,
+            values=self.buffer.values,
+            masks=self.buffer.masks,
+            last_value=last_value,
+        )
+        advantages = torch.as_tensor(advantages_np, device=self.device)
+        returns = torch.as_tensor(returns_np, device=self.device)
+
+        metrics = self._ppo_update_from_tensors(
+            obs, prim_actions, param_actions,
+            old_prim_logp, old_param_logp, old_values,
+            disabled_masks, agent_masks, context_masks, param_masks,
+            advantages, returns,
+        )
+        self.buffer.clear()
+        return metrics
 
     # -- persistence ------------------------------------------------------
 

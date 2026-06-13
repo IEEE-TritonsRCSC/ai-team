@@ -75,7 +75,7 @@
     "stage1_180_full": {
       "description": "ACTIVE — next to run (overnight chain RUNG 2). TURN GENERALIZATION rung: same narrow ball_y ±6, spawn theta ±180°. Result: 98.6% overall goal rate, 100% last 100 eps, bad_aim 3%→0.5%. Skill transferred instantly from stage1_090_mid checkpoint — no warm-up phase needed. Checkpoint: models/ppo_jal_curriculum/stage1_180_full_complete.pt (OLD flat-MLP lineage — ignored; incompatible with the attention net). QUEUED — overnight chain RUNG 2 on the NEW expandable backbone; warm-starts IN-MEMORY from rung 1 (stage1_090_mid) final weights, NOT from any checkpoint path. New checkpoint: models/ppo_jal_expandable/stage1_180_full_complete.pt. Budget 150k.",
       "num_robots": 1,
-      "timesteps": 150000,
+      "timesteps": 0,
       "robot_ids": [1],
       "disabled_actions": ["goto", "approach_ball", "start_dribble", "stop_dribble"],
       "spawn_robot_at_ball": true,
@@ -109,7 +109,7 @@
     "stage1_180_y10": {
       "description": "COMPLETED (§18). AIM STEEPENING rung: ball_y ±10, spawn theta ±180°. Result: 96.8% overall goal rate, 98% last 100 eps, bad_aim 1%→0.0%. Skill transferred instantly from stage1_180_full checkpoint. Checkpoint: models/ppo_jal_curriculum/stage1_180_y10_complete.pt (OLD lineage — ignored). QUEUED — overnight chain RUNG 3 on the NEW backbone; warm-starts IN-MEMORY from rung 2. New checkpoint: models/ppo_jal_expandable/stage1_180_y10_complete.pt. Budget 150k.",
       "num_robots": 1,
-      "timesteps": 150000,
+      "timesteps": 0,
       "robot_ids": [1],
       "disabled_actions": ["goto", "approach_ball", "start_dribble", "stop_dribble"],
       "spawn_robot_at_ball": true,
@@ -143,7 +143,7 @@
     "stage1_180_y15": {
       "description": "COMPLETED (§19). FULL DIFFICULTY rung: widen ball_y ±10 → ±15 (full field width) at ±180° spawn theta — the original hard distribution. Enabled: kick, turn. Result: 89.0% overall goal rate, 87.7% deterministic inference, bad_aim 0.0%. Instant transfer from stage1_180_y10. Checkpoint: models/ppo_jal_curriculum/stage1_180_y15_complete.pt (OLD lineage — ignored). QUEUED — overnight chain RUNG 4 (full field width, the hard distribution) on the NEW backbone; warm-starts IN-MEMORY from rung 3. New checkpoint: models/ppo_jal_expandable/stage1_180_y15_complete.pt. Budget 200k.",
       "num_robots": 1,
-      "timesteps": 200000,
+      "timesteps": 0,
       "robot_ids": [1],
       "disabled_actions": ["goto", "approach_ball", "start_dribble", "stop_dribble"],
       "spawn_robot_at_ball": true,
@@ -177,7 +177,7 @@
     "stage1_9": {
       "description": "RUNG 5 — FINAL Stage-1 task (overnight chain, runs last, on the NEW expandable backbone; warm-starts IN-MEMORY from rung 4. New checkpoint: models/ppo_jal_expandable/stage1_9_complete.pt). HOME-SPOT APPROACH → TURN → KICK: final Stage 1 task. Robot starts at its fixed home pose (-10, 0) facing a random heading; ball spawns at full distribution (x∈[5,30], y∈[-15,15]). Must approach 15–43 units (approach_ball enabled for the first time), turn to aim, then kick. goto and dribbles stay disabled — Gaussian Dx/Dy head still idle, only Dtheta active. approach_weight=1.0 (not 1.8): worst-case park EV = 1.0×43−10 = 33 << goal 70; at 1.8 it would be 67≈goal (unsafe local optimum). Acceptance: goal ≥ 50% over final 1000 eps; no primitive > 90% in any 100-ep window. Warm-start: models/ppo_jal_curriculum/stage1_180_y15_complete.pt. Budget: 300,000 steps — first stage with genuine approach learning, not an instant transfer.",
       "num_robots": 1,
-      "timesteps": 300000,
+      "timesteps": 0,
       "robot_ids": [1],
       "disabled_actions": ["goto", "start_dribble", "stop_dribble"],
       "spawn_robot_at_ball": false,
@@ -210,8 +210,17 @@
     "stage2_goalie": {
       "description": "STAGE 2 STUB — REWARD SIDE DONE, TRAINER WIRING NEEDED (set timesteps > 0 to enable). 1v1 vs scripted goalie (ai_interface/goalie.py): approach + turn + kick + dribble, ball spawns in the attacking third near the penalty arc. Reward is fully wired in reward.py / JAL_env.py: (1) use_goalie_aim_gate switches the kick bonus AND the dense ball_speed / goal_progress gates from center-mouth aim to GOALIE-GAP quality (0 = shot at keeper's y, 1 = max in-mouth separation) — breaks the stage-1 center-shot habit; goalie_gap_blend_center=0.3 eases transfer from the stage-1 checkpoint, fade toward 0.0 once goal rate recovers. (2) Dribble session rules enforced in JAL_env._action_to_commands: 1.0 m max radius from the start_dribble anchor (exhaustion forces a drop), re-dribble requires robot-ball separation > kickable_dist + 0.2; dribble bonus pays only inside the valid envelope while moving laterally away from the keeper's y. (3) stop_dribble_release_bonus pays releasing late in a session (>= 70% of radius) to teach stop -> re-approach -> kick. TRAINER WORK REMAINING: spawn the opponent goalie robot and drive it with goalie.py each cycle (aux scripted policy in the rollout loop — JAL_env only reads its pose from game_state via _opponent_goalie_pose, nearest opponent to GOAL_R), warm-start from models/ppo_jal_expandable/stage1_9_complete.pt, and consider adding goalie (x,y) to a context slot (+context_active_mask) as a follow-up if corner placement plateaus — the obs currently has no goalie dims, so placement must be inferred from ball y correlation. Weights below mirror stage-1 scale (goal 70): tune kick_into_keeper_penalty / opponent_near_ball_penalty against goal rate, gap_quality logs (JAL_env 'Kick fired' lines), and invalid start_dribble rate.",
       "num_robots": 1,
-      "timesteps": 0,
+      "timesteps": 300000,
       "robot_ids": [1],
+      "team_config": "team_config_stage2.json",
+      "aux_team_policies": [
+        {
+          "controller_type": "goalie",
+          "team_name": "TeamB",
+          "robot_ids": [1],
+          "side": "right"
+        }
+      ],
       "disabled_actions": ["goto"],
       "spawn_robot_at_ball": false,
       "random_ball_x": true,
@@ -267,7 +276,7 @@
   "max_steps": 300,
   "save_interval": 10000,
   "save_path": "models/ppo_jal_expandable",
-  "load_model": "models/ppo_jal_expandable/stage1_090_mid_complete.pt",
+  "load_model": "final_models/ppo_jal_expandable_stage1_final.pt",
   "model_params": {
     "gamma": 0.99,
     "gae_lambda": 0.95,

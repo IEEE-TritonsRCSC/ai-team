@@ -73,7 +73,8 @@ class JALTeamEnv(gym.Env):
         approach_defer_when_has_ball: bool = False,
         approach_defer_epsilon: float = 0.0,
         reward_config_overrides: Optional[Dict[str, float]] = None,
-        some_arg=None
+        some_arg=None,
+        opponent_team_name: Optional[str] = None,
         ):
 
         super().__init__()
@@ -175,12 +176,17 @@ class JALTeamEnv(gym.Env):
             shape=(self.obs_dim,),
             dtype=np.float32
             )
+        # Opponent team name for filling context slots (slot 1 = opp goalie).
+        self.opponent_team_name: Optional[str] = opponent_team_name
+
         # Active masks: which agent slots are controlled robots, which context
         # slots are present. Static within Stage 1 (1 robot, no context); later
         # stages / foul-randomization will vary them per episode.
         self.agent_active_mask = np.zeros(self.a_max, dtype=np.float32)
         self.agent_active_mask[: self.num_robots] = 1.0
-        self.context_active_mask = np.zeros(self.c_max, dtype=np.float32)  # TODO(opponent-stage)
+        self.context_active_mask = np.zeros(self.c_max, dtype=np.float32)
+        if self.opponent_team_name is not None:
+            self.context_active_mask[1] = 1.0  # slot 1 = opp goalie
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
         self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
 
@@ -242,6 +248,7 @@ class JALTeamEnv(gym.Env):
 
         # Per-robot pose history for velocity estimation
         self.prev_robot_pose_by_id: Dict[int, np.ndarray] = {}
+        self.prev_opp_pose_by_id: Dict[int, np.ndarray] = {}
         self.prev_reward_ball_dist_by_id: Dict[int, float] = {}
         self.prev_reward_ball_to_goal_dist: Optional[float] = None
         self.prev_reward_ball_pos: Optional[Tuple[float, float]] = None
@@ -392,6 +399,7 @@ class JALTeamEnv(gym.Env):
 
         # Clear robot pose memory
         self.prev_robot_pose_by_id = {}
+        self.prev_opp_pose_by_id = {}
         self.prev_reward_ball_dist_by_id = {}
         self.prev_reward_ball_to_goal_dist = None
         self.prev_reward_ball_pos = None
@@ -931,9 +939,39 @@ class JALTeamEnv(gym.Env):
                 obs[off + 7] = float(start_dribble_pos[1]) / self._NORM_POS_Y
                 # dims 8..per_agent_dim-1 reserved → stay 0
 
-            # --- context slots (c_max × d_ctx): ALL ZERO for now ---
-            # TODO(opponent-stage): fill from extract_opponent_positions / our
-            # goalie pose, set context_active_mask accordingly. See reward.py.
+            # --- context slots (c_max × d_ctx) ---
+            # Layout: slot 0 = our goalie (unused Stage 1/2), slot 1 = opp goalie.
+            # Only fill when an opponent team is configured.
+            if self.opponent_team_name is not None:
+                opp_pose_entries = game_state.robot_poses.get(self.opponent_team_name, [])
+                opp_pose_by_id: Dict[int, Any] = {}
+                for entry in opp_pose_entries:
+                    if isinstance(entry, dict):
+                        opp_pose_by_id.update(entry)
+
+                # Context slot 1: first opponent robot (goalie robot_id=1 by convention).
+                first_opp_id = min(opp_pose_by_id.keys()) if opp_pose_by_id else None
+                if first_opp_id is not None:
+                    opp_pose = opp_pose_by_id[first_opp_id]
+                    opp_x = float(opp_pose[0])
+                    opp_y = float(opp_pose[1])
+                    opp_theta = float(np.deg2rad(opp_pose[2]))
+                    prev_opp_xy = self.prev_opp_pose_by_id.get(first_opp_id)
+                    if prev_opp_xy is not None:
+                        opp_vx = float(opp_x - prev_opp_xy[0])
+                        opp_vy = float(opp_y - prev_opp_xy[1])
+                    else:
+                        opp_vx = opp_vy = 0.0
+                    self.prev_opp_pose_by_id[first_opp_id] = np.array([opp_x, opp_y], dtype=np.float32)
+
+                    ctx_base = self.global_dim + self.per_agent_dim * self.a_max
+                    opp_slot_off = ctx_base + 1 * self.d_ctx  # slot 1
+                    obs[opp_slot_off + 0] = opp_x / self._NORM_POS_X
+                    obs[opp_slot_off + 1] = opp_y / self._NORM_POS_Y
+                    obs[opp_slot_off + 2] = opp_theta / self._NORM_THETA
+                    obs[opp_slot_off + 3] = opp_vx / self._NORM_VEL
+                    obs[opp_slot_off + 4] = opp_vy / self._NORM_VEL
+                    # dims 5..d_ctx-1 reserved → stay 0
 
             return obs
             

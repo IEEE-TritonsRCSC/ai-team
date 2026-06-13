@@ -278,12 +278,7 @@ class FullTeamMARLEnv(gym.Env):
         self.current_states = states
 
         goal_scored, robot_oob, ball_oob = self._termination_flags(game_state)
-        done = (
-            self.current_step >= self.max_steps
-            or goal_scored
-            or robot_oob
-            or ball_oob
-        )
+        done = self.current_step >= self.max_steps or goal_scored
 
         info = {
             "goal_scored": goal_scored,

@@ -32,6 +32,7 @@ import torch
 from ai_interface.algorithms.ppo_jal import PPOJALAgent, PRIMITIVE_NAMES, NUM_PRIMITIVES
 from ai_interface.envs.JAL_env import JALTeamEnv
 from ai_interface.trainers.base_trainer import BaseTrainer
+from ai_interface.trainers.policy_control import ScriptedTeamCommandProvider, GoalieCommandProvider
 from networking.networker import Networker, TeamInfo
 
 
@@ -121,8 +122,12 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         super().__init__(config, log_dir, algorithm_name="ppo_jal_curriculum")
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.networker: Optional[Networker] = None
+        self.networkers: List[Networker] = []   # one per parallel env
         self.env: Optional[JALTeamEnv] = None
+        self.envs: List[JALTeamEnv] = []        # one per parallel env
         self.agent: Optional[PPOJALAgent] = None
+        self._opp_controller: Optional[ScriptedTeamCommandProvider] = None
+        self._opp_team_name: Optional[str] = None
 
         self.curriculum = config.get("curriculum", {})
         self._current_num_robots: Optional[int] = None
@@ -158,27 +163,28 @@ class PPOJALCurriculumTrainer(BaseTrainer):
     # Environment
     # ------------------------------------------------------------------
 
-    def setup_environment(
+    def _build_networker(
         self,
-        num_robots: int,
+        team_infos: List[TeamInfo],
+        env_idx: int,
+    ) -> Networker:
+        sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(env_idx)
+        return Networker(
+            team_infos,
+            self.config.get("env_mode", "sim-only"),
+            sim_host=sim_host,
+            sim_player_port=sim_player_port,
+            sim_trainer_port=sim_trainer_port,
+        )
+
+    def _build_env(
+        self,
+        networker: Networker,
+        team_name: str,
         robot_ids: List[int],
-        stage_config: Optional[Dict[str, Any]] = None,
+        stage_config: Dict[str, Any],
+        opponent_team_name: Optional[str] = None,
     ) -> JALTeamEnv:
-        team_infos = self._load_team_config(self.config["team_config"])
-        team_name = self.config.get("team_name") or team_infos[0].name
-
-        if self.networker is None:
-            sim_host, sim_player_port, sim_trainer_port = self._sim_endpoint_for_env(0)
-            self.networker = Networker(
-                team_infos,
-                self.config.get("env_mode", "sim-only"),
-                sim_host=sim_host,
-                sim_player_port=sim_player_port,
-                sim_trainer_port=sim_trainer_port,
-            )
-
-        stage_config = stage_config or {}
-
         def _stage_or_top(key, default):
             if key in stage_config:
                 return stage_config[key]
@@ -196,8 +202,8 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         reward_config_overrides = _stage_or_top("reward_config_overrides", None)
         invalid_action_penalty = _stage_or_top("invalid_action_penalty", 0.2)
 
-        self.env = JALTeamEnv(
-            networker=self.networker,
+        return JALTeamEnv(
+            networker=networker,
             team_name=team_name,
             robot_ids=robot_ids,
             obs_dim_per_robot=int(self.config.get("obs_dim_per_robot", 8)),
@@ -220,16 +226,136 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             random_spawn_theta=bool(random_spawn_theta),
             random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
             reward_config_overrides=dict(reward_config_overrides) if reward_config_overrides else None,
+            opponent_team_name=opponent_team_name,
+        )
+
+    def setup_environment(
+        self,
+        num_robots: int,
+        robot_ids: List[int],
+        stage_config: Optional[Dict[str, Any]] = None,
+    ) -> JALTeamEnv:
+        stage_config = stage_config or {}
+        team_config_path = stage_config.get("team_config", self.config["team_config"])
+        team_infos = self._load_team_config(team_config_path)
+        team_name = self.config.get("team_name") or team_infos[0].name
+
+        # Opponent info: second team in team_infos when they have robots.
+        opponent_team_name: Optional[str] = None
+        if len(team_infos) > 1 and team_infos[1].n_players > 0:
+            opponent_team_name = team_infos[1].name
+
+        if self.networker is None:
+            self.networker = self._build_networker(team_infos, 0)
+
+        self.env = self._build_env(
+            self.networker, team_name, robot_ids, stage_config, opponent_team_name,
         )
 
         self.logger.info(
-            "JAL environment setup — Team: %s, robots=%s, obs_dim=%d, disabled_actions=%s",
-            team_name,
-            robot_ids,
+            "JAL environment setup — Team: %s, robots=%s, obs_dim=%d, "
+            "disabled_actions=%s, opponent=%s",
+            team_name, robot_ids,
             int(self.env.observation_space.shape[0]),
-            list(disabled_actions) if disabled_actions else [],
+            list(stage_config.get("disabled_actions", self.config.get("disabled_actions", []))),
+            opponent_team_name or "none",
         )
         return self.env
+
+    def _setup_parallel_envs(
+        self,
+        num_envs: int,
+        num_robots: int,
+        robot_ids: List[int],
+        stage_config: Dict[str, Any],
+    ) -> List[JALTeamEnv]:
+        """Create num_envs independent (networker, env) pairs for parallel rollouts."""
+        stage_config = stage_config or {}
+        team_config_path = stage_config.get("team_config", self.config["team_config"])
+        team_infos = self._load_team_config(team_config_path)
+        team_name = self.config.get("team_name") or team_infos[0].name
+
+        opponent_team_name: Optional[str] = None
+        if len(team_infos) > 1 and team_infos[1].n_players > 0:
+            opponent_team_name = team_infos[1].name
+
+        # Shut down any previously open networkers before recreating.
+        for nw in self.networkers:
+            try:
+                if hasattr(nw, "shutdown"):
+                    nw.shutdown()
+                elif hasattr(nw, "disconnect_from_sim"):
+                    nw.disconnect_from_sim()
+            except Exception:
+                pass
+        self.networkers.clear()
+        self.envs.clear()
+
+        for idx in range(num_envs):
+            nw = self._build_networker(team_infos, idx)
+            env = self._build_env(nw, team_name, robot_ids, stage_config, opponent_team_name)
+            self.networkers.append(nw)
+            self.envs.append(env)
+            self.logger.info(
+                "Parallel env %d/%d — Team: %s, robots=%s, opponent=%s",
+                idx, num_envs, team_name, robot_ids, opponent_team_name or "none",
+            )
+
+        # Keep self.networker / self.env pointing at env 0 for backward compat.
+        self.networker = self.networkers[0]
+        self.env = self.envs[0]
+        return self.envs
+
+    def _setup_opponent_controller(
+        self,
+        stage_config: Dict[str, Any],
+        networker: Networker,
+    ) -> Optional[Any]:
+        """Build a scripted opponent controller if the stage config requests one."""
+        aux_specs = stage_config.get("aux_team_policies", [])
+        if not aux_specs:
+            return None
+
+        spec = aux_specs[0] if isinstance(aux_specs[0], dict) else {}
+        controller_type = str(spec.get("controller_type", "naive")).lower()
+        team_name = str(spec.get("team_name", ""))
+        if not team_name:
+            self.logger.warning("aux_team_policies: missing team_name. Skipping.")
+            return None
+
+        robot_ids = list(spec.get("robot_ids", [1]))
+
+        if controller_type == "goalie":
+            robot_id = int(robot_ids[0]) if robot_ids else 1
+            side = str(spec.get("side", "right"))
+            ctrl = GoalieCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
+            self.logger.info(
+                "Opponent controller: goalie team=%s robot_id=%d side=%s",
+                team_name, robot_id, side,
+            )
+            return ctrl
+
+        if controller_type not in {"naive", "scripted_naive"}:
+            self.logger.warning(
+                "aux_team_policies: unsupported controller_type=%s. Skipping.", controller_type
+            )
+            return None
+
+        commander = getattr(networker, "commander", None)
+        team_infos = (
+            list(commander.team_infos) if commander and hasattr(commander, "team_infos")
+            else []
+        )
+        ctrl = ScriptedTeamCommandProvider(
+            team_infos=team_infos,
+            team_name=team_name,
+            num_robots=len(robot_ids),
+            controller_type=controller_type,
+        )
+        self.logger.info(
+            "Opponent controller: %s team=%s robots=%s", controller_type, team_name, robot_ids,
+        )
+        return ctrl
 
     # ------------------------------------------------------------------
     # Model
@@ -321,8 +447,25 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         timesteps: int,
         stage_config: Optional[Dict[str, Any]] = None,
     ):
-        # Build the env for this stage.
-        self.env = self.setup_environment(num_robots, robot_ids, stage_config=stage_config)
+        num_envs = max(1, int(self.config.get("num_envs", 1)))
+        stage_config = stage_config or {}
+
+        # Build env(s) for this stage.
+        if num_envs > 1:
+            envs = self._setup_parallel_envs(num_envs, num_robots, robot_ids, stage_config)
+            self.env = envs[0]
+        else:
+            self.env = self.setup_environment(num_robots, robot_ids, stage_config=stage_config)
+            envs = [self.env]
+
+        # Opponent controller (scripted goalie, etc.) — only for env 0.
+        self._opp_controller = self._setup_opponent_controller(stage_config, self.networkers[0] if self.networkers else self.networker)
+        self._opp_team_name = None
+        if self._opp_controller is not None:
+            aux_specs = stage_config.get("aux_team_policies", [])
+            if aux_specs and isinstance(aux_specs[0], dict):
+                self._opp_team_name = str(aux_specs[0].get("team_name", ""))
+            self._opp_robot_ids = list(stage_config.get("aux_team_policies", [{}])[0].get("robot_ids", [1]))
 
         obs_dim_now = int(self.env.observation_space.shape[0])
 
@@ -367,13 +510,23 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         checkpoint_dir = Path(self.config.get("save_path", "models/ppo_jal_curriculum"))
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        self._training_loop(
-            stage_name=stage_name,
-            total_timesteps=timesteps,
-            disabled_actions=disabled_actions,
-            save_interval=save_interval,
-            checkpoint_dir=checkpoint_dir,
-        )
+        if num_envs > 1:
+            self._training_loop_multi_env(
+                envs=envs,
+                stage_name=stage_name,
+                total_timesteps=timesteps,
+                disabled_actions=disabled_actions,
+                save_interval=save_interval,
+                checkpoint_dir=checkpoint_dir,
+            )
+        else:
+            self._training_loop(
+                stage_name=stage_name,
+                total_timesteps=timesteps,
+                disabled_actions=disabled_actions,
+                save_interval=save_interval,
+                checkpoint_dir=checkpoint_dir,
+            )
 
         stage_ckpt = checkpoint_dir / f"{stage_name}_complete.pt"
         stage_ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -447,6 +600,19 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             # Accumulate the chosen primitive(s) for the rolling action mix.
             for p in np.asarray(action["primitive_idx"]).reshape(-1):
                 win_actions[PRIMITIVE_NAMES[int(p)]] += 1
+
+            # Send scripted opponent commands from last observed game state so
+            # the opponent robot acts each cycle alongside our policy.
+            if (
+                self._opp_controller is not None
+                and self._opp_team_name
+                and self.env._cached_game_state is not None
+            ):
+                try:
+                    opp_cmds = self._opp_controller.predict_commands(self.env._cached_game_state)
+                    self.env.networker.execute_ai_output(opp_cmds, self._opp_team_name)
+                except Exception as e:
+                    self.logger.debug("Opponent command send failed: %s", e)
 
             # Step env.
             next_obs, reward, terminated, truncated, info = self.env.step(action)
@@ -586,6 +752,250 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 win_outcomes, win_actions, win_rewards, win_lengths, cum_outcomes,
             )
 
+    # ------------------------------------------------------------------
+    # Multi-env training loop (N parallel simulators)
+    # ------------------------------------------------------------------
+
+    def _training_loop_multi_env(
+        self,
+        envs: List[JALTeamEnv],
+        stage_name: str,
+        total_timesteps: int,
+        disabled_actions: Sequence[str],
+        save_interval: int,
+        checkpoint_dir: Path,
+    ):
+        """Training loop for N parallel envs. Collects rollouts per-env and
+        computes GAE independently, then runs one combined PPO update.
+
+        The scripted opponent controller (if configured) is stateless, so one
+        instance serves all envs — commands are sent per-env via each env's
+        own networker before that env's step().
+        """
+        assert self.agent is not None and len(envs) > 0
+        N = len(envs)
+        rollout_size = int(self.agent.hparams.get("rollout_size", 4096))
+
+        param_active_mask = np.zeros(self.agent.param_dim, dtype=np.float32)
+        if "goto" not in disabled_actions:
+            param_active_mask[0] = 1.0
+            param_active_mask[1] = 1.0
+        if "turn" not in disabled_actions:
+            param_active_mask[2] = 1.0
+        self.logger.info(
+            "Stage %s multi-env loop: N=%d param_active_mask=%s",
+            stage_name, N, param_active_mask.tolist(),
+        )
+
+        # Per-env state.
+        obs_list, info_list = zip(*[env.reset() for env in envs])
+        obs_list = list(obs_list)
+        agent_masks = [info.get("agent_active_mask") for info in info_list]
+        context_masks = [info.get("context_active_mask") for info in info_list]
+        ep_returns = [0.0] * N
+        ep_lengths = [0] * N
+
+        # Per-env rollout mini-buffers (cleared after each combined update).
+        seg_keys = [
+            "obs", "primitive_actions", "param_actions",
+            "primitive_logprobs", "param_logprobs", "values",
+            "rewards", "masks",
+            "disabled_masks", "agent_active_masks", "context_active_masks", "param_active_masks",
+        ]
+        segs: List[Dict[str, list]] = [{k: [] for k in seg_keys} for _ in range(N)]
+
+        steps_done = 0
+        next_save = save_interval
+        wall_start = time.time()
+        last_update_step = 0
+
+        summary_interval = int(self.config.get("episode_summary_interval", 200))
+        stage_ep = 0
+        win_outcomes: Counter = Counter()
+        win_actions: Counter = Counter()
+        win_rewards: List[float] = []
+        win_lengths: List[int] = []
+        cum_outcomes: Counter = Counter()
+
+        while steps_done < total_timesteps:
+            for i, env in enumerate(envs):
+                obs = obs_list[i]
+                am = agent_masks[i]
+                cm = context_masks[i]
+
+                action, transition = self.agent.sample_action(
+                    obs=obs,
+                    disabled_actions=disabled_actions,
+                    agent_active_mask=am,
+                    context_active_mask=cm,
+                    param_active_mask=param_active_mask,
+                    deterministic=False,
+                )
+
+                for p in np.asarray(action["primitive_idx"]).reshape(-1):
+                    win_actions[PRIMITIVE_NAMES[int(p)]] += 1
+
+                if (
+                    self._opp_controller is not None
+                    and self._opp_team_name
+                    and env._cached_game_state is not None
+                ):
+                    try:
+                        opp_cmds = self._opp_controller.predict_commands(env._cached_game_state)
+                        env.networker.execute_ai_output(opp_cmds, self._opp_team_name)
+                    except Exception as e:
+                        self.logger.debug("Opponent command send failed (env %d): %s", i, e)
+
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = bool(terminated or truncated)
+                mask = 0.0 if terminated else 1.0
+
+                raw_reward = float(reward)
+                if self._reward_normalizer is not None:
+                    norm_reward = self._reward_normalizer.normalize(raw_reward, done)
+                else:
+                    norm_reward = raw_reward
+
+                # Append to this env's segment.
+                s = segs[i]
+                s["obs"].append(transition["obs"])
+                s["primitive_actions"].append(transition["primitive_action"])
+                s["param_actions"].append(transition["param_action"])
+                s["primitive_logprobs"].append(transition["primitive_logprob"])
+                s["param_logprobs"].append(transition["param_logprob"])
+                s["values"].append(transition["value"])
+                s["rewards"].append(norm_reward)
+                s["masks"].append(mask)
+                s["disabled_masks"].append(transition["disabled_mask"])
+                s["agent_active_masks"].append(transition["agent_active_mask"])
+                s["context_active_masks"].append(transition["context_active_mask"])
+                s["param_active_masks"].append(transition["param_active_mask"])
+
+                ep_returns[i] += raw_reward
+                ep_lengths[i] += 1
+                steps_done += 1
+
+                progress_remaining = max(0.0, 1.0 - steps_done / total_timesteps)
+                self.agent.set_progress_remaining(progress_remaining)
+
+                if done:
+                    self._global_episode_count += 1
+                    stage_ep += 1
+                    ep_ret = ep_returns[i]
+                    ep_len = ep_lengths[i]
+                    self.log_episode(self._global_episode_count, ep_ret, ep_len)
+                    self.logger.info(
+                        "[%s] env%d Episode %d — reward=%.2f  length=%d  steps=%d",
+                        stage_name, i, self._global_episode_count, ep_ret, ep_len, steps_done,
+                    )
+
+                    outcome = info.get("termination_reason") or "unknown"
+                    win_outcomes[outcome] += 1
+                    cum_outcomes[outcome] += 1
+                    win_rewards.append(ep_ret)
+                    win_lengths.append(ep_len)
+                    if stage_ep % summary_interval == 0:
+                        self._log_episode_summary(
+                            stage_name, stage_ep, summary_interval,
+                            win_outcomes, win_actions, win_rewards, win_lengths, cum_outcomes,
+                        )
+                        win_outcomes = Counter()
+                        win_actions = Counter()
+                        win_rewards = []
+                        win_lengths = []
+
+                    ep_returns[i] = 0.0
+                    ep_lengths[i] = 0
+                    obs_list[i], new_info = env.reset()
+                    agent_masks[i] = new_info.get("agent_active_mask")
+                    context_masks[i] = new_info.get("context_active_mask")
+                    segs[i]["last_obs"] = None  # terminal — no bootstrap
+                else:
+                    obs_list[i] = next_obs
+                    agent_masks[i] = info.get("agent_active_mask", am)
+                    context_masks[i] = info.get("context_active_mask", cm)
+
+            # PPO update when total collected transitions >= rollout_size.
+            total_buf = sum(len(s["rewards"]) for s in segs)
+            if total_buf >= rollout_size:
+                # Attach last_obs for non-terminal envs (for bootstrapping).
+                rollout_segments = []
+                for i, s in enumerate(segs):
+                    seg_copy = dict(s)
+                    if ep_lengths[i] > 0:
+                        seg_copy["last_obs"] = obs_list[i]
+                        seg_copy["last_agent_mask"] = agent_masks[i]
+                        seg_copy["last_context_mask"] = context_masks[i]
+                    else:
+                        seg_copy.setdefault("last_obs", None)
+                    rollout_segments.append(seg_copy)
+
+                metrics = self.agent.update_from_rollout_segments(rollout_segments)
+                # Clear per-env mini-buffers.
+                for s in segs:
+                    for k in seg_keys:
+                        s[k] = []
+                    s.pop("last_obs", None)
+                    s.pop("last_agent_mask", None)
+                    s.pop("last_context_mask", None)
+
+                rollout_steps = steps_done - last_update_step
+                last_update_step = steps_done
+                self.logger.info(
+                    "[%s] PPO update @ step %d/%d  rollout=%d  N=%d  "
+                    "loss(pol=%.4f val=%.4f)  ent=%.3f cat_ent=%.3f kl=%.4f  lr=%.2e",
+                    stage_name, steps_done, total_timesteps, rollout_steps, N,
+                    metrics.get("policy_loss", 0.0),
+                    metrics.get("value_loss", 0.0),
+                    metrics.get("entropy", 0.0),
+                    metrics.get("categorical_entropy", float("nan")),
+                    metrics.get("approx_kl", 0.0),
+                    metrics.get("lr", 0.0),
+                )
+
+            # Periodic checkpoint.
+            if steps_done >= next_save:
+                ckpt = checkpoint_dir / f"{stage_name}_steps{next_save}.pt"
+                self.save_model(str(ckpt))
+                self.logger.info(
+                    "[%s] Checkpoint saved: %s (wall=%.1fs)",
+                    stage_name, ckpt, time.time() - wall_start,
+                )
+                next_save += save_interval
+
+            if steps_done % 1000 == 0:
+                self.logger.info(
+                    "[%s][N=%d] progress: %s/%s (%.1f%%)  wall=%.1fs",
+                    stage_name, N,
+                    f"{steps_done:,}", f"{total_timesteps:,}",
+                    100.0 * steps_done / total_timesteps,
+                    time.time() - wall_start,
+                )
+
+        # Final flush.
+        total_buf = sum(len(s["rewards"]) for s in segs)
+        if total_buf >= int(self.agent.hparams.get("minibatch_size", 64)):
+            rollout_segments = []
+            for i, s in enumerate(segs):
+                if not s["rewards"]:
+                    continue
+                seg_copy = dict(s)
+                if ep_lengths[i] > 0:
+                    seg_copy["last_obs"] = obs_list[i]
+                    seg_copy["last_agent_mask"] = agent_masks[i]
+                    seg_copy["last_context_mask"] = context_masks[i]
+                else:
+                    seg_copy.setdefault("last_obs", None)
+                rollout_segments.append(seg_copy)
+            if rollout_segments:
+                self.agent.update_from_rollout_segments(rollout_segments)
+
+        if win_outcomes:
+            self._log_episode_summary(
+                stage_name, stage_ep, sum(win_outcomes.values()),
+                win_outcomes, win_actions, win_rewards, win_lengths, cum_outcomes,
+            )
+
     def _log_episode_summary(
         self,
         stage_name: str,
@@ -654,12 +1064,15 @@ class PPOJALCurriculumTrainer(BaseTrainer):
 
     def cleanup(self):
         super().cleanup()
-        if self.networker:
+        all_networkers = list(self.networkers) if self.networkers else (
+            [self.networker] if self.networker else []
+        )
+        for nw in all_networkers:
             try:
-                if hasattr(self.networker, "shutdown") and callable(self.networker.shutdown):
-                    self.networker.shutdown()
-                elif hasattr(self.networker, "disconnect_from_sim") and callable(self.networker.disconnect_from_sim):
-                    self.networker.disconnect_from_sim()
+                if hasattr(nw, "shutdown") and callable(nw.shutdown):
+                    nw.shutdown()
+                elif hasattr(nw, "disconnect_from_sim") and callable(nw.disconnect_from_sim):
+                    nw.disconnect_from_sim()
             except Exception as e:
                 self.logger.error("Error during networker shutdown: %s", e)
 

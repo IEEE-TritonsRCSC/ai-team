@@ -298,10 +298,16 @@ class AttentionMAPPOAgent:
 
         advantages = self._compute_gae(rewards, masks, values.detach().cpu().tolist())
         adv_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
-        returns = adv_t + values
+        returns = adv_t + values  # true discounted returns (critic target)
 
+        # Normalize advantages for actor (standard PPO)
         if adv_t.numel() > 1:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+        # Normalize returns for critic to prevent the loss scale from exploding
+        # when rewards have large magnitude (e.g., -45 un-normalized vs. ~1 normalized).
+        if returns.numel() > 1:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         old_logprobs = torch.stack([m["logprobs"] for m in self.memory])  # (T, N)
         all_actions = torch.stack([m["actions"] for m in self.memory])    # (T, N, A)
@@ -357,27 +363,34 @@ class AttentionMAPPOAgent:
                 predicted_v = self.critic(team_embs_t).squeeze(-1) # (B,)
                 critic_loss = (mb_ret - predicted_v).pow(2).mean()
 
-                total_loss = (
-                    actor_loss
-                    + self.config.value_coef * critic_loss
-                    - self.config.entropy_coef * entropy
-                )
-
+                # --- Actor pass (encoder + actors) ---
+                # Separate backward so the exploding critic gradient doesn't
+                # dominate encoder updates via the joint loss path.
+                actor_total = actor_loss - self.config.entropy_coef * entropy
                 self.encoder_optimizer.zero_grad()
                 self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                total_loss.backward()
-
-                all_params = (
+                actor_total.backward(retain_graph=True)
+                nn.utils.clip_grad_norm_(
                     list(self.agent_encoder.parameters())
                     + list(self.team_attention.parameters())
-                    + list(self.actors.parameters())
-                    + list(self.critic.parameters())
+                    + list(self.actors.parameters()),
+                    self.config.max_grad_norm,
                 )
-                nn.utils.clip_grad_norm_(all_params, self.config.max_grad_norm)
-
                 self.encoder_optimizer.step()
                 self.actor_optimizer.step()
+
+                # --- Critic pass (encoder + critic) ---
+                critic_total = self.config.value_coef * critic_loss
+                self.encoder_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                critic_total.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.agent_encoder.parameters())
+                    + list(self.team_attention.parameters())
+                    + list(self.critic.parameters()),
+                    self.config.max_grad_norm,
+                )
+                self.encoder_optimizer.step()
                 self.critic_optimizer.step()
 
                 total_actor_loss += float(actor_loss.item())
