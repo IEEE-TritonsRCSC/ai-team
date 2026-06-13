@@ -153,10 +153,6 @@ class EmbeddedSimulatorBackend:
         else:
             command_text = str(command)
         command_text = command_text.rstrip("\0").strip()
-        # "drop" releases a caught ball with no force. The parser has no drop
-        # token, so translate to a minimal-power kick before wrapping.
-        if command_text.lower() == "drop":
-            command_text = "kick 1 0"
         if command_text and not command_text.startswith("("):
             command_text = f"({command_text})"
         return command_text
