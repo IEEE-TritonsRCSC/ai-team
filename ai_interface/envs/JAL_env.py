@@ -678,6 +678,10 @@ class JALTeamEnv(gym.Env):
         # level (aim-gate goal_progress) than at the terminal level.
         if terminated and term_reason == "ball_in_penalty_off_target":
             pass
+        if terminated and term_reason == "goalie_catch":
+            goal_reward = float(self.reward_config.get("goal_reward", 70.0))
+            reward -= goal_reward
+            self.total_rewards -= goal_reward
         # Small penalty for "wasted kick" outcomes — ball went dead via a
         # non-goal playmode (kick_in/corner/goal_kick), or came to rest where
         # the robot can't recover it. Small enough not to crush kick
@@ -1659,6 +1663,11 @@ class JALTeamEnv(gym.Env):
     # would risk pre-empting goals.
     _TOUCHLINE_DEAD_MARGIN: float = 0.5
 
+    # Goalie-catch detection radius. rcssserver's catch area is roughly 1.2 × 1.0
+    # units; we use a generous circular threshold so a catch is reliably flagged
+    # even when the ball drifts slightly after being held.
+    _GOALIE_CATCH_DIST: float = 3.0
+
     def _own_robot_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) for the first controlled robot, or None."""
         if game_state is None:
@@ -1700,13 +1709,23 @@ class JALTeamEnv(gym.Env):
         if bx >= self._RIGHT_PENALTY_AREA_X and abs(by) > self._GOAL_HALF_HEIGHT:
             return True, "ball_in_penalty_off_target"
 
+        # Goalie catch: free_kick_right is issued by rcssserver when the right-side
+        # goalie successfully catches. Confirm with ball proximity to the goalie to
+        # distinguish from other free-kick causes (e.g. fouls).
+        playmode = getattr(game_state, "playmode", None)
+        if playmode == "free_kick_right":
+            gk_pose = self._opponent_goalie_pose(game_state)
+            if gk_pose is not None:
+                gk_x, gk_y, _ = gk_pose
+                if math.hypot(bx - gk_x, by - gk_y) < self._GOALIE_CATCH_DIST:
+                    return True, "goalie_catch"
+
         # Dead-ball playmodes: when rcssserver transitions out of play_on
         # (kick_in_*, corner_kick_*, goal_kick_*, foul_*, etc.) the ball is no
         # longer in play. Without approach_ball/goto enabled, the robot can't
         # do anything meaningful — keep going just wastes cycles until
         # max_steps. End immediately. The playmode is preserved in the reason
         # so the trainer logs distinguish causes.
-        playmode = getattr(game_state, "playmode", None)
         if playmode is not None and playmode not in ("play_on", "before_kick_off"):
             return True, f"ball_dead_{playmode}"
 
