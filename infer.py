@@ -612,6 +612,7 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     """
     from ai_interface.algorithms.ppo_jal import PPOJALAgent, PRIMITIVE_NAMES
     from ai_interface.envs.JAL_env import JALTeamEnv
+    from ai_interface.trainers.policy_control import GoalieCommandProvider
 
     device = _resolve_device()
 
@@ -652,6 +653,21 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     )
 
     disabled_actions = list(stage_config.get("disabled_actions", []))
+
+    # Build scripted opponent controller if the stage config defines one
+    # (e.g. GoalieCommandProvider for stage2_goalie). Mirrors training behaviour.
+    opp_controller = None
+    opp_team_name = None
+    aux_specs = stage_config.get("aux_team_policies", [])
+    if aux_specs and isinstance(aux_specs[0], dict):
+        spec = aux_specs[0]
+        if str(spec.get("controller_type", "")).lower() == "goalie":
+            robot_id = int(spec.get("robot_ids", [1])[0])
+            side = str(spec.get("side", "right"))
+            opp_team_name = str(spec.get("team_name", ""))
+            opp_controller = GoalieCommandProvider(
+                team_name=opp_team_name, robot_id=robot_id, side=side
+            )
 
     log_dir = (
         Path(args.log_dir)
@@ -754,6 +770,17 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
             name = PRIMITIVE_NAMES[int(p)]
             actions_total[name] += 1
             actions_window[name] += 1
+
+        if (
+            opp_controller is not None
+            and opp_team_name
+            and getattr(env, "_cached_game_state", None) is not None
+        ):
+            try:
+                opp_cmds = opp_controller.predict_commands(env._cached_game_state)
+                networker.execute_ai_output(opp_cmds, opp_team_name)
+            except Exception:
+                pass
 
         obs, reward, terminated, truncated, info = env.step(action)
         if isinstance(info, dict):
