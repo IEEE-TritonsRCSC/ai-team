@@ -202,6 +202,9 @@ class JALTeamEnv(gym.Env):
         self.dribble_anchor: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
         self.dribble_exhausted: Dict[int, bool] = {rid: False for rid in self.robot_ids}
         self.awaiting_redribble_gap: Dict[int, bool] = {rid: False for rid in self.robot_ids}
+        # Steps since the last stop_dribble fired per robot. None = no stop_dribble
+        # has occurred yet this episode; 0 = fired this step; > combo_window = expired.
+        self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
         
         # Action design per robot (9D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
         # Matches the layout used to train `stage1_6_final_58pct.zip` so that
@@ -411,6 +414,7 @@ class JALTeamEnv(gym.Env):
         self.dribble_anchor = {rid: None for rid in self.robot_ids}
         self.dribble_exhausted = {rid: False for rid in self.robot_ids}
         self.awaiting_redribble_gap = {rid: False for rid in self.robot_ids}
+        self.steps_since_stop_dribble = {rid: None for rid in self.robot_ids}
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -692,6 +696,34 @@ class JALTeamEnv(gym.Env):
                             if info_i.get("kick_fired"):
                                 reward -= kick_near_goalie_penalty
                                 self.total_rewards -= kick_near_goalie_penalty
+
+        # Stage 2: dribble→kick combo bonus. Rewards the stop_dribble → kick
+        # chain as a unit. Update the per-robot stop_dribble age counter first,
+        # then check whether any kick this step qualifies for the bonus.
+        combo_bonus = float(getattr(self.reward_config, "post_dribble_kick_bonus", 0.0))
+        combo_window = int(getattr(self.reward_config, "post_dribble_kick_combo_window", 5))
+        per_robot_info_list = action_info.get("per_robot", [])
+        for info_i in per_robot_info_list:
+            rid = info_i.get("robot_id")
+            if rid is None:
+                continue
+            if info_i.get("stop_dribble_fired"):
+                self.steps_since_stop_dribble[rid] = 0
+            elif self.steps_since_stop_dribble.get(rid) is not None:
+                self.steps_since_stop_dribble[rid] += 1
+        if combo_bonus > 0.0:
+            for info_i in per_robot_info_list:
+                rid = info_i.get("robot_id")
+                if not info_i.get("kick_fired"):
+                    continue
+                age = self.steps_since_stop_dribble.get(rid)
+                if age is not None and age <= combo_window:
+                    reward += combo_bonus
+                    self.total_rewards += combo_bonus
+                    self.logger.info(
+                        "Dribble→kick combo bonus +%.1f (steps_since_stop=%d)",
+                        combo_bonus, age,
+                    )
 
         self.total_rewards += reward
         terminated, term_reason = self._check_terminal(next_game_state, prev_game_state=current_game_state)

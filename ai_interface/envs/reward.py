@@ -115,6 +115,15 @@ class RewardConfig:
     # JAL_env._check_terminal as the early possession-detection radius.
     goalie_possession_dist: float = 2.0
 
+    # ---- Stage 2: dribble→kick combo bonus ----
+    # One-shot bonus applied when a kick fires within `post_dribble_kick_combo_window`
+    # steps of a stop_dribble event. Directly rewards the dribble-to-create-angle
+    # → kick sequence as a single unit, preventing the robot from learning dribble
+    # and kick as independent behaviours. 0.0 disables.
+    post_dribble_kick_bonus: float = 0.0
+    # How many steps after stop_dribble a kick still qualifies for the combo bonus.
+    post_dribble_kick_combo_window: int = 5
+
 
 @dataclass(frozen=True)
 class RewardInputs:

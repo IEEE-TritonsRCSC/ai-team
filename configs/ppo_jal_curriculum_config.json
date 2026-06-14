@@ -264,7 +264,7 @@
       }
     },
     "stage2b_goalie_dribble": {
-      "description": "STAGE 2B — DRIBBLE MASTERY. Builds on stage2a's gap-shot policy. Key differences: (1) dribble_max_radius 1.0→2.0 gives more lateral room per session; (2) dribble_lateral_progress_weight 0.1→0.4 pays feinting away from the keeper more aggressively; (3) stop_dribble_release_bonus 0.5→1.5 strongly incentivises the stop→re-approach→kick chain; (4) goalie_gap_blend_center 0.3→0.0 removes the center-shot crutch (pure gap quality); (5) kick_into_keeper_penalty 1.5→3.0 makes shooting at the keeper's face clearly negative EV; (6) ball_y widened to ±15 to create lateral-approach scenarios where dribbling actually helps. Load from models/ppo_jal_expandable/stage2a_complete.pt. Budget 300k.",
+      "description": "STAGE 2B — DRIBBLE MASTERY. Builds on stage2a's gap-shot policy. Key differences from 2a: (1) dribble_max_radius 1.0→2.0 gives more lateral room per session; (2) dribble_lateral_progress_weight 0.1→0.4 pays feinting more aggressively; (3) stop_dribble_release_bonus 0.5→1.5; (4) goalie_gap_blend_center 0.3→0.0 removes center-shot crutch; (5) kick_into_keeper_penalty 3.0→1.5 (was over-punishing, robot avoided all kicks); (6) dribble_state_bonus 0.2→0.05 (dense dribble reward was outcompeting risky kick EV); (7) step_bonus -0.05→-0.1 increases urgency to commit to a kick; (8) post_dribble_kick_bonus=5.0 directly rewards the dribble→kick chain as a unit within 5 steps; (9) ball_y widened to ±15. Load from models/ppo_jal_expandable/stage2a_complete.pt. Budget 300k.",
       "num_robots": 1,
       "timesteps": 300000,
       "robot_ids": [1],
@@ -290,7 +290,7 @@
         "has_ball_bonus": 0.05,
         "near_ball_bonus": 0.05,
         "approach_weight": 1.0,
-        "step_bonus": -0.05,
+        "step_bonus": -0.1,
         "goal_progress_weight": 2.0,
         "goal_progress_clip": 1.5,
         "ball_speed_bonus_weight": 2.0,
@@ -305,9 +305,9 @@
         "bad_aim_grad_scale": 15.0,
         "use_goalie_aim_gate": true,
         "goalie_gap_min_quality": 0.3,
-        "kick_into_keeper_penalty": 3.0,
+        "kick_into_keeper_penalty": 1.5,
         "goalie_gap_blend_center": 0.0,
-        "dribble_state_bonus": 0.2,
+        "dribble_state_bonus": 0.05,
         "dribble_max_radius": 2.0,
         "dribble_redribble_gap_margin": 0.2,
         "dribble_lateral_progress_weight": 0.4,
@@ -316,7 +316,9 @@
         "opponent_near_ball_penalty": -0.5,
         "opponent_near_ball_threshold": 5.0,
         "kick_near_goalie_penalty": 3.0,
-        "goalie_possession_dist": 2.0
+        "goalie_possession_dist": 2.0,
+        "post_dribble_kick_bonus": 5.0,
+        "post_dribble_kick_combo_window": 5
       }
     }
   },
