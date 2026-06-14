@@ -105,6 +105,16 @@ class RewardConfig:
     # spamming start_dribble at the 1 m boundary. 0.0 disables.
     stop_dribble_release_bonus: float = 0.0
 
+    # ---- Stage 2: goalie-possession tug-of-war suppression ----
+    # One-shot penalty applied when a kick fires while the ball is within
+    # `goalie_possession_dist` of the keeper. Penalizes the tug-of-war pattern
+    # (robot kicking while the goalie already has possession), complementing the
+    # early-termination check in JAL_env._check_terminal. 0.0 disables.
+    kick_near_goalie_penalty: float = 0.0
+    # Ball-to-goalie distance threshold for the above penalty. Also used by
+    # JAL_env._check_terminal as the early possession-detection radius.
+    goalie_possession_dist: float = 2.0
+
 
 @dataclass(frozen=True)
 class RewardInputs:

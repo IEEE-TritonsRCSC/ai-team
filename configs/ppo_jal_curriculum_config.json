@@ -208,7 +208,7 @@
       }
     },
     "stage2_goalie": {
-      "description": "STAGE 2 STUB — REWARD SIDE DONE, TRAINER WIRING NEEDED (set timesteps > 0 to enable). 1v1 vs scripted goalie (ai_interface/goalie.py): approach + turn + kick + dribble, ball spawns in the attacking third near the penalty arc. Reward is fully wired in reward.py / JAL_env.py: (1) use_goalie_aim_gate switches the kick bonus AND the dense ball_speed / goal_progress gates from center-mouth aim to GOALIE-GAP quality (0 = shot at keeper's y, 1 = max in-mouth separation) — breaks the stage-1 center-shot habit; goalie_gap_blend_center=0.3 eases transfer from the stage-1 checkpoint, fade toward 0.0 once goal rate recovers. (2) Dribble session rules enforced in JAL_env._action_to_commands: 1.0 m max radius from the start_dribble anchor (exhaustion forces a drop), re-dribble requires robot-ball separation > kickable_dist + 0.2; dribble bonus pays only inside the valid envelope while moving laterally away from the keeper's y. (3) stop_dribble_release_bonus pays releasing late in a session (>= 70% of radius) to teach stop -> re-approach -> kick. TRAINER WORK REMAINING: spawn the opponent goalie robot and drive it with goalie.py each cycle (aux scripted policy in the rollout loop — JAL_env only reads its pose from game_state via _opponent_goalie_pose, nearest opponent to GOAL_R), warm-start from models/ppo_jal_expandable/stage1_9_complete.pt, and consider adding goalie (x,y) to a context slot (+context_active_mask) as a follow-up if corner placement plateaus — the obs currently has no goalie dims, so placement must be inferred from ball y correlation. Weights below mirror stage-1 scale (goal 70): tune kick_into_keeper_penalty / opponent_near_ball_penalty against goal rate, gap_quality logs (JAL_env 'Kick fired' lines), and invalid start_dribble rate.",
+      "description": "STAGE 2A — GAP SHOOTING. 1v1 vs scripted goalie: approach + turn + kick + dribble. Ball spawns in attacking third (x=[25,34], y=±10). Reward: use_goalie_aim_gate breaks the center-shot habit; goalie_gap_blend_center=0.3 eases transfer from stage-1 checkpoint (fade to 0.0 once gap-shot rate stabilises). Dribble sessions: 1 m max radius, lateral-progress shaping at 0.1 weight. kick_near_goalie_penalty=2.0 discourages tug-of-war kicks when goalie has caught the ball. Load from models/ppo_jal_expandable/stage1_9_complete.pt. Budget 300k. See stage2b_goalie_dribble for the dribble-mastery substage.",
       "num_robots": 1,
       "timesteps": 300000,
       "robot_ids": [1],
@@ -258,7 +258,65 @@
         "dribble_lateral_progress_clip": 0.3,
         "stop_dribble_release_bonus": 0.5,
         "opponent_near_ball_penalty": -0.5,
-        "opponent_near_ball_threshold": 5.0
+        "opponent_near_ball_threshold": 5.0,
+        "kick_near_goalie_penalty": 2.0,
+        "goalie_possession_dist": 2.0
+      }
+    },
+    "stage2b_goalie_dribble": {
+      "description": "STAGE 2B — DRIBBLE MASTERY. Builds on stage2a's gap-shot policy. Key differences: (1) dribble_max_radius 1.0→2.0 gives more lateral room per session; (2) dribble_lateral_progress_weight 0.1→0.4 pays feinting away from the keeper more aggressively; (3) stop_dribble_release_bonus 0.5→1.5 strongly incentivises the stop→re-approach→kick chain; (4) goalie_gap_blend_center 0.3→0.0 removes the center-shot crutch (pure gap quality); (5) kick_into_keeper_penalty 1.5→3.0 makes shooting at the keeper's face clearly negative EV; (6) ball_y widened to ±15 to create lateral-approach scenarios where dribbling actually helps. Load from models/ppo_jal_expandable/stage2a_complete.pt. Budget 300k.",
+      "num_robots": 1,
+      "timesteps": 300000,
+      "robot_ids": [1],
+      "team_config": "team_config_stage2.json",
+      "aux_team_policies": [
+        {
+          "controller_type": "goalie",
+          "team_name": "TeamB",
+          "robot_ids": [1],
+          "side": "right"
+        }
+      ],
+      "disabled_actions": ["goto"],
+      "spawn_robot_at_ball": false,
+      "random_ball_x": true,
+      "random_ball_x_range": [25.0, 34.0],
+      "random_ball_y": true,
+      "random_ball_y_range": [-15.0, 15.0],
+      "random_spawn_theta": true,
+      "random_spawn_theta_range_deg": [-180.0, 180.0],
+      "invalid_action_penalty": 0.5,
+      "reward_config_overrides": {
+        "has_ball_bonus": 0.05,
+        "near_ball_bonus": 0.05,
+        "approach_weight": 1.0,
+        "step_bonus": -0.05,
+        "goal_progress_weight": 2.0,
+        "goal_progress_clip": 1.5,
+        "ball_speed_bonus_weight": 2.0,
+        "ball_speed_threshold": 0.2,
+        "ball_speed_clip": 2.0,
+        "goal_reward": 70.0,
+        "alignment_weight": 3.0,
+        "alignment_near_ball_only": false,
+        "alignment_has_ball_only": true,
+        "kick_aim_bonus_weight": 20.0,
+        "bad_aim_kick_penalty": 1.0,
+        "bad_aim_grad_scale": 15.0,
+        "use_goalie_aim_gate": true,
+        "goalie_gap_min_quality": 0.3,
+        "kick_into_keeper_penalty": 3.0,
+        "goalie_gap_blend_center": 0.0,
+        "dribble_state_bonus": 0.2,
+        "dribble_max_radius": 2.0,
+        "dribble_redribble_gap_margin": 0.2,
+        "dribble_lateral_progress_weight": 0.4,
+        "dribble_lateral_progress_clip": 0.5,
+        "stop_dribble_release_bonus": 1.5,
+        "opponent_near_ball_penalty": -0.5,
+        "opponent_near_ball_threshold": 5.0,
+        "kick_near_goalie_penalty": 3.0,
+        "goalie_possession_dist": 2.0
       }
     }
   },

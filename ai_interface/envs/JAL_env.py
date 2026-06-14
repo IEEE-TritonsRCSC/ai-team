@@ -667,6 +667,32 @@ class JALTeamEnv(gym.Env):
                 if info_i.get("stop_dribble_fired") and info_i.get("stop_dribble_at_limit"):
                     reward += stop_release_bonus
 
+        # Stage 2: penalty for kicking while the ball is already in the
+        # goalie's possession (tug-of-war suppression). Fires when a kick
+        # command was actually sent AND the ball is within goalie_possession_dist
+        # of the keeper. Complemented by the early termination in _check_terminal.
+        kick_near_goalie_penalty = float(
+            getattr(self.reward_config, "kick_near_goalie_penalty", 0.0)
+        )
+        if kick_near_goalie_penalty > 0.0 and current_game_state is not None:
+            gk_pose = self._opponent_goalie_pose(current_game_state)
+            if gk_pose is not None:
+                gk_x, gk_y = gk_pose[0], gk_pose[1]
+                goalie_possession_dist = float(
+                    getattr(self.reward_config, "goalie_possession_dist", 2.0)
+                )
+                ball_pos_now = getattr(current_game_state, "ball_pos", None)
+                if ball_pos_now is not None:
+                    ball_gk_dist = math.hypot(
+                        float(ball_pos_now[0]) - gk_x,
+                        float(ball_pos_now[1]) - gk_y,
+                    )
+                    if ball_gk_dist < goalie_possession_dist:
+                        for info_i in action_info.get("per_robot", []):
+                            if info_i.get("kick_fired"):
+                                reward -= kick_near_goalie_penalty
+                                self.total_rewards -= kick_near_goalie_penalty
+
         self.total_rewards += reward
         terminated, term_reason = self._check_terminal(next_game_state, prev_game_state=current_game_state)
         # Off-target terminal penalty disabled: a -3 penalty here flipped the
@@ -679,7 +705,7 @@ class JALTeamEnv(gym.Env):
         if terminated and term_reason == "ball_in_penalty_off_target":
             pass
         if terminated and term_reason == "goalie_catch":
-            goal_reward = float(self.reward_config.get("goal_reward", 70.0))
+            goal_reward = float(getattr(self.reward_config, "goal_reward", 70.0))
             reward -= goal_reward
             self.total_rewards -= goal_reward
         # Small penalty for "wasted kick" outcomes — ball went dead via a
@@ -1708,6 +1734,21 @@ class JALTeamEnv(gym.Env):
         # learning signal — see _RIGHT_PENALTY_AREA_X comment above.
         if bx >= self._RIGHT_PENALTY_AREA_X and abs(by) > self._GOAL_HALF_HEIGHT:
             return True, "ball_in_penalty_off_target"
+
+        # Early goalie-possession detection: the rcssserver catch animation holds
+        # the ball at the keeper for 1-2 cycles BEFORE free_kick_right fires.
+        # Terminate in that window to prevent tug-of-war kick attempts. Only
+        # fire when the keeper is deep in its goal zone (x > 38) so this check
+        # doesn't trigger when the goalie rushes out to challenge during open play.
+        gk_pose_early = self._opponent_goalie_pose(game_state)
+        if gk_pose_early is not None:
+            gk_x_e, gk_y_e, _ = gk_pose_early
+            if gk_x_e > 38.0:
+                early_catch_dist = float(
+                    getattr(self.reward_config, "goalie_possession_dist", 2.0)
+                )
+                if math.hypot(bx - gk_x_e, by - gk_y_e) < early_catch_dist:
+                    return True, "goalie_catch"
 
         # Goalie catch: free_kick_right is issued by rcssserver when the right-side
         # goalie successfully catches. Confirm with ball proximity to the goalie to
