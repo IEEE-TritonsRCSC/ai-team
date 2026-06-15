@@ -322,7 +322,7 @@
       }
     },
     "stage2c_goalie_balance": {
-      "description": "STAGE 2C — DRIBBLE+KICK BALANCE. Bridges stage2b's dribble-heavy policy toward committed shooting. Dribble is no longer self-rewarding (dribble_state_bonus=0.0); only lateral progress and the combo bonus justify a session. step_bonus=-0.15 (300 steps × -0.15 = -45 worst-case vs +70 goal) forces the robot to commit. post_dribble_kick_bonus=8.0 makes the stop→kick chain clearly the highest-EV play. dribble_max_radius shrunk 2.0→1.5 to force quicker per-session decisions. kick_into_keeper_penalty kept low (1.0) so kicking is not scary. invalid_action_penalty raised 0.5→2.0: stop_dribble without an active session (no-op turn 0) was being selected 81% of steps; at 0.5 penalty the approach reward easily compensated, so it was effectively free. Load from models/ppo_jal_expandable/stage2b_complete.pt. Budget 300k.",
+      "description": "STAGE 2C — DRIBBLE+KICK BALANCE. Bridges stage2b's dribble-heavy policy toward committed shooting. Dribble is no longer self-rewarding (dribble_state_bonus=0.0); only lateral progress and the combo bonus justify a session. step_bonus=-0.15 forces urgency. post_dribble_kick_bonus=8.0 makes the stop→kick chain clearly highest-EV. dribble_max_radius=1.5. kick_into_keeper_penalty=1.0 so kicking is not scary. invalid_action_penalty=1.0: raised from 0.5 so stop_dribble no-ops (-1.0/step) exceed approach reward (~0.3-0.5/step), but kept below 2.0 which caused policy collapse to approach_ball+turn only (kick and start_dribble become too risky when occasionally invalid during early approach). Also penalises stop_dribble with ball but no active session (new JAL_env case). Load from models/ppo_jal_expandable/stage2b_complete.pt. Budget 300k.",
       "num_robots": 1,
       "timesteps": 300000,
       "robot_ids": [1],
@@ -343,7 +343,7 @@
       "random_ball_y_range": [-15.0, 15.0],
       "random_spawn_theta": true,
       "random_spawn_theta_range_deg": [-180.0, 180.0],
-      "invalid_action_penalty": 2.0,
+      "invalid_action_penalty": 1.0,
       "reward_config_overrides": {
         "has_ball_bonus": 0.05,
         "near_ball_bonus": 0.05,
