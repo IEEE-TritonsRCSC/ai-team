@@ -124,14 +124,6 @@ class RewardConfig:
     # How many steps after stop_dribble a kick still qualifies for the combo bonus.
     post_dribble_kick_combo_window: int = 5
 
-    # ---- Stage 2: re-dribble cycle bonus ----
-    # One-shot bonus for completing a full SSL re-dribble cycle: a legitimate
-    # stop_dribble (session active, ball released) followed by a successful
-    # start_dribble (gap cleared, new session opened). Teaches the multi-hop
-    # dribble chain required by the SSL 1 m rule — drop → move away → re-catch.
-    # 0.0 disables.
-    redribble_cycle_bonus: float = 0.0
-
 
 @dataclass(frozen=True)
 class RewardInputs:

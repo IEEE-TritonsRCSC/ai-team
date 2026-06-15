@@ -205,10 +205,6 @@ class JALTeamEnv(gym.Env):
         # Steps since the last stop_dribble fired per robot. None = no stop_dribble
         # has occurred yet this episode; 0 = fired this step; > combo_window = expired.
         self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
-        # True after a legitimate stop_dribble (session was active) until the next
-        # successful start_dribble opens a new session — that transition fires the
-        # redribble_cycle_bonus reward.
-        self.awaiting_redribble_for_bonus: Dict[int, bool] = {rid: False for rid in self.robot_ids}
         
         # Action design per robot (9D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
         # Matches the layout used to train `stage1_6_final_58pct.zip` so that
@@ -419,7 +415,6 @@ class JALTeamEnv(gym.Env):
         self.dribble_exhausted = {rid: False for rid in self.robot_ids}
         self.awaiting_redribble_gap = {rid: False for rid in self.robot_ids}
         self.steps_since_stop_dribble = {rid: None for rid in self.robot_ids}
-        self.awaiting_redribble_for_bonus = {rid: False for rid in self.robot_ids}
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -702,44 +697,20 @@ class JALTeamEnv(gym.Env):
                                 reward -= kick_near_goalie_penalty
                                 self.total_rewards -= kick_near_goalie_penalty
 
-        # Stage 2: dribble→kick combo bonus and re-dribble cycle bonus.
-        # Update per-robot trackers first, then evaluate bonuses.
+        # Stage 2: dribble→kick combo bonus. Rewards the stop_dribble → kick
+        # chain as a unit. Update the per-robot stop_dribble age counter first,
+        # then check whether any kick this step qualifies for the bonus.
         combo_bonus = float(getattr(self.reward_config, "post_dribble_kick_bonus", 0.0))
         combo_window = int(getattr(self.reward_config, "post_dribble_kick_combo_window", 5))
-        redribble_bonus = float(getattr(self.reward_config, "redribble_cycle_bonus", 0.0))
         per_robot_info_list = action_info.get("per_robot", [])
-
         for info_i in per_robot_info_list:
             rid = info_i.get("robot_id")
             if rid is None:
                 continue
-
-            # Legitimate stop_dribble (session was active): arm both trackers.
             if info_i.get("stop_dribble_fired"):
                 self.steps_since_stop_dribble[rid] = 0
-                self.awaiting_redribble_for_bonus[rid] = True
-
-            # Age the combo window counter each step it isn't reset.
             elif self.steps_since_stop_dribble.get(rid) is not None:
                 self.steps_since_stop_dribble[rid] += 1
-
-            # Successful re-dribble: start_dribble opened a new session while
-            # awaiting_redribble_for_bonus is armed → fire the cycle bonus.
-            executed = info_i.get("action_type")
-            session_now = info_i.get("dribble_session_active", False)
-            blocked = info_i.get("start_dribble_blocked", False)
-            if (
-                executed == "start_dribble"
-                and session_now
-                and not blocked
-                and self.awaiting_redribble_for_bonus.get(rid, False)
-            ):
-                self.awaiting_redribble_for_bonus[rid] = False
-                if redribble_bonus > 0.0:
-                    reward += redribble_bonus
-                    self.total_rewards += redribble_bonus
-                    self.logger.info("Re-dribble cycle bonus +%.1f", redribble_bonus)
-
         if combo_bonus > 0.0:
             for info_i in per_robot_info_list:
                 rid = info_i.get("robot_id")
@@ -1351,10 +1322,6 @@ class JALTeamEnv(gym.Env):
                 (action_type == "kick" and not can_kick)
                 or (action_type == "start_dribble" and not has_ball_now)
                 or (action_type == "stop_dribble" and not has_ball_now)
-                # stop_dribble with ball but no active session: executes as "drop"
-                # which does nothing useful and doesn't fire the release bonus.
-                # Penalise it so the robot can't farm near-zero-cost no-ops here.
-                or (action_type == "stop_dribble" and has_ball_now and not session_active)
                 or start_dribble_blocked
                 or kick_blocked_bad_aim
             )
