@@ -322,7 +322,7 @@
       }
     },
     "stage2c_goalie_balance": {
-      "description": "STAGE 2C — DRIBBLE+KICK BALANCE. Bridges stage2b's dribble-heavy policy toward committed shooting. Dribble is no longer self-rewarding (dribble_state_bonus=0.0); only lateral progress and the combo bonus justify a session. step_bonus=-0.15 (300 steps × -0.15 = -45 worst-case vs +70 goal) forces the robot to commit. post_dribble_kick_bonus=8.0 makes the stop→kick chain clearly the highest-EV play. dribble_max_radius shrunk 2.0→1.5 to force quicker per-session decisions. kick_into_keeper_penalty kept low (1.0) so kicking is not scary. Load from models/ppo_jal_expandable/stage2b_complete.pt. Budget 300k.",
+      "description": "STAGE 2C — DRIBBLE+KICK BALANCE. Bridges stage2b's dribble-heavy policy toward committed shooting. Dribble is no longer self-rewarding (dribble_state_bonus=0.0); only lateral progress and the combo bonus justify a session. step_bonus=-0.15 (300 steps × -0.15 = -45 worst-case vs +70 goal) forces the robot to commit. post_dribble_kick_bonus=8.0 makes the stop→kick chain clearly the highest-EV play. dribble_max_radius shrunk 2.0→1.5 to force quicker per-session decisions. kick_into_keeper_penalty kept low (1.0) so kicking is not scary. invalid_action_penalty raised 0.5→2.0: stop_dribble without an active session (no-op turn 0) was being selected 81% of steps; at 0.5 penalty the approach reward easily compensated, so it was effectively free. Load from models/ppo_jal_expandable/stage2b_complete.pt. Budget 300k.",
       "num_robots": 1,
       "timesteps": 300000,
       "robot_ids": [1],
@@ -343,7 +343,7 @@
       "random_ball_y_range": [-15.0, 15.0],
       "random_spawn_theta": true,
       "random_spawn_theta_range_deg": [-180.0, 180.0],
-      "invalid_action_penalty": 0.5,
+      "invalid_action_penalty": 2.0,
       "reward_config_overrides": {
         "has_ball_bonus": 0.05,
         "near_ball_bonus": 0.05,
@@ -376,7 +376,8 @@
         "kick_near_goalie_penalty": 3.0,
         "goalie_possession_dist": 2.0,
         "post_dribble_kick_bonus": 8.0,
-        "post_dribble_kick_combo_window": 5
+        "post_dribble_kick_combo_window": 5,
+        "redribble_cycle_bonus": 3.0
       }
     }
   },
