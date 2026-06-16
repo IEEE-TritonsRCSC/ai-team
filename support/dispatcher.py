@@ -107,8 +107,8 @@ class Dispatcher:
 
         self._upm = field_units_per_meter(_FIELD_LENGTH_M)
         self._current_command: str | None = None
-        self._prev_command: str | None = None   # used to resolve NORMAL_START
         self._algo = None                       # current AccessoryAlgo instance
+        self._last_designated_pos: tuple[float, float] | None = None
 
     # ---------------------------------------------------------------- #
     #  Main entry point                                                 #
@@ -145,9 +145,12 @@ class Dispatcher:
         cmd = gc_state.command
 
         if cmd == 'NORMAL_START':
-            if self._prev_command in _KICKOFF_PREPARES:
+            # _current_command is still last tick's active state (the prepare
+            # phase we're resuming from) since _transition() for this tick's
+            # command hasn't run yet — _prev_command would be one state too old.
+            if self._current_command in _KICKOFF_PREPARES:
                 return 'NORMAL_START__KICKOFF'
-            if self._prev_command in _PENALTY_PREPARES:
+            if self._current_command in _PENALTY_PREPARES:
                 return 'NORMAL_START__PENALTY'
             # Unexpected NORMAL_START without a prepare phase; treat as FreeKick
             return 'DIRECT_FREE_BLUE'
@@ -172,10 +175,8 @@ class Dispatcher:
         if hasattr(self._algo, 'penalty_against'):
             self._algo.penalty_against = self._penalty_is_against_us(command)
 
-        # Track command history AFTER the transition so _prev_command is the
-        # command we're transitioning *from*, not the new one.
-        self._prev_command = self._current_command
         self._current_command = command
+        self._last_designated_pos = None
 
     # ---------------------------------------------------------------- #
     #  BallPlacement wiring                                            #
@@ -189,7 +190,14 @@ class Dispatcher:
 
         if gc_state.designated_pos is not None:
             x_m, y_m = gc_state.designated_pos
-            algo.update_designated_ball_pos(x_m * self._upm, y_m * self._upm)
+            new_pos = (x_m * self._upm, y_m * self._upm)
+            # Only push when the target actually changes — update_designated_ball_pos()
+            # resets BallPlacement's internal timers/drop-flag, so calling it every
+            # tick would re-arm the initial drop forever and the placer would never
+            # progress past "drop".
+            if new_pos != self._last_designated_pos:
+                algo.update_designated_ball_pos(*new_pos)
+                self._last_designated_pos = new_pos
 
         placing_color = gc_state.placing_color()
         algo.is_placing_team = (placing_color == self.our_color)

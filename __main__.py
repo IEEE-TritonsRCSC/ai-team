@@ -6,6 +6,7 @@ in various environments including simulation and physical robot scenarios.
 """
 
 import argparse
+import sys
 import threading
 from networking.networker import TeamInfo, GameState, Networker
 from networking.gc_receiver import GCReceiver, MockGCReceiver
@@ -37,7 +38,12 @@ def main():
     if args.mock_gc or args.env == "sim-only":
         gc_receiver = MockGCReceiver()
         gc_receiver.start()
-        print("[main] Using MockGCReceiver — robots will halt until GC state is pushed.")
+        print("[main] Using MockGCReceiver — robots will halt until a command is entered.")
+        print("[main] Type a command and press enter, e.g.:")
+        print("[main]   STOP")
+        print("[main]   BALL_PLACEMENT_BLUE 1.0 0.5")
+        print("[main]   NORMAL_START")
+        _start_stdin_console(gc_receiver)
     else:
         gc_receiver = GCReceiver()
         gc_receiver.start()
@@ -94,6 +100,34 @@ def _process_team(
 
 def _opposite(color: str) -> str:
     return "yellow" if color == "blue" else "blue"
+
+
+def _start_stdin_console(gc_receiver: MockGCReceiver) -> None:
+    """
+    Background thread that reads lines from stdin and pushes them into
+    gc_receiver as GC commands, e.g.:
+        STOP
+        BALL_PLACEMENT_BLUE 1.0 0.5
+        NORMAL_START
+    """
+    def _loop():
+        for line in sys.stdin:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            command = parts[0].upper()
+            designated_pos = None
+            if len(parts) >= 3:
+                try:
+                    designated_pos = (float(parts[1]), float(parts[2]))
+                except ValueError:
+                    print(f"[console] Could not parse position from: {line.strip()}")
+            gc_receiver.push_command(command, designated_pos=designated_pos)
+            print(f"[console] Pushed command: {command}"
+                  + (f" designated_pos={designated_pos}" if designated_pos else ""))
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
 
 
 if __name__ == "__main__":
