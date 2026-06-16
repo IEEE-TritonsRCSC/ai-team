@@ -258,6 +258,25 @@ class JALTeamEnv(gym.Env):
         self.prev_reward_facing_goal_cos_by_id: Dict[int, float] = {}
         self._stopped_ball_counter: int = 0
 
+        # Frozen-state detection: counts consecutive steps where BOTH the
+        # ball position AND our robots' poses are bit-identical to the prior
+        # step. A stalled/stale sim connection (or a stuck-ball edge case)
+        # repeats the same frame indefinitely; without this, reward terms
+        # computed from static pose (e.g. kick_aim_bonus) get re-granted
+        # every step with no actual progress, letting an episode rack up a
+        # huge total_reward purely from a frozen frame. Unlike
+        # _stopped_ball_counter (which only ends episodes when
+        # approach_ball/goto are both disabled), this runs unconditionally.
+        self._frozen_state_counter: int = 0
+
+        # Per-robot (rx, ry, theta, bx, by) snapshot at the last step a kick
+        # was actually rewarded. If a subsequent kick fires from the exact
+        # same snapshot, the underlying frame didn't change — skip awarding
+        # kick_aim_bonus/bad_aim_penalty again so a frozen frame can't farm
+        # the bonus once per step. See _frozen_state_counter above for the
+        # episode-level backstop.
+        self._last_rewarded_kick_state: Dict[int, Tuple[float, float, float, float, float]] = {}
+
         # Statistics
         self.total_rewards = 0.0
         self.episode_actions = []  # Track action distribution
@@ -408,6 +427,8 @@ class JALTeamEnv(gym.Env):
         self.prev_reward_ball_pos = None
         self.prev_reward_facing_goal_cos_by_id = {}
         self._stopped_ball_counter = 0
+        self._frozen_state_counter = 0
+        self._last_rewarded_kick_state = {}
 
         # Clear stage 2 dribble session state
         self.dribble_session_active = {rid: False for rid in self.robot_ids}
@@ -594,6 +615,7 @@ class JALTeamEnv(gym.Env):
                 self._opponent_goalie_pose(current_game_state) if use_goalie_gate else None
             )
             gk_y = float(goalie_pose[1]) if goalie_pose is not None else None
+            kick_ball_pos = getattr(current_game_state, "ball_pos", None)
             for info_i in per_robot:
                 if info_i.get("action_type") != "kick":
                     continue
@@ -608,6 +630,19 @@ class JALTeamEnv(gym.Env):
                 if pose is None:
                     continue
                 rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
+                robot_id_i = info_i.get("robot_id")
+                if kick_ball_pos is not None and len(kick_ball_pos) >= 2:
+                    kick_state_snapshot = (
+                        round(rx, 3), round(ry, 3), round(theta_deg, 1),
+                        round(float(kick_ball_pos[0]), 3), round(float(kick_ball_pos[1]), 3),
+                    )
+                    # Identical (pose, ball) snapshot as the last kick we
+                    # rewarded for this robot means the frame hasn't actually
+                    # advanced (frozen/stale state) — the kick didn't do
+                    # anything new, so don't pay the aim bonus again.
+                    if self._last_rewarded_kick_state.get(robot_id_i) == kick_state_snapshot:
+                        continue
+                    self._last_rewarded_kick_state[robot_id_i] = kick_state_snapshot
                 aim_quality, predicted_y_at_goal_line = self._kick_aim_quality_from_pose(pose)
                 # Facing away from / parallel to the goal line: kick can
                 # never cross x=FIELD_X[1]. Guaranteed miss — apply the
@@ -1709,6 +1744,19 @@ class JALTeamEnv(gym.Env):
     _BALL_STOPPED_SPEED: float = 0.05
     _BALL_STOPPED_STEPS: int = 10
 
+    # Frozen-state detection: if the ball position AND every one of our
+    # robots' poses are bit-identical (within float noise) to the previous
+    # step for this many consecutive steps, the sim connection is treating
+    # us to the same stale frame repeatedly (or the ball is genuinely wedged
+    # with the robot unable to affect it). Runs unconditionally, unlike
+    # _BALL_STOPPED_STEPS above which only ends the episode when
+    # approach_ball/goto are both disabled — this is the general backstop
+    # that catches the case those actions enabled but the frame still never
+    # advances, which let one inference episode bank a kick_aim_bonus on
+    # every step of a ~140-step frozen frame.
+    _FROZEN_STATE_EPS: float = 1e-6
+    _FROZEN_STATE_STEPS: int = 15
+
     # Touchline dead-zone margin: a ball within this many units of the
     # |y|=FIELD_Y[1] touchline is treated as out-of-bounds. In a real game a
     # ball this close to the line is a kick-in/throw-in (dead, not
@@ -1801,6 +1849,48 @@ class JALTeamEnv(gym.Env):
         # so the trainer logs distinguish causes.
         if playmode is not None and playmode not in ("play_on", "before_kick_off"):
             return True, f"ball_dead_{playmode}"
+
+        # Frozen-state backstop: ball AND all our robots' poses bit-identical
+        # to last step for too long means the frame isn't advancing (stale
+        # sim connection, or a genuinely wedged ball). See _FROZEN_STATE_STEPS.
+        if prev_game_state is not None:
+            prev_ball_pos_fs = getattr(prev_game_state, "ball_pos", None)
+            ball_frozen = (
+                prev_ball_pos_fs is not None
+                and abs(bx - float(prev_ball_pos_fs[0])) < self._FROZEN_STATE_EPS
+                and abs(by - float(prev_ball_pos_fs[1])) < self._FROZEN_STATE_EPS
+            )
+            robots_frozen = False
+            if ball_frozen:
+                team_robots_fs = getattr(game_state, "robot_poses", {}).get(self.team_name, [])
+                prev_team_robots_fs = getattr(prev_game_state, "robot_poses", {}).get(self.team_name, [])
+                prev_pose_by_unum_fs: Dict[int, Tuple[float, float]] = {}
+                for entry in prev_team_robots_fs:
+                    for unum, pose in entry.items():
+                        prev_pose_by_unum_fs[int(unum)] = (float(pose[0]), float(pose[1]))
+                robots_frozen = True
+                any_robot_checked = False
+                for robot in team_robots_fs:
+                    for unum, pose in robot.items():
+                        if int(unum) not in self.robot_ids:
+                            continue
+                        prev_pose_fs = prev_pose_by_unum_fs.get(int(unum))
+                        if prev_pose_fs is None:
+                            robots_frozen = False
+                            continue
+                        any_robot_checked = True
+                        if (
+                            abs(float(pose[0]) - prev_pose_fs[0]) >= self._FROZEN_STATE_EPS
+                            or abs(float(pose[1]) - prev_pose_fs[1]) >= self._FROZEN_STATE_EPS
+                        ):
+                            robots_frozen = False
+                robots_frozen = robots_frozen and any_robot_checked
+            if ball_frozen and robots_frozen:
+                self._frozen_state_counter += 1
+            else:
+                self._frozen_state_counter = 0
+            if self._frozen_state_counter >= self._FROZEN_STATE_STEPS:
+                return True, "frozen_state_stale_sim"
 
         # Ball stopped far from the robot: if the ball has come to rest (low
         # speed for several consecutive cycles) and the robot can't reach it
