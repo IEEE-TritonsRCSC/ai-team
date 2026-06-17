@@ -175,6 +175,10 @@ class Dispatcher:
         if hasattr(self._algo, 'penalty_against'):
             self._algo.penalty_against = self._penalty_is_against_us(command)
 
+        # Wire FreeKick ownership (are we taking the kick, or defending it?)
+        if hasattr(self._algo, 'free_kick_against'):
+            self._algo.free_kick_against = self._free_kick_is_against_us(command)
+
         self._current_command = command
         self._last_designated_pos = None
 
@@ -235,3 +239,17 @@ class Dispatcher:
         if command in ('PREPARE_PENALTY_YELLOW',):
             return self.our_color == 'blue'
         return False
+
+    def _free_kick_is_against_us(self, command: str) -> bool | None:
+        """
+        Return True if the free kick is awarded to the opponent (we defend),
+        False if it is ours (we attack), or None for FORCE_START.
+
+        FORCE_START is routed here but is not a free kick (normal play resumes
+        with the ball already live); FreeKick treats None as out-of-scope.
+        """
+        if command == 'DIRECT_FREE_BLUE':
+            return self.our_color == 'yellow'
+        if command == 'DIRECT_FREE_YELLOW':
+            return self.our_color == 'blue'
+        return None  # FORCE_START
