@@ -59,10 +59,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--env",
         choices=["sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"],
-        default="sim-only",
-        help="Environment mode forwarded to train.py (default: sim-only). "
+        default="sim-embedded",
+        help="Environment mode forwarded to train.py (default: sim-embedded). "
              "sim-embedded runs the synchronous embedded rcssserver_embedded backend "
-             "in-process and does not launch external rcssserver instances.",
+             "in-process and does not launch external rcssserver instances. "
+             "Pass --env sim-only (with --monitor) for a visual check in an external "
+             "rcssserver/monitor window.",
     )
 
     # Simulator / monitor commands

@@ -195,6 +195,15 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         random_spawn_theta_range_deg = _stage_or_top("random_spawn_theta_range_deg", [-45.0, 45.0])
         reward_config_overrides = _stage_or_top("reward_config_overrides", None)
         invalid_action_penalty = _stage_or_top("invalid_action_penalty", 0.2)
+        # Stage 2: scripted opponent keeper + opponent observability. The
+        # opponent team name comes from team_config (second team), which is
+        # the same source the Networker used to enable the keeper player.
+        scripted_opponent_goalie = _stage_or_top("scripted_opponent_goalie", False)
+        observe_opponents = _stage_or_top("observe_opponents", False)
+        ball_cleared_x_threshold = _stage_or_top("ball_cleared_x_threshold", None)
+        opponent_goalie_team = (
+            team_infos[1].name if len(team_infos) > 1 else None
+        )
 
         self.env = JALTeamEnv(
             networker=self.networker,
@@ -220,6 +229,13 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             random_spawn_theta=bool(random_spawn_theta),
             random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
             reward_config_overrides=dict(reward_config_overrides) if reward_config_overrides else None,
+            scripted_opponent_goalie=bool(scripted_opponent_goalie),
+            opponent_goalie_team=opponent_goalie_team,
+            observe_opponents=bool(observe_opponents),
+            ball_cleared_x_threshold=(
+                float(ball_cleared_x_threshold)
+                if ball_cleared_x_threshold is not None else None
+            ),
         )
 
         self.logger.info(

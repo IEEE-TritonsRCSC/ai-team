@@ -73,6 +73,10 @@ class JALTeamEnv(gym.Env):
         approach_defer_when_has_ball: bool = False,
         approach_defer_epsilon: float = 0.0,
         reward_config_overrides: Optional[Dict[str, float]] = None,
+        scripted_opponent_goalie: bool = False,
+        opponent_goalie_team: Optional[str] = None,
+        observe_opponents: bool = False,
+        ball_cleared_x_threshold: Optional[float] = None,
         some_arg=None
         ):
 
@@ -127,6 +131,26 @@ class JALTeamEnv(gym.Env):
         self.kick_tie_break_epsilon: float = max(0.0, float(kick_tie_break_epsilon))
         self.approach_defer_when_has_ball: bool = bool(approach_defer_when_has_ball)
         self.approach_defer_epsilon: float = max(0.0, float(approach_defer_epsilon))
+
+        # Stage 2: scripted opponent goalie (ai_interface/goalie.py) driven by
+        # the env each step so both trainer and inference field the same keeper.
+        # observe_opponents fills context slot 0+ with opponent poses (keeper
+        # first) and flips context_active_mask — the obs stays 105-D; only the
+        # previously-zero context block becomes live. ball_cleared_x_threshold
+        # terminates the episode when the keeper clears the ball back upfield
+        # (the duel is decided; don't burn the remaining max_steps).
+        self.scripted_opponent_goalie: bool = bool(scripted_opponent_goalie)
+        self.opponent_goalie_team: Optional[str] = opponent_goalie_team
+        self.observe_opponents: bool = bool(observe_opponents)
+        self.ball_cleared_x_threshold: Optional[float] = (
+            float(ball_cleared_x_threshold)
+            if ball_cleared_x_threshold is not None else None
+        )
+        self._scripted_goalie = None  # fresh Goalie instance per episode
+        # Prev opponent poses by context slot for velocity differencing
+        # (opponents are slot-ordered nearest-to-GOAL_R first, so slot 0 is
+        # always the keeper while it holds its goal).
+        self.prev_opponent_pose_by_slot: Dict[int, np.ndarray] = {}
 
         # Build a RewardConfig with optional overrides from caller. Field names
         # must match the RewardConfig dataclass attributes in reward.py.
@@ -404,6 +428,20 @@ class JALTeamEnv(gym.Env):
         self.dribble_exhausted = {rid: False for rid in self.robot_ids}
         self.awaiting_redribble_gap = {rid: False for rid in self.robot_ids}
 
+        # Stage 2: fresh scripted keeper per episode. A new instance clears its
+        # ball-velocity history and mode state machine, which would otherwise
+        # see the episode-reset teleport as a fast-moving ball (false BLOCK).
+        self.prev_opponent_pose_by_slot = {}
+        if self.scripted_opponent_goalie:
+            from ai_interface.goalie import Goalie  # local import: keep stage-1 paths free of Player deps
+            self._scripted_goalie = Goalie(
+                teamname=self.opponent_goalie_team or "TeamB",
+                unum=1,
+                side="right",
+            )
+        else:
+            self._scripted_goalie = None
+
         # Get initial game state from simulator
         game_state = self._get_game_state(
             retries=max(self.state_retry_count, 20),
@@ -504,6 +542,12 @@ class JALTeamEnv(gym.Env):
 
         # Send commands to simulator
         self._send_commands(commands)
+
+        # Stage 2: queue the scripted keeper's command BEFORE advancing the
+        # sim (the embedded backend applies all pending commands from both
+        # teams in one watch_game() step), so keeper and policy act in the
+        # same cycle.
+        self._drive_scripted_goalie(current_game_state)
 
         # Read next state after sending commands, then build next observation.
         next_game_state = self._get_game_state(
@@ -931,9 +975,53 @@ class JALTeamEnv(gym.Env):
                 obs[off + 7] = float(start_dribble_pos[1]) / self._NORM_POS_Y
                 # dims 8..per_agent_dim-1 reserved → stay 0
 
-            # --- context slots (c_max × d_ctx): ALL ZERO for now ---
-            # TODO(opponent-stage): fill from extract_opponent_positions / our
-            # goalie pose, set context_active_mask accordingly. See reward.py.
+            # --- context slots (c_max × d_ctx): opponent poses, keeper first ---
+            # Filled only when observe_opponents is enabled (stage 2+). Slots
+            # are ordered nearest-to-GOAL_R first so slot 0 is always the
+            # opponent keeper while it holds its goal (same identification rule
+            # as _opponent_goalie_pose). Live dims: [x, y, theta, vx, vy],
+            # analytically normalized like the agent slots; the 2 reserved dims
+            # stay 0. Absent slots stay zero and masked off, so 1v0 stages see
+            # the exact obs they always did.
+            self.context_active_mask[:] = 0.0
+            if self.observe_opponents:
+                opponent_poses = []
+                for other_team, entries in game_state.robot_poses.items():
+                    if other_team == self.team_name:
+                        continue
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        for _unum, p in entry.items():
+                            if p is not None and len(p) >= 3:
+                                opponent_poses.append(
+                                    (float(p[0]), float(p[1]), float(p[2]))
+                                )
+                opponent_poses.sort(
+                    key=lambda p: math.hypot(p[0] - GOAL_R[0], p[1] - GOAL_R[1])
+                )
+                ctx_base = self.global_dim + self.per_agent_dim * self.a_max
+                for slot, (ox, oy, otheta_deg) in enumerate(
+                    opponent_poses[: self.c_max]
+                ):
+                    otheta = float(np.deg2rad(otheta_deg))
+                    cur_xy = np.array([ox, oy], dtype=np.float32)
+                    prev_xy = self.prev_opponent_pose_by_slot.get(slot)
+                    if prev_xy is None:
+                        ovx = ovy = 0.0
+                    else:
+                        ovx = float(cur_xy[0] - prev_xy[0])
+                        ovy = float(cur_xy[1] - prev_xy[1])
+                    self.prev_opponent_pose_by_slot[slot] = cur_xy
+
+                    off = ctx_base + slot * self.d_ctx
+                    obs[off + 0] = ox / self._NORM_POS_X
+                    obs[off + 1] = oy / self._NORM_POS_Y
+                    obs[off + 2] = otheta / self._NORM_THETA
+                    obs[off + 3] = ovx / self._NORM_VEL
+                    obs[off + 4] = ovy / self._NORM_VEL
+                    # dims 5..d_ctx-1 reserved → stay 0
+                    self.context_active_mask[slot] = 1.0
 
             return obs
             
@@ -1443,6 +1531,41 @@ class JALTeamEnv(gym.Env):
         self.dribble_anchor[robot_id] = None
         self.awaiting_redribble_gap[robot_id] = True
 
+    def _drive_scripted_goalie(self, game_state) -> None:
+        """Compute and queue the scripted opponent keeper's command this cycle.
+
+        Called from step() between our team's command send and the sim
+        advance, so the keeper acts in the same cycle as the policy. Any
+        failure degrades to "keeper idles this cycle" rather than killing
+        the episode.
+        """
+
+        if not self.scripted_opponent_goalie or self._scripted_goalie is None:
+            return
+        if game_state is None or self.networker is None:
+            return
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is None or len(ball_pos) < 2:
+            return
+        gk_pose = self._opponent_goalie_pose(game_state)
+        if gk_pose is None:
+            return
+        try:
+            cmd = self._scripted_goalie.action(
+                ball_pos=(float(ball_pos[0]), float(ball_pos[1])),
+                goalie_pose=gk_pose,
+                game_state=game_state,
+            )
+        except Exception:
+            self.logger.exception(
+                "Scripted goalie action failed; keeper idles this cycle"
+            )
+            return
+        if not cmd:
+            return
+        team = self.opponent_goalie_team or self._scripted_goalie.teamname
+        self.networker.execute_ai_output([cmd], team)
+
     def _opponent_goalie_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) of the opponent goalie, or None.
 
@@ -1659,8 +1782,45 @@ class JALTeamEnv(gym.Env):
         # Ball entered the right penalty area but missed the goal mouth. Ending
         # the episode here is BOTH a bug workaround (avoids BallStuckRef) AND a
         # learning signal — see _RIGHT_PENALTY_AREA_X comment above.
+        # Stage 2 exemptions: a wide-y ball inside the wedge is NOT dead when
+        # it is (a) a LIVE ON-MOUTH SHOT — a mouth-bound kick from a wide-y
+        # spawn near x=34 crosses x>=35 at |y|>5 mid-flight, so terminating on
+        # position alone makes scoring from there impossible — or (b) in our
+        # robot's possession (dribbling into the box is exactly the behavior
+        # stage 2 teaches). A slow/loose wide ball still terminates as before.
         if bx >= self._RIGHT_PENALTY_AREA_X and abs(by) > self._GOAL_HALF_HEIGHT:
-            return True, "ball_in_penalty_off_target"
+            live_on_mouth_shot = False
+            prev_bp = (
+                getattr(prev_game_state, "ball_pos", None)
+                if prev_game_state is not None else None
+            )
+            if prev_bp is not None:
+                vx = bx - float(prev_bp[0])
+                vy = by - float(prev_bp[1])
+                if vx > 1e-6:
+                    projected_y = by + (FIELD_X[1] - bx) * (vy / vx)
+                    live_on_mouth_shot = (
+                        abs(projected_y) < self._GOAL_HALF_HEIGHT + 1.0
+                    )
+            in_our_possession = False
+            own_pose = self._own_robot_pose(game_state)
+            if own_pose is not None:
+                in_our_possession = (
+                    math.hypot(bx - own_pose[0], by - own_pose[1])
+                    <= self.kickable_dist
+                )
+            if not live_on_mouth_shot and not in_our_possession:
+                return True, "ball_in_penalty_off_target"
+
+        # Stage 2: keeper cleared the ball back upfield — the 1v1 duel is
+        # decided, so end the episode instead of burning the remaining
+        # max_steps on a dead play. Losing the +70 is the learning signal;
+        # no extra penalty.
+        if (
+            self.ball_cleared_x_threshold is not None
+            and bx < self.ball_cleared_x_threshold
+        ):
+            return True, "keeper_cleared"
 
         # Dead-ball playmodes: when rcssserver transitions out of play_on
         # (kick_in_*, corner_kick_*, goal_kick_*, foul_*, etc.) the ball is no

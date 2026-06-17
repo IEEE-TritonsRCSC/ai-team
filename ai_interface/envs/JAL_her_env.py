@@ -43,6 +43,7 @@ import numpy as np
 from gymnasium import spaces
 
 from ai_interface.envs.JAL_env import JALTeamEnv
+from ai_interface.envs.reward import aim_quality_from_prediction
 from networking.data_utils import GameState
 
 
@@ -105,6 +106,7 @@ class JALHEREnv(JALTeamEnv):
         # Tracks previous ball distance to _desired_goal (normalized) for the
         # progress shaping term in _calculate_reward. Reset each episode.
         self._prev_ball_to_desired_dist: Optional[float] = None
+        self._prev_her_ball_pos: Optional[Tuple[float, float]] = None
         self.aux_team_command_providers = dict(aux_team_command_providers or {})
 
     # ------------------------------------------------------------------
@@ -114,6 +116,7 @@ class JALHEREnv(JALTeamEnv):
     def reset(self, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
         self._prev_ball_to_desired_dist = None
+        self._prev_her_ball_pos = None
         return obs, info
 
     # ------------------------------------------------------------------
@@ -258,12 +261,32 @@ class JALHEREnv(JALTeamEnv):
 
         dist_to_desired = float(np.linalg.norm(ball_norm - self._desired_goal))
 
-        # Goal-conditioned progress shaping
+        # Goal-conditioned progress shaping. Positive progress from fast ball
+        # movement is aim-gated so off-target kicks cannot collect HER progress
+        # after the parent reward has correctly zeroed their goal progress.
         if self._prev_ball_to_desired_dist is not None:
             progress = self._prev_ball_to_desired_dist - dist_to_desired
-            reward += float(np.clip(progress, -_HER_GOAL_PROGRESS_CLIP, _HER_GOAL_PROGRESS_CLIP)) * _HER_GOAL_PROGRESS_WEIGHT
+            progress = float(np.clip(progress, -_HER_GOAL_PROGRESS_CLIP, _HER_GOAL_PROGRESS_CLIP))
+            if progress > 0.0 and self._prev_her_ball_pos is not None:
+                prev_x, prev_y = self._prev_her_ball_pos
+                vx = ball_x - prev_x
+                vy = ball_y - prev_y
+                ball_speed = float(np.hypot(vx, vy))
+                if ball_speed > float(self.reward_config.ball_speed_threshold):
+                    predicted_y = None
+                    desired_x = float(self._desired_goal[0]) * self.field_half_width
+                    if vx > 1e-6:
+                        predicted_y = float(ball_y + (desired_x - ball_x) * (vy / vx))
+                    desired_y = float(self._desired_goal[1]) * self.field_half_height
+                    progress *= aim_quality_from_prediction(
+                        predicted_y,
+                        float(self.reward_config.goal_half_height),
+                        target_y=desired_y,
+                    )
+            reward += progress * _HER_GOAL_PROGRESS_WEIGHT
 
         self._prev_ball_to_desired_dist = dist_to_desired
+        self._prev_her_ball_pos = (ball_x, ball_y)
 
         # Sparse bonus for reaching the desired goal region
         if dist_to_desired <= self.her_distance_threshold:

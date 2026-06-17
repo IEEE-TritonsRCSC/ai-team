@@ -52,7 +52,7 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
     """Create default configuration based on trainer type and command line arguments."""
     base_config = {
         "team_config": args.team_config,
-        "env_mode": args.env,
+        "env_mode": args.env or "sim-only",
         "team_name": args.team,
         "num_envs": value_or_default(args.num_envs, 1),
         "sim_host": value_or_default(args.sim_host, "127.0.0.1"),
@@ -489,7 +489,9 @@ Examples:
                         help="Path to team configuration JSON file")
     parser.add_argument("--env", choices=[
         "sim-only", "sim-embedded", "sim-mixed", "field-practice", "field-tournament"
-    ], default="sim-only", help="Environment mode for Networker")
+    ], default=None, help="Environment mode for Networker. When omitted, an "
+       "auto-loaded config's env_mode is used (falling back to sim-only); when "
+       "given, it overrides the config's env_mode.")
     parser.add_argument("--team", type=str, default=None,
                         help="Team name to control")
     parser.add_argument("--num_envs", type=int, default=None,
@@ -599,6 +601,7 @@ Examples:
         # runtime values override config values when explicitly provided;
         # otherwise defaults fill in for older config files.
         runtime_overrides = {
+            "env_mode": args.env,
             "num_envs": args.num_envs,
             "sim_host": args.sim_host,
             "sim_player_port": args.sim_player_port,
@@ -606,6 +609,7 @@ Examples:
             "device": args.device,
         }
         runtime_defaults = {
+            "env_mode": "sim-only",
             "num_envs": 1,
             "sim_host": "127.0.0.1",
             "sim_player_port": 6000,

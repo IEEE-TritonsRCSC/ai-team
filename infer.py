@@ -623,6 +623,13 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     robot_ids = stage_config.get("robot_ids", list(range(1, num_robots + 1)))
     reward_overrides = stage_config.get("reward_config_overrides")
 
+    # Stage 2: scripted opponent keeper (driven by the env) + opponent
+    # observability. The opponent team name is the second team in team_config,
+    # same source the Networker used to enable the keeper player.
+    team_infos = load_team_config(args.team_config)
+    opponent_goalie_team = team_infos[1].name if len(team_infos) > 1 else None
+    ball_cleared_x_threshold = stage_config.get("ball_cleared_x_threshold", None)
+
     # Mirror PPOJALCurriculumTrainer.setup_environment exactly so the obs the
     # policy sees at inference matches training (same spawn / reward / mask).
     env = JALTeamEnv(
@@ -649,6 +656,13 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         random_spawn_theta=bool(stage_config.get("random_spawn_theta", False)),
         random_spawn_theta_range_deg=tuple(stage_config.get("random_spawn_theta_range_deg", [-45.0, 45.0])),
         reward_config_overrides=dict(reward_overrides) if reward_overrides else None,
+        scripted_opponent_goalie=bool(stage_config.get("scripted_opponent_goalie", False)),
+        opponent_goalie_team=opponent_goalie_team,
+        observe_opponents=bool(stage_config.get("observe_opponents", False)),
+        ball_cleared_x_threshold=(
+            float(ball_cleared_x_threshold)
+            if ball_cleared_x_threshold is not None else None
+        ),
     )
 
     disabled_actions = list(stage_config.get("disabled_actions", []))

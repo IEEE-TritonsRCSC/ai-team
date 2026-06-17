@@ -139,6 +139,14 @@ class TD3JALHERTrainer(BaseTrainer):
         random_ball_y_range = _stage_or_top("random_ball_y_range", [-3.0, 3.0])
         random_spawn_theta = _stage_or_top("random_spawn_theta", False)
         random_spawn_theta_range_deg = _stage_or_top("random_spawn_theta_range_deg", [-45.0, 45.0])
+        spawn_theta_relative_to_goal = _stage_or_top("spawn_theta_relative_to_goal", False)
+        spawn_theta_min_abs_deg = _stage_or_top("spawn_theta_min_abs_deg", 0.0)
+        kick_requires_aim = _stage_or_top("kick_requires_aim", False)
+        kick_min_aim_quality = _stage_or_top("kick_min_aim_quality", 0.0)
+        kick_tie_break_when_aimed = _stage_or_top("kick_tie_break_when_aimed", False)
+        kick_tie_break_epsilon = _stage_or_top("kick_tie_break_epsilon", 0.0)
+        approach_defer_when_has_ball = _stage_or_top("approach_defer_when_has_ball", False)
+        approach_defer_epsilon = _stage_or_top("approach_defer_epsilon", 0.0)
         reward_config_overrides = _stage_or_top("reward_config_overrides", None)
         invalid_action_penalty = _stage_or_top("invalid_action_penalty", 0.2)
 
@@ -169,6 +177,14 @@ class TD3JALHERTrainer(BaseTrainer):
             random_ball_y_range=tuple(random_ball_y_range),
             random_spawn_theta=bool(random_spawn_theta),
             random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
+            spawn_theta_relative_to_goal=bool(spawn_theta_relative_to_goal),
+            spawn_theta_min_abs_deg=float(spawn_theta_min_abs_deg),
+            kick_requires_aim=bool(kick_requires_aim),
+            kick_min_aim_quality=float(kick_min_aim_quality),
+            kick_tie_break_when_aimed=bool(kick_tie_break_when_aimed),
+            kick_tie_break_epsilon=float(kick_tie_break_epsilon),
+            approach_defer_when_has_ball=bool(approach_defer_when_has_ball),
+            approach_defer_epsilon=float(approach_defer_epsilon),
             reward_config_overrides=dict(reward_config_overrides) if reward_config_overrides else None,
         )
 
@@ -201,6 +217,17 @@ class TD3JALHERTrainer(BaseTrainer):
         target_policy_noise = float(model_params.get("target_policy_noise", 0.2))
         target_noise_clip = float(model_params.get("target_noise_clip", 0.5))
         action_noise_std  = float(model_params.get("action_noise_std", 0.05))
+        # Optional per-dim split of the exploration sigma. The 9-dim per-robot
+        # action vector is [6 slot-logits, goto_x, goto_y, turn_theta]. The slot
+        # logits need HIGH sigma to keep sampling newly-enabled primitives past
+        # learning_starts (else the warm argmax dominates → action collapse),
+        # but the continuous params — especially turn_theta (dim 8, scaled ×π) —
+        # need LOW sigma so the robot can settle into clean alignment and the
+        # critic actually observes a well-aimed kick. A single global sigma
+        # cannot satisfy both (TRAINING.md §15/§16). When set, these override
+        # the uniform action_noise_std for the respective dim groups.
+        action_noise_logit_std = model_params.get("action_noise_logit_std", None)
+        action_noise_param_std = model_params.get("action_noise_param_std", None)
 
         # HER-specific params
         n_sampled_goal           = int(model_params.get("her_n_sampled_goal", 4))
@@ -213,10 +240,45 @@ class TD3JALHERTrainer(BaseTrainer):
             n_sampled_goal, goal_selection_strategy,
         )
 
+        # Build the exploration noise from the CURRENT config first, so it can be
+        # applied whether we start fresh OR warm-start from a checkpoint. (The
+        # warm-start branch below used to `return` before this ran, silently
+        # ignoring the config noise and reusing whatever was pickled into the
+        # loaded checkpoint — see TRAINING.md §17.)
+        n_actions = int(env.action_space.shape[0])
+        if action_noise_logit_std is not None or action_noise_param_std is not None:
+            # Build a per-dim sigma vector, tiled across robots. Per robot the
+            # 9 dims are [0-5]=slot logits, [6]=goto_x, [7]=goto_y, [8]=turn_theta.
+            per_robot_dim = int(getattr(env, "action_dim_per_robot", 9))
+            logit_sigma = float(action_noise_logit_std if action_noise_logit_std is not None else action_noise_std)
+            param_sigma = float(action_noise_param_std if action_noise_param_std is not None else action_noise_std)
+            per_robot_sigma = np.array(
+                [logit_sigma] * 6 + [param_sigma] * (per_robot_dim - 6),
+                dtype=np.float64,
+            )
+            n_robots_in_action = n_actions // per_robot_dim
+            sigma = np.tile(per_robot_sigma, n_robots_in_action)
+            self.logger.info(
+                "Per-dim action noise: logit_sigma=%.3f (dims 0-5), param_sigma=%.3f (dims 6-8), tiled ×%d robots",
+                logit_sigma, param_sigma, n_robots_in_action,
+            )
+        else:
+            sigma = action_noise_std * np.ones(n_actions)
+        action_noise = NormalActionNoise(
+            mean=np.zeros(n_actions),
+            sigma=sigma,
+        )
+
         if self.config.get("load_model") and reuse_model is None:
             load_path = self.config["load_model"]
             self.logger.info("Loading model from %s", load_path)
             self.model = TD3.load(load_path, env=env, device=str(self.device))
+            # Re-attach the action noise built from the CURRENT config — the
+            # checkpoint ships with its own pickled action_noise, which is NOT
+            # what this stage's config asked for. Without this, every warm-start
+            # run silently used the previous stage's exploration noise.
+            self.model.action_noise = action_noise
+            self.logger.info("Applied config action noise to warm-started model")
             # Reset step counters so learning_starts applies from scratch.
             # The replay buffer is not saved in checkpoints, so without this
             # SB3 immediately tries to sample an empty HER buffer and crashes.
@@ -224,12 +286,6 @@ class TD3JALHERTrainer(BaseTrainer):
             self.model._episode_num = 0
             self.logger.info("TD3+HER model loaded (step counters reset for fresh buffer collection)")
             return
-
-        n_actions = int(env.action_space.shape[0])
-        action_noise = NormalActionNoise(
-            mean=np.zeros(n_actions),
-            sigma=action_noise_std * np.ones(n_actions),
-        )
 
         # net_arch applies to the policy and Q-network heads.
         # With MultiInputPolicy + Dict obs SB3 uses CombinedExtractor by default,
