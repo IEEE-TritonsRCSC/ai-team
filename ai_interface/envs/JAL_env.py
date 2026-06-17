@@ -1756,6 +1756,11 @@ class JALTeamEnv(gym.Env):
     # every step of a ~140-step frozen frame.
     _FROZEN_STATE_EPS: float = 1e-6
     _FROZEN_STATE_STEPS: int = 15
+    # Heading epsilon (degrees) for the same backstop. Without this, a robot
+    # that's purely turning in place (no translation) has bit-identical x/y
+    # for as long as it keeps turning and gets wrongly killed as "frozen"
+    # even though it's actively rotating and the sim is healthy.
+    _FROZEN_STATE_THETA_EPS_DEG: float = 1e-4
 
     # Touchline dead-zone margin: a ball within this many units of the
     # |y|=FIELD_Y[1] touchline is treated as out-of-bounds. In a real game a
@@ -1864,10 +1869,12 @@ class JALTeamEnv(gym.Env):
             if ball_frozen:
                 team_robots_fs = getattr(game_state, "robot_poses", {}).get(self.team_name, [])
                 prev_team_robots_fs = getattr(prev_game_state, "robot_poses", {}).get(self.team_name, [])
-                prev_pose_by_unum_fs: Dict[int, Tuple[float, float]] = {}
+                prev_pose_by_unum_fs: Dict[int, Tuple[float, float, float]] = {}
                 for entry in prev_team_robots_fs:
                     for unum, pose in entry.items():
-                        prev_pose_by_unum_fs[int(unum)] = (float(pose[0]), float(pose[1]))
+                        prev_pose_by_unum_fs[int(unum)] = (
+                            float(pose[0]), float(pose[1]), float(pose[2]),
+                        )
                 robots_frozen = True
                 any_robot_checked = False
                 for robot in team_robots_fs:
@@ -1879,9 +1886,13 @@ class JALTeamEnv(gym.Env):
                             robots_frozen = False
                             continue
                         any_robot_checked = True
+                        # Wrap to [-180, 180] so e.g. 179° -> -179° isn't seen as a huge jump.
+                        theta_delta = (float(pose[2]) - prev_pose_fs[2] + 180.0) % 360.0 - 180.0
+                        theta_delta = abs(theta_delta)
                         if (
                             abs(float(pose[0]) - prev_pose_fs[0]) >= self._FROZEN_STATE_EPS
                             or abs(float(pose[1]) - prev_pose_fs[1]) >= self._FROZEN_STATE_EPS
+                            or theta_delta >= self._FROZEN_STATE_THETA_EPS_DEG
                         ):
                             robots_frozen = False
                 robots_frozen = robots_frozen and any_robot_checked
