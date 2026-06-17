@@ -146,12 +146,16 @@ class AccessoryAlgo:
 
         self._update_ball_in_play(ball, now)
 
-        if self.free_kick_against is None:
-            # FORCE_START: not a free kick — out of scope for this module.
-            # TODO: route FORCE_START to a dedicated normal-play module.
-            return ["dash 0 0" for _ in robot_poses]
-
         opponents = self._opponent_poses(game_state, teamname)
+
+        if self.free_kick_against is None:
+            # FORCE_START: ball is live immediately, no ownership, no distance
+            # restrictions (§5.3.4 / §5.4 SSL rules). Both teams contest freely.
+            self.ball_in_play = True
+            if self._we_are_closer(robot_poses, opponents, ball):
+                return self._attack(robot_poses, opponents, ball, game_state)
+            return self._defend(robot_poses, opponents, ball, game_state)
+
         if self.free_kick_against:
             return self._defend(robot_poses, opponents, ball, game_state)
         return self._attack(robot_poses, opponents, ball, game_state)
@@ -188,6 +192,18 @@ class AccessoryAlgo:
                 continue
             opponents.extend(robot_id_and_pose(robot) for robot in robots)
         return opponents
+
+    def _we_are_closer(self, robot_poses, opponents, ball) -> bool:
+        """True if our nearest field robot is closer to the ball than any opponent."""
+        goalie_id = self._goalie_id(robot_poses)
+        field = [pose for unum, pose in robot_poses if unum != goalie_id]
+        if not field:
+            return False
+        our_min = min(distance(p[:2], ball[:2]) for p in field)
+        if not opponents:
+            return True
+        opp_min = min(distance(pose[:2], ball[:2]) for _, pose in opponents)
+        return our_min <= opp_min
 
     def _infer_attack_direction(
         self, robot_poses: list[tuple[int, tuple[float, float, float]]]
