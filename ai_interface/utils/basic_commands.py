@@ -3,6 +3,7 @@ import os
 
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
+from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 import math
 import numpy as np
@@ -207,7 +208,6 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
         return f"kick {kick_power} {0}"
         
 
-
 def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
                   goal: np.ndarray | Tuple | List, kick_power: float = 80.0, dribbling=False) -> str:
     """
@@ -251,3 +251,157 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
         return f"turn {angle_diff}"
 
     return f"catch 0"
+
+
+# ---------------------------------------------------------------------------
+# dribble_to: rule-compliant ball transport to a target coordinate.
+#
+# RoboCup SSL "Excessive Dribbling": a robot may not dribble the ball further
+# than 1 m from where dribbling started (the ball location at first contact).
+# It may, however, cover large distances by periodically losing possession.
+#
+# This skill mirrors that rule with a small phase machine. Each call returns a
+# single command for the current timestep; per-robot state is held in a caller-
+# owned DribbleState so the helper stays as stateless as its siblings here.
+#
+# One transport cycle:
+#   APPROACH  -> close on the ball until it is kickable.
+#   GRAB      -> dribble() turns to face the ball, then "catch 0" glues it and
+#                opens a new <=1 m segment anchored at the ball's catch location.
+#   CARRY     -> face the target and dash; the caught ball follows. Release with
+#                "drop" once the segment nears the 1 m limit.
+#   RELEASE   -> dash directly away from the ball until there is observable
+#                separation (> kickable + redribble gap), genuinely losing
+#                possession, then return to APPROACH for the next segment.
+# Repeats until the ball is within `arrival_margin` of the target.
+# ---------------------------------------------------------------------------
+
+DRIBBLE_PHASE_APPROACH = "approach"
+DRIBBLE_PHASE_GRAB = "grab"
+DRIBBLE_PHASE_CARRY = "carry"
+DRIBBLE_PHASE_RELEASE = "release"
+DRIBBLE_PHASE_DONE = "done"
+
+
+@dataclass
+class DribbleState:
+    """Per-robot state for `dribble_to`, persisted by the caller across steps.
+
+    phase is one of the DRIBBLE_PHASE_* constants. segment_start is the ball
+    position [x, y] captured at the moment of the catch that opened the current
+    possession segment; the 1 m limit is measured from it.
+    """
+
+    phase: str = DRIBBLE_PHASE_APPROACH
+    segment_start: Tuple[float, float] | None = None
+
+    def reset(self) -> None:
+        self.phase = DRIBBLE_PHASE_APPROACH
+        self.segment_start = None
+
+
+def dribble_to(self_pose: np.ndarray | Tuple | List,
+               ball_pose: np.ndarray | Tuple | List,
+               target: np.ndarray | Tuple | List,
+               game_state,
+               state: DribbleState,
+               arrival_margin: float = 0.3,
+               segment_limit: float = 0.85,
+               separation_margin: float = 0.2,
+               speed: float = 80.0,
+               angle_tolerance: float = math.radians(5.0),
+               kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE) -> str:
+    """
+    Transport the ball to `target` within the SSL excessive-dribbling rule.
+
+    self_pose is [x, y, theta] in radians; ball_pose and target are [x, y].
+    `state` is mutated in place to advance the phase machine. Returns a single
+    command string ("dash …", "turn …", "catch 0", "drop", or "done").
+
+    `segment_limit` (default 0.85 m) is the per-possession carry distance at
+    which the ball is released, kept under the 1 m rule with margin for the
+    per-step travel of the released ball. `separation_margin` mirrors the env's
+    re-dribble gap: after releasing, the robot must reach a robot-ball distance
+    of `kickable_tolerance + separation_margin` before re-grabbing.
+    """
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
+    target = _as_float_array(target)
+    robot_xy = self_pose[:2]
+    heading = float(self_pose[2])
+
+    separation_gap = kickable_tolerance + separation_margin
+    robot_ball_dist = float(np.linalg.norm(ball_pose - robot_xy))
+    angle_to_target = float(np.arctan2(target[1] - robot_xy[1], target[0] - robot_xy[0]))
+
+    # Global arrival check: stop once the ball itself is on target.
+    if float(np.linalg.norm(ball_pose - target)) <= arrival_margin:
+        state.phase = DRIBBLE_PHASE_DONE
+        return "drop" if robot_ball_dist <= kickable_tolerance else "done"
+
+    # APPROACH: close on the ball, facing the target so the grab is aimed.
+    if state.phase == DRIBBLE_PHASE_APPROACH:
+        if robot_ball_dist > kickable_tolerance:
+            return goto(
+                self_pose, float(ball_pose[0]), float(ball_pose[1]), game_state,
+                margin=kickable_tolerance, theta=angle_to_target, speed=speed,
+                obstacle_avoidance=False,
+            )
+        state.phase = DRIBBLE_PHASE_GRAB  # within reach; fall through to grab
+
+    # GRAB: turn to face the ball, then catch it to open a new segment.
+    if state.phase == DRIBBLE_PHASE_GRAB:
+        cmd = dribble(self_pose, ball_pose,
+                      kickable_tolerance=kickable_tolerance,
+                      angle_tolerance=angle_tolerance)
+        if cmd == "failed":  # ball drifted out of reach; chase it again
+            state.phase = DRIBBLE_PHASE_APPROACH
+            return goto(
+                self_pose, float(ball_pose[0]), float(ball_pose[1]), game_state,
+                margin=kickable_tolerance, theta=angle_to_target, speed=speed,
+                obstacle_avoidance=False,
+            )
+        if cmd == "catch 0":
+            state.segment_start = (float(ball_pose[0]), float(ball_pose[1]))
+            state.phase = DRIBBLE_PHASE_CARRY
+        return cmd  # "turn …" (still aligning) or "catch 0" (grabbed this step)
+
+    # CARRY: ball is glued; face the target and dash, watching the 1 m limit.
+    if state.phase == DRIBBLE_PHASE_CARRY:
+        if state.segment_start is None:
+            state.segment_start = (float(ball_pose[0]), float(ball_pose[1]))
+        if robot_ball_dist > kickable_tolerance:  # ball escaped the dribbler
+            state.phase = DRIBBLE_PHASE_APPROACH
+            return goto(
+                self_pose, float(ball_pose[0]), float(ball_pose[1]), game_state,
+                margin=kickable_tolerance, theta=angle_to_target, speed=speed,
+                obstacle_avoidance=False,
+            )
+        carried = float(np.linalg.norm(ball_pose - _as_float_array(state.segment_start)))
+        if carried >= segment_limit:  # approaching the foul line: release
+            state.phase = DRIBBLE_PHASE_RELEASE
+            return "drop"
+        angle_diff = normalize_angle(angle_to_target - heading)
+        if abs(angle_diff) > angle_tolerance:
+            return f"turn {angle_diff}"  # keep the ball pointed at the target
+        return f"dash {speed} {0.0}"
+
+    # RELEASE: create observable separation before the next segment is legal.
+    if state.phase == DRIBBLE_PHASE_RELEASE:
+        if robot_ball_dist <= separation_gap:
+            away_angle = float(np.arctan2(robot_xy[1] - ball_pose[1],
+                                          robot_xy[0] - ball_pose[0]))
+            rel = normalize_angle(away_angle - heading)
+            return f"dash {speed} {rel}"  # reverse straight away from the ball
+        state.phase = DRIBBLE_PHASE_APPROACH
+        state.segment_start = None
+        return goto(
+            self_pose, float(ball_pose[0]), float(ball_pose[1]), game_state,
+            margin=kickable_tolerance, theta=angle_to_target, speed=speed,
+            obstacle_avoidance=False,
+        )
+
+    # DONE or unknown phase: idle.
+    return "done"
+
+    
