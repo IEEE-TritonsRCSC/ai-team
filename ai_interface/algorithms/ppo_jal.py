@@ -35,9 +35,8 @@ Primitives (Categorical, live order):
     1: approach_ball  — reads nothing (uses ball position)
     2: turn           — reads Dtheta
     3: kick           — reads nothing
-    4: start_dribble  — reads nothing
-    5: stop_dribble   — reads nothing
-    (6, 7 reserved — always disabled until a future primitive is introduced)
+    4: dribble_to     — reads (Dx, Dy) as target coordinate
+    (5, 6, 7 reserved — always disabled until a future primitive is introduced)
 
 Continuous params (Gaussian, live order): Dx, Dy, Dtheta. (3, 4 reserved.)
 """
@@ -67,10 +66,9 @@ PRIMITIVE_NAMES: Tuple[str, ...] = (
     "approach_ball",
     "turn",
     "kick",
-    "start_dribble",
-    "stop_dribble",
+    "dribble_to",
 )
-NUM_PRIMITIVES = len(PRIMITIVE_NAMES)   # 6 live (== len(PRIMITIVE_NAMES))
+NUM_PRIMITIVES = len(PRIMITIVE_NAMES)   # 5 live (== len(PRIMITIVE_NAMES))
 NUM_PRIMITIVES_MAX = 8                  # primitive head width (6 live + 2 reserved)
 PARAM_DIM = 3                           # Dx, Dy, Dtheta (live)
 PARAM_DIM_MAX = 5                       # param head width (3 live + 2 reserved)

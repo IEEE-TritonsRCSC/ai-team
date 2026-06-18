@@ -17,7 +17,10 @@ from gymnasium import spaces
 import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
-from ai_interface.utils.basic_commands import goto, approach_ball
+from ai_interface.utils.basic_commands import (
+    goto, approach_ball, dribble_to, DribbleState,
+    DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_GRAB, DRIBBLE_PHASE_RELEASE,
+)
 from ai_interface.constants.field_constants import *
 from ai_interface.constants.player_constants import *
 from ai_interface.envs.reward import (
@@ -33,7 +36,7 @@ from networking.data_utils import GameState
 
 
 class JALTeamEnv(gym.Env):
-    ACTION_TYPES = ["goto", "turn", "kick", "start_dribble", "stop_dribble"]
+    ACTION_TYPES = ["goto", "turn", "kick", "dribble_to"]
 
     def __init__(
         self, 
@@ -190,30 +193,17 @@ class JALTeamEnv(gym.Env):
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
         self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
 
-        # Stage 2 dribble session state (command-level, distinct from the
-        # proximity-based is_dribbling/start_dribble_pos used by the obs).
-        # A session opens on a VALID start_dribble (catch) and is anchored at
-        # the robot's position; it ends on stop_dribble (drop), a fired kick,
-        # or exhaustion (anchor distance >= reward_config.dribble_max_radius,
-        # which forces a drop). After any session ends the robot must create
-        # visible separation from the ball (robot-ball dist > kickable_dist +
-        # dribble_redribble_gap_margin) before start_dribble is valid again.
+        # Per-robot DribbleState for the dribble_to phase machine (basic_commands).
+        self.dribble_states: Dict[int, DribbleState] = {rid: DribbleState() for rid in self.robot_ids}
+        # Dribble session tracking derived from DribbleState phases, used by
+        # reward code and info reporting.
         self.dribble_session_active: Dict[int, bool] = {rid: False for rid in self.robot_ids}
         self.dribble_anchor: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
-        self.dribble_exhausted: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        self.awaiting_redribble_gap: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        # Steps since the last stop_dribble fired per robot. None = no stop_dribble
-        # has occurred yet this episode; 0 = fired this step; > combo_window = expired.
+        # Steps since the last dribble release per robot (phase CARRY→RELEASE).
         self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
         
-        # Action design per robot (9D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
-        # Matches the layout used to train `stage1_6_final_58pct.zip` so that
-        # checkpoint can be warm-started directly. In the 58% run only turn
-        # (slot 2) and kick (slot 3) were enabled, so those slots carry
-        # trained weights; goto / approach_ball / start_dribble / stop_dribble
-        # were masked and have effectively untrained weights. For stage1_9 we
-        # enable approach_ball alongside the already-trained turn/kick.
-        self.action_dim_per_robot = 9
+        # Action design per robot (8D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, dribble_to_logit, goto_x, goto_y, turn_theta]
+        self.action_dim_per_robot = 8
         self.action_space = spaces.Box(
             low=-1.0, 
             high=1.0, 
@@ -302,7 +292,7 @@ class JALTeamEnv(gym.Env):
         if has_ball_now:
             allowed_indices = np.array([0, 1, 2, 3, 4], dtype=np.int64)
         else:
-            allowed_indices = np.array([0, 1], dtype=np.int64)
+            allowed_indices = np.array([0, 1, 4], dtype=np.int64)
 
         allowed_logits = logits[allowed_indices]
         allowed_logits_shifted = allowed_logits - np.max(allowed_logits)
@@ -430,11 +420,11 @@ class JALTeamEnv(gym.Env):
         self._frozen_state_counter = 0
         self._last_rewarded_kick_state = {}
 
-        # Clear stage 2 dribble session state
+        # Clear dribble_to phase machine and session tracking state
+        for rid in self.robot_ids:
+            self.dribble_states[rid].reset()
         self.dribble_session_active = {rid: False for rid in self.robot_ids}
         self.dribble_anchor = {rid: None for rid in self.robot_ids}
-        self.dribble_exhausted = {rid: False for rid in self.robot_ids}
-        self.awaiting_redribble_gap = {rid: False for rid in self.robot_ids}
         self.steps_since_stop_dribble = {rid: None for rid in self.robot_ids}
 
         # Get initial game state from simulator
@@ -695,9 +685,9 @@ class JALTeamEnv(gym.Env):
                     f"{gap_quality:.2f}" if gap_quality is not None else "N/A",
                 )
 
-        # Stage 2: one-shot bonus for deliberately releasing the ball late in
-        # a dribble session (instead of spamming start_dribble at the limit),
-        # setting up the stop -> re-approach -> turn -> kick chain.
+        # One-shot bonus for deliberately releasing the ball late in a dribble
+        # session (at segment limit), setting up the release -> re-approach ->
+        # turn -> kick chain.
         stop_release_bonus = float(
             getattr(self.reward_config, "stop_dribble_release_bonus", 0.0)
         )
@@ -732,8 +722,8 @@ class JALTeamEnv(gym.Env):
                                 reward -= kick_near_goalie_penalty
                                 self.total_rewards -= kick_near_goalie_penalty
 
-        # Stage 2: dribble→kick combo bonus. Rewards the stop_dribble → kick
-        # chain as a unit. Update the per-robot stop_dribble age counter first,
+        # Dribble→kick combo bonus. Rewards the dribble release → kick chain
+        # as a unit. Update the per-robot release age counter first,
         # then check whether any kick this step qualifies for the bonus.
         combo_bonus = float(getattr(self.reward_config, "post_dribble_kick_bonus", 0.0))
         combo_window = int(getattr(self.reward_config, "post_dribble_kick_combo_window", 5))
@@ -1082,12 +1072,11 @@ class JALTeamEnv(gym.Env):
 
         Two accepted action formats:
 
-        1. Legacy TD3 flat Box vector, shape (9 * num_robots,):
-            [0..5] logits over {goto, approach_ball, turn, kick,
-                                start_dribble, stop_dribble}
-            [6] goto_x_raw ∈ [-1, 1]
-            [7] goto_y_raw ∈ [-1, 1]
-            [8] turn_theta_raw ∈ [-1, 1]
+        1. Legacy TD3 flat Box vector, shape (8 * num_robots,):
+            [0..4] logits over {goto, approach_ball, turn, kick, dribble_to}
+            [5] goto_x_raw ∈ [-1, 1]
+            [6] goto_y_raw ∈ [-1, 1]
+            [7] turn_theta_raw ∈ [-1, 1]
 
         2. New PPO hybrid dict:
             {
@@ -1105,7 +1094,7 @@ class JALTeamEnv(gym.Env):
             commands: List of simulator command strings in robot_ids order
             action_info: Dictionary with action details (for logging/debugging)
         """
-        action_types = ["goto", "approach_ball", "turn", "kick", "start_dribble", "stop_dribble"]
+        action_types = ["goto", "approach_ball", "turn", "kick", "dribble_to"]
 
         # Detect format and extract per-robot (action_type, goto_x, goto_y, turn_theta).
         per_robot_decoded: List[Dict[str, Any]] = []
@@ -1172,7 +1161,6 @@ class JALTeamEnv(gym.Env):
                     float(action_arr[base + 2]),
                     float(action_arr[base + 3]),
                     float(action_arr[base + 4]),
-                    float(action_arr[base + 5]),
                 ], dtype=np.float32)
                 if self.disabled_actions:
                     for j, name in enumerate(action_types):
@@ -1186,9 +1174,9 @@ class JALTeamEnv(gym.Env):
                 per_robot_decoded.append({
                     "action_idx": action_idx,
                     "action_type": action_type,
-                    "goto_x_raw": float(action_arr[base + 6]),
-                    "goto_y_raw": float(action_arr[base + 7]),
-                    "turn_theta_raw": float(action_arr[base + 8]),
+                    "goto_x_raw": float(action_arr[base + 5]),
+                    "goto_y_raw": float(action_arr[base + 6]),
+                    "turn_theta_raw": float(action_arr[base + 7]),
                     "logits": logits.tolist(),
                     "probs": probs.tolist(),
                 })
@@ -1238,58 +1226,18 @@ class JALTeamEnv(gym.Env):
             kick_aim_quality: Optional[float] = None
             kick_predicted_y_at_goal_line: Optional[float] = None
 
-            # ---- Stage 2 dribble session bookkeeping (see __init__) ----
-            dribble_max_radius = float(
-                getattr(self.reward_config, "dribble_max_radius", 1.0)
-            )
-            redribble_gap_dist = self.kickable_dist + float(
-                getattr(self.reward_config, "dribble_redribble_gap_margin", 0.2)
-            )
-            robot_ball_dist = None
-            if pose is not None and ball_pos is not None and len(ball_pos) >= 2:
-                robot_ball_dist = float(np.hypot(
-                    float(pose[0]) - float(ball_pos[0]),
-                    float(pose[1]) - float(ball_pos[1]),
-                ))
-            session_active = self.dribble_session_active.get(robot_id, False)
-            if session_active and not has_ball_now:
-                # Ball escaped the dribbler (stolen / rolled away): session over.
-                self._end_dribble_session(robot_id)
-                session_active = False
+            # ---- dribble_to session tracking (derived from DribbleState) ----
+            dribble_st = self.dribble_states.get(robot_id)
+            if dribble_st is None:
+                dribble_st = DribbleState()
+                self.dribble_states[robot_id] = dribble_st
+            prev_dribble_phase = dribble_st.phase
             anchor = self.dribble_anchor.get(robot_id)
             anchor_dist = None
             if pose is not None and anchor is not None:
                 anchor_dist = float(np.hypot(
                     float(pose[0]) - anchor[0], float(pose[1]) - anchor[1]
                 ))
-            # Exhaustion: an active session that reached the radius limit. The
-            # session must release; start_dribble is invalid until re-approach.
-            dribble_exhausted_now = bool(
-                session_active
-                and anchor_dist is not None
-                and anchor_dist >= dribble_max_radius
-            )
-            if dribble_exhausted_now:
-                self.dribble_exhausted[robot_id] = True
-                self.awaiting_redribble_gap[robot_id] = True
-            # The re-dribble gap clears once the robot visibly separates from
-            # the ball after the last session ended.
-            if (
-                self.awaiting_redribble_gap.get(robot_id, False)
-                and not session_active
-                and robot_ball_dist is not None
-                and robot_ball_dist > redribble_gap_dist
-            ):
-                self.awaiting_redribble_gap[robot_id] = False
-                self.dribble_exhausted[robot_id] = False
-            start_dribble_blocked = (
-                action_type == "start_dribble"
-                and has_ball_now
-                and (
-                    self.awaiting_redribble_gap.get(robot_id, False)
-                    or self.dribble_exhausted.get(robot_id, False)
-                )
-            )
             stop_dribble_fired = False
             stop_dribble_at_limit = False
 
@@ -1355,9 +1303,6 @@ class JALTeamEnv(gym.Env):
 
             invalid_action_requested = (
                 (action_type == "kick" and not can_kick)
-                or (action_type == "start_dribble" and not has_ball_now)
-                or (action_type == "stop_dribble" and not has_ball_now)
-                or start_dribble_blocked
                 or kick_blocked_bad_aim
             )
             if invalid_action_requested:
@@ -1365,52 +1310,48 @@ class JALTeamEnv(gym.Env):
 
             if action_type == "kick":
                 if not can_kick or kick_blocked_bad_aim:
-                    # Use the policy's own turn_theta rather than "turn 0" so
-                    # the state changes each step, allowing Q(kick) to receive
-                    # proper TD targets instead of bootstrapping off itself in
-                    # a stationary (s == s') loop.
                     command = f"turn {turn_theta:.2f}"
                     if kick_blocked_bad_aim:
                         executed_action_type = "turn"
                 else:
                     command = "kick 100 0"
                     kick_fired = True
-                    if session_active:
-                        # A fired kick releases the ball, ending the session.
-                        self._end_dribble_session(robot_id)
-            elif action_type == "start_dribble":
-                if not has_ball_now:
+                    # A fired kick releases the ball; reset dribble phase machine.
+                    dribble_st.reset()
+                    self.dribble_session_active[robot_id] = False
+                    self.dribble_anchor[robot_id] = None
+            elif action_type == "dribble_to":
+                if pose is None or game_state is None or ball_pos is None:
                     command = "turn 0"
-                elif start_dribble_blocked:
-                    if dribble_exhausted_now:
-                        # At the radius limit with the ball still caught:
-                        # force the release instead of sustaining the dribble.
-                        command = "drop"
-                        executed_action_type = "stop_dribble"
-                        self._end_dribble_session(robot_id)
-                    else:
-                        # Re-catch before creating separation: refuse with a no-op.
+                else:
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    ball_xy = np.array([float(ball_pos[0]), float(ball_pos[1])], dtype=np.float32)
+                    target_xy = np.array([goto_x, goto_y], dtype=np.float32)
+                    command = dribble_to(
+                        self_pose=self_pose,
+                        ball_pose=ball_xy,
+                        target=target_xy,
+                        game_state=game_state,
+                        state=dribble_st,
+                    )
+                    if command == "done":
                         command = "turn 0"
-                        executed_action_type = "turn"
-                else:
-                    command = "catch 0"  # Start dribble
-                    if not session_active and pose is not None:
-                        self.dribble_session_active[robot_id] = True
-                        self.dribble_anchor[robot_id] = (float(pose[0]), float(pose[1]))
-                        self.dribble_exhausted[robot_id] = False
-            elif action_type == "stop_dribble":
-                if not has_ball_now:
-                    command = "turn 0"
-                else:
-                    command = "drop"  # Stop dribble
-                    if session_active:
+                    # Update session tracking from DribbleState phase transitions.
+                    is_carrying = dribble_st.phase in (DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_GRAB)
+                    was_carrying = prev_dribble_phase in (DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_GRAB)
+                    self.dribble_session_active[robot_id] = is_carrying
+                    if dribble_st.segment_start is not None and self.dribble_anchor.get(robot_id) is None:
+                        self.dribble_anchor[robot_id] = dribble_st.segment_start
+                    if was_carrying and dribble_st.phase == DRIBBLE_PHASE_RELEASE:
                         stop_dribble_fired = True
-                        stop_dribble_at_limit = bool(
-                            anchor_dist is not None
-                            and anchor_dist
-                            >= self._STOP_DRIBBLE_RELEASE_FRACTION * dribble_max_radius
-                        )
-                        self._end_dribble_session(robot_id)
+                        stop_dribble_at_limit = True
+                        self.dribble_anchor[robot_id] = None
+                    if not is_carrying and not was_carrying:
+                        self.dribble_anchor[robot_id] = None
             elif action_type == "turn":
                 command = f"turn {turn_theta:.2f}"
             elif action_type == "approach_ball":
@@ -1471,9 +1412,7 @@ class JALTeamEnv(gym.Env):
                     "invalid_action_requested": invalid_action_requested,
                     "dribble_session_active": self.dribble_session_active.get(robot_id, False),
                     "dribble_anchor_dist": anchor_dist,
-                    "dribble_exhausted": self.dribble_exhausted.get(robot_id, False),
-                    "awaiting_redribble_gap": self.awaiting_redribble_gap.get(robot_id, False),
-                    "start_dribble_blocked": start_dribble_blocked,
+                    "dribble_phase": dribble_st.phase,
                     "stop_dribble_fired": stop_dribble_fired,
                     "stop_dribble_at_limit": stop_dribble_at_limit,
                     "command": command,
@@ -1566,17 +1505,12 @@ class JALTeamEnv(gym.Env):
             return "secure_possession"
         return "chase_ball"
 
-    # stop_dribble counts as a deliberate "release near the limit" (eligible
-    # for stop_dribble_release_bonus) when the session covered at least this
-    # fraction of dribble_max_radius.
-    _STOP_DRIBBLE_RELEASE_FRACTION: float = 0.7
-
     def _end_dribble_session(self, robot_id: int) -> None:
-        """Close a dribble session and require re-approach separation."""
+        """Close a dribble session and reset the phase machine."""
 
         self.dribble_session_active[robot_id] = False
         self.dribble_anchor[robot_id] = None
-        self.awaiting_redribble_gap[robot_id] = True
+        self.dribble_states[robot_id].reset()
 
     def _opponent_goalie_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) of the opponent goalie, or None.
@@ -1984,7 +1918,7 @@ class JALTeamEnv(gym.Env):
 
     def _can_robot_move(self) -> bool:
         """Return True if the current action mask allows any locomotion action."""
-        locomotion_actions = {"goto", "approach_ball"}
+        locomotion_actions = {"goto", "approach_ball", "dribble_to"}
         return any(a not in self.disabled_actions for a in locomotion_actions)
 
     def _send_commands(self, commands: List[str]):

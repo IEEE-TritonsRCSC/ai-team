@@ -554,7 +554,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         # and preserves them for later activation. Mirrors the disabled-primitive
         # mask on the policy side. See PPO_EXPANDABLE_PLAN.md.
         param_active_mask = np.zeros(self.agent.param_dim, dtype=np.float32)
-        if "goto" not in disabled_actions:
+        if "goto" not in disabled_actions or "dribble_to" not in disabled_actions:
             param_active_mask[0] = 1.0  # Dx
             param_active_mask[1] = 1.0  # Dy
         if "turn" not in disabled_actions:
