@@ -30,6 +30,7 @@ from ai_interface.envs.reward import (
     evaluate_reward,
     extract_opponent_positions,
     goalie_gap_quality,
+    positional_gap_quality,
 )
 from networking.networker import Networker
 from networking.data_utils import GameState
@@ -201,6 +202,10 @@ class JALTeamEnv(gym.Env):
         self.dribble_anchor: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
         # Steps since the last dribble release per robot (phase CARRY→RELEASE).
         self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
+        # dribble_to reward tracking: target chosen, prev distance, action transition.
+        self.dribble_to_target: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
+        self.prev_ball_to_dribble_target_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+        self._prev_action_was_dribble_to: Dict[int, bool] = {rid: False for rid in self.robot_ids}
         
         # Action design per robot (8D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, dribble_to_logit, goto_x, goto_y, turn_theta]
         self.action_dim_per_robot = 8
@@ -426,6 +431,9 @@ class JALTeamEnv(gym.Env):
         self.dribble_session_active = {rid: False for rid in self.robot_ids}
         self.dribble_anchor = {rid: None for rid in self.robot_ids}
         self.steps_since_stop_dribble = {rid: None for rid in self.robot_ids}
+        self.dribble_to_target = {rid: None for rid in self.robot_ids}
+        self.prev_ball_to_dribble_target_dist = {rid: None for rid in self.robot_ids}
+        self._prev_action_was_dribble_to = {rid: False for rid in self.robot_ids}
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -685,16 +693,37 @@ class JALTeamEnv(gym.Env):
                     f"{gap_quality:.2f}" if gap_quality is not None else "N/A",
                 )
 
-        # One-shot bonus for deliberately releasing the ball late in a dribble
-        # session (at segment limit), setting up the release -> re-approach ->
-        # turn -> kick chain.
-        stop_release_bonus = float(
-            getattr(self.reward_config, "stop_dribble_release_bonus", 0.0)
+        # One-shot bonus when dribble_to is first selected and the target
+        # improves goalie-gap quality over the ball's current position. Fires
+        # only on the transition step (not dribble_to last step → dribble_to
+        # this step) to prevent farming.
+        dribble_quality_weight = float(
+            getattr(self.reward_config, "dribble_target_quality_weight", 0.0)
         )
-        if stop_release_bonus > 0.0:
+        if dribble_quality_weight > 0.0 and current_game_state is not None:
             for info_i in action_info.get("per_robot", []):
-                if info_i.get("stop_dribble_fired") and info_i.get("stop_dribble_at_limit"):
-                    reward += stop_release_bonus
+                if info_i.get("action_type") != "dribble_to":
+                    continue
+                rid = info_i.get("robot_id")
+                if self._prev_action_was_dribble_to.get(rid, False):
+                    continue
+                target = self.dribble_to_target.get(rid)
+                if target is None or ball_pos is None:
+                    continue
+                gk_pose = self._opponent_goalie_pose(current_game_state)
+                if gk_pose is None:
+                    continue
+                gk_y_val = float(gk_pose[1])
+                current_gap = positional_gap_quality(
+                    (float(ball_pos[0]), float(ball_pos[1])),
+                    gk_y_val, goal_half_height,
+                )
+                target_gap = positional_gap_quality(
+                    target, gk_y_val, goal_half_height,
+                )
+                delta = max(0.0, target_gap - current_gap)
+                if delta > 0.0:
+                    reward += delta * dribble_quality_weight
 
         # Stage 2: penalty for kicking while the ball is already in the
         # goalie's possession (tug-of-war suppression). Fires when a kick
@@ -736,6 +765,9 @@ class JALTeamEnv(gym.Env):
                 self.steps_since_stop_dribble[rid] = 0
             elif self.steps_since_stop_dribble.get(rid) is not None:
                 self.steps_since_stop_dribble[rid] += 1
+        combo_quality_scale = bool(
+            getattr(self.reward_config, "post_dribble_kick_quality_scale", False)
+        )
         if combo_bonus > 0.0:
             for info_i in per_robot_info_list:
                 rid = info_i.get("robot_id")
@@ -743,11 +775,19 @@ class JALTeamEnv(gym.Env):
                     continue
                 age = self.steps_since_stop_dribble.get(rid)
                 if age is not None and age <= combo_window:
-                    reward += combo_bonus
-                    self.total_rewards += combo_bonus
+                    scale = 1.0
+                    if combo_quality_scale:
+                        aim_q = info_i.get("kick_aim_quality")
+                        if aim_q is not None:
+                            scale = max(0.0, float(aim_q))
+                        else:
+                            scale = 0.0
+                    bonus = combo_bonus * scale
+                    reward += bonus
+                    self.total_rewards += bonus
                     self.logger.info(
-                        "Dribble→kick combo bonus +%.1f (steps_since_stop=%d)",
-                        combo_bonus, age,
+                        "Dribble→kick combo bonus +%.1f (steps_since_stop=%d, scale=%.2f)",
+                        bonus, age, scale,
                     )
 
         self.total_rewards += reward
@@ -816,6 +856,22 @@ class JALTeamEnv(gym.Env):
             )
             if terminated:
                 self._cached_game_state = None
+
+        # Update dribble_to reward tracking for next step.
+        next_ball_pos = getattr(next_game_state, "ball_pos", None) if next_game_state is not None else None
+        for rid in self.robot_ids:
+            target = self.dribble_to_target.get(rid)
+            if target is not None and next_ball_pos is not None:
+                self.prev_ball_to_dribble_target_dist[rid] = float(math.hypot(
+                    float(next_ball_pos[0]) - target[0],
+                    float(next_ball_pos[1]) - target[1],
+                ))
+            else:
+                self.prev_ball_to_dribble_target_dist[rid] = None
+        for info_i in action_info.get("per_robot", []):
+            rid = info_i.get("robot_id")
+            if rid is not None:
+                self._prev_action_was_dribble_to[rid] = (info_i.get("action_type") == "dribble_to")
 
         info = {
             "action_info": action_info,
@@ -1308,6 +1364,13 @@ class JALTeamEnv(gym.Env):
             if invalid_action_requested:
                 invalid_action_count += 1
 
+            # Track dribble_to target for reward computation.
+            if action_type == "dribble_to":
+                self.dribble_to_target[robot_id] = (goto_x, goto_y)
+            else:
+                self.dribble_to_target[robot_id] = None
+                self.prev_ball_to_dribble_target_dist[robot_id] = None
+
             if action_type == "kick":
                 if not can_kick or kick_blocked_bad_aim:
                     command = f"turn {turn_theta:.2f}"
@@ -1495,6 +1558,8 @@ class JALTeamEnv(gym.Env):
             goalie_y=(float(goalie_pose[1]) if goalie_pose is not None else None),
             is_dribbling=bool(self.dribble_session_active.get(robot_id, False)),
             dribble_anchor_dist=dribble_anchor_dist,
+            dribble_target=self.dribble_to_target.get(robot_id),
+            prev_ball_to_dribble_target_dist=self.prev_ball_to_dribble_target_dist.get(robot_id),
         )
 
     @staticmethod
