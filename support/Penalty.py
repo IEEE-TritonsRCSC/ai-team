@@ -1,6 +1,5 @@
 # Assignee: Yash Tandon
 import math
-from collections import deque
 
 from networking.data_utils import GameState, TeamInfo
 
@@ -8,16 +7,13 @@ from ai_interface.constants.field_constants import (
     FIELD_X,
     GOAL_L,
     GOAL_R,
-    MAX_KEEPER_OUT,
 )
 from ai_interface.constants.player_constants import BALL_SIZE, KICKABLE_MARGIN, PLAYER_SIZE
 from ai_interface.utils.algo_utils import (
-    clamp,
     distance,
-    face_ball_angle,
-    get_goal_params,
     normalize_angle,
 )
+from ai_interface.goalie import Goalie
 from ai_interface.utils.basic_commands import goto
 
 
@@ -27,16 +23,11 @@ class AccessoryAlgo:
     PENALTY_TAKER_ID = 5
 
     FIELD_LENGTH_M = 9.0
-    PENALTY_MARK_TO_GOAL_M = 6.0
     FINAL_SHOT_DISTANCE_M = 2.0
     ADVANCE_TOUCH_M = 0.8
     RELEASE_GAP_M = 0.22
     APPROACH_STANDOFF_M = 0.15
     PENALTY_TIMEOUT_S = 10.0
-    BALL_IN_PLAY_M = 0.03
-    BALL_MOVING_MPS = 0.15
-    FAST_SHOT_MPS = 0.35
-    CHALLENGE_OUT_M = 1.0
 
     KICKABLE_DISTANCE_M = 0.18
     ALIGN_TOLERANCE_RAD = math.radians(7.0)
@@ -58,22 +49,13 @@ class AccessoryAlgo:
         self.penalty_started_at = None
         self.touch_start_ball_x = None
         self.last_ball_x = None
-        self.defense_start_ball = None
-        self.ball_in_play = False
-        self.ball_history = deque(maxlen=5)
+        self._goalie: Goalie | None = None
 
         self.units_per_meter = self._units_per_meter()
         self.final_shot_distance = self.FINAL_SHOT_DISTANCE_M * self.units_per_meter
         self.advance_touch = self.ADVANCE_TOUCH_M * self.units_per_meter
         self.release_gap = self.RELEASE_GAP_M * self.units_per_meter
         self.approach_standoff = self.APPROACH_STANDOFF_M * self.units_per_meter
-        self.ball_in_play_distance = self.BALL_IN_PLAY_M * self.units_per_meter
-        self.ball_moving_speed = self.BALL_MOVING_MPS * self.units_per_meter
-        self.fast_shot_speed = self.FAST_SHOT_MPS * self.units_per_meter
-        self.challenge_out = min(
-            self.CHALLENGE_OUT_M * self.units_per_meter,
-            float(MAX_KEEPER_OUT),
-        )
         self.kickable_distance = max(
             self.KICKABLE_DISTANCE_M * self.units_per_meter,
             PLAYER_SIZE + BALL_SIZE + KICKABLE_MARGIN,
@@ -91,8 +73,6 @@ class AccessoryAlgo:
         Returns:
             Decided actions for all the robots
         """
-        self._update_ball_history(game_state)
-
         if self.penalty_against:
             return self._defend_penalty(game_state, teamname)
         return self._attack_penalty(game_state, teamname)
@@ -117,17 +97,11 @@ class AccessoryAlgo:
 
     def _defend_penalty(self, game_state: GameState, teamname: str) -> list[str]:
         ball = game_state.ball_pos
-        if self.defense_start_ball is None:
-            self.defense_start_ball = tuple(ball[:2])
-
-        if self._defense_ball_is_in_play(ball):
-            self.ball_in_play = True
-
         actions = []
         for robot in game_state.robot_poses[teamname]:
             unum, pose = self._robot_id_and_pose(robot)
             if unum == self.GOALIE_ID:
-                actions.append(self._penalty_goalie_action(pose, ball, game_state))
+                actions.append(self._penalty_goalie_action(pose, ball, game_state, teamname))
             else:
                 actions.append("dash 0 0")
         return actions
@@ -219,83 +193,16 @@ class AccessoryAlgo:
             return self._move_to_pose(pose, kick_pos, target_angle, game_state)
         return f"kick {power:.1f} 0"
 
-    def _penalty_goalie_action(self, pose, ball, game_state: GameState) -> str:
-        if self.ball_in_play and distance(pose[:2], ball[:2]) <= self.kickable_distance:
-            return self._clear_ball(pose, ball, game_state)
-
-        if not self.ball_in_play:
-            target = self._goal_line_target(ball)
-            return self._move_to_pose(pose, target, face_ball_angle(pose, ball), game_state, speed=80.0)
-
-        target = self._goalie_intercept_target(ball)
-        return self._move_to_pose(pose, target, face_ball_angle(pose, ball), game_state, speed=100.0)
-
-    def _goalie_intercept_target(self, ball) -> tuple[float, float]:
-        vx, vy = self._estimate_ball_velocity()
-        ball_speed = math.hypot(vx, vy)
-        opponent_attack_direction = self._active_penalty_attack_direction()
-        moving_toward_goal = opponent_attack_direction * vx > self.ball_moving_speed
-
-        if moving_toward_goal and ball_speed >= self.fast_shot_speed:
-            crossing = self._predict_goal_line_crossing(ball, vx, vy)
-            if crossing is not None:
-                return crossing
-
-        return self._challenge_target(ball)
-
-    def _goal_line_target(self, ball) -> tuple[float, float]:
-        goal_x, min_y, max_y = self._defended_goal_limits()
-        target_y = clamp(ball[1], min_y, max_y)
-        return (goal_x, target_y)
-
-    def _predict_goal_line_crossing(self, ball, vx: float, vy: float) -> tuple[float, float] | None:
-        goal_x, min_y, max_y = self._defended_goal_limits()
-        if abs(vx) < 1e-6:
-            return None
-        t_cross = (goal_x - ball[0]) / vx
-        if t_cross <= 0:
-            return None
-        crossing_y = ball[1] + vy * t_cross
-        return (goal_x, clamp(crossing_y, min_y, max_y))
-
-    def _challenge_target(self, ball) -> tuple[float, float]:
-        goal_x, min_y, max_y = self._defended_goal_limits()
-        opponent_attack_direction = self._active_penalty_attack_direction()
-        step_x = goal_x - opponent_attack_direction * self.challenge_out
-        if opponent_attack_direction > 0:
-            target_x = clamp(ball[0], step_x, goal_x)
-        else:
-            target_x = clamp(ball[0], goal_x, step_x)
-        target_y = clamp(ball[1], min_y - self.units_per_meter, max_y + self.units_per_meter)
-        return (target_x, target_y)
-
-    def _clear_ball(self, pose, ball, game_state: GameState) -> str:
-        opponent_attack_direction = self._active_penalty_attack_direction()
-        lateral_sign = 1.0 if ball[1] >= 0 else -1.0
-        if abs(ball[1]) < 0.5 * self.units_per_meter:
-            lateral_sign = 1.0 if pose[1] >= 0 else -1.0
-        target = (
-            ball[0] - opponent_attack_direction * self.units_per_meter,
-            ball[1] + lateral_sign * 3.0 * self.units_per_meter,
+    def _penalty_goalie_action(self, pose, ball, game_state: GameState, teamname: str) -> str:
+        if self._goalie is None:
+            self._goalie = Goalie(teamname=teamname, unum=self.GOALIE_ID)
+        goalie_pose_deg = (pose[0], pose[1], math.degrees(pose[2]))
+        return self._goalie.action(
+            ball_pos=tuple(ball[:2]),
+            goalie_pose=goalie_pose_deg,
+            goalie_to_ball_dist=distance(pose[:2], ball[:2]),
+            game_state=game_state,
         )
-        return self._kick_toward_target(pose, ball, target, self.SHOT_POWER, game_state)
-
-    def _defense_ball_is_in_play(self, ball) -> bool:
-        if self.ball_in_play:
-            return True
-        if self.defense_start_ball is None:
-            return False
-        if distance(ball[:2], self.defense_start_ball) >= self.ball_in_play_distance:
-            return True
-        vx, vy = self._estimate_ball_velocity()
-        return math.hypot(vx, vy) >= self.ball_moving_speed
-
-    def _defended_goal_limits(self) -> tuple[float, float, float]:
-        opponent_attack_direction = self._active_penalty_attack_direction()
-        side = "right" if opponent_attack_direction > 0 else "left"
-        post_top, post_bottom, goal_center = get_goal_params(side)
-        y_values = (post_top[1], post_bottom[1])
-        return (goal_center[0], min(y_values), max(y_values))
 
     def _move_to_pose(
         self,
@@ -368,22 +275,6 @@ class AccessoryAlgo:
     def _goal_angle(self, ball) -> float:
         return 0.0 if self.attack_direction > 0 else math.pi
 
-    def _active_penalty_attack_direction(self) -> int:
-        if self.penalty_against:
-            return -self.attack_direction
-        return self.attack_direction
-
-    def _update_ball_history(self, game_state: GameState) -> None:
-        self.ball_history.append((self._time(game_state), tuple(game_state.ball_pos[:2])))
-
-    def _estimate_ball_velocity(self) -> tuple[float, float]:
-        if len(self.ball_history) < 2:
-            return (0.0, 0.0)
-        t0, p0 = self.ball_history[-2]
-        t1, p1 = self.ball_history[-1]
-        dt = max(t1 - t0, 1e-6)
-        return ((p1[0] - p0[0]) / dt, (p1[1] - p0[1]) / dt)
-
     def _time(self, game_state: GameState) -> float:
         timestamp = getattr(game_state, "timestamp", None)
         if timestamp is not None:
@@ -401,4 +292,3 @@ class AccessoryAlgo:
     def _units_per_meter(self) -> float:
         field_units = abs(FIELD_X[1] - FIELD_X[0])
         return field_units / self.FIELD_LENGTH_M
-
