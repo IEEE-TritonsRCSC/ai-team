@@ -201,6 +201,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         random_spawn_theta_range_deg = _stage_or_top("random_spawn_theta_range_deg", [-45.0, 45.0])
         reward_config_overrides = _stage_or_top("reward_config_overrides", None)
         invalid_action_penalty = _stage_or_top("invalid_action_penalty", 0.2)
+        own_goalie_robot_id = _stage_or_top("own_goalie_robot_id", None)
 
         return JALTeamEnv(
             networker=networker,
@@ -227,6 +228,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
             reward_config_overrides=dict(reward_config_overrides) if reward_config_overrides else None,
             opponent_team_name=opponent_team_name,
+            own_goalie_robot_id=int(own_goalie_robot_id) if own_goalie_robot_id is not None else None,
         )
 
     def setup_environment(
@@ -311,51 +313,90 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         stage_config: Dict[str, Any],
         networker: Networker,
     ) -> Optional[Any]:
-        """Build a scripted opponent controller if the stage config requests one."""
+        """Build opponent/aux controllers from the stage config.
+
+        Returns the first controller for backward compat (single-controller
+        callers). All controllers are stored in self._aux_controllers.
+        """
         aux_specs = stage_config.get("aux_team_policies", [])
         if not aux_specs:
+            self._aux_controllers = []
             return None
 
-        spec = aux_specs[0] if isinstance(aux_specs[0], dict) else {}
-        controller_type = str(spec.get("controller_type", "naive")).lower()
-        team_name = str(spec.get("team_name", ""))
-        if not team_name:
-            self.logger.warning("aux_team_policies: missing team_name. Skipping.")
-            return None
+        self._aux_controllers = []
 
-        robot_ids = list(spec.get("robot_ids", [1]))
+        for spec in aux_specs:
+            if not isinstance(spec, dict):
+                continue
+            controller_type = str(spec.get("controller_type", "naive")).lower()
+            team_name = str(spec.get("team_name", ""))
+            if not team_name:
+                self.logger.warning("aux_team_policies: missing team_name. Skipping.")
+                continue
 
-        if controller_type == "goalie":
-            robot_id = int(robot_ids[0]) if robot_ids else 1
-            side = str(spec.get("side", "right"))
-            ctrl = GoalieCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
-            self.logger.info(
-                "Opponent controller: goalie team=%s robot_id=%d side=%s",
-                team_name, robot_id, side,
-            )
-            return ctrl
+            robot_ids = list(spec.get("robot_ids", [1]))
 
-        if controller_type not in {"naive", "scripted_naive"}:
-            self.logger.warning(
-                "aux_team_policies: unsupported controller_type=%s. Skipping.", controller_type
-            )
-            return None
+            if controller_type == "goalie":
+                robot_id = int(robot_ids[0]) if robot_ids else 1
+                side = str(spec.get("side", "right"))
+                ctrl = GoalieCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
+                self.logger.info(
+                    "Aux controller: goalie team=%s robot_id=%d side=%s",
+                    team_name, robot_id, side,
+                )
+                self._aux_controllers.append(ctrl)
 
-        commander = getattr(networker, "commander", None)
-        team_infos = (
-            list(commander.team_infos) if commander and hasattr(commander, "team_infos")
-            else []
-        )
-        ctrl = ScriptedTeamCommandProvider(
-            team_infos=team_infos,
-            team_name=team_name,
-            num_robots=len(robot_ids),
-            controller_type=controller_type,
-        )
-        self.logger.info(
-            "Opponent controller: %s team=%s robots=%s", controller_type, team_name, robot_ids,
-        )
-        return ctrl
+            elif controller_type == "frozen_ppo":
+                from ai_interface.trainers.policy_control import (
+                    FrozenPPOJALPolicySpec,
+                    FrozenPPOJALPolicyController,
+                )
+                model_path = str(spec.get("model_path", ""))
+                if not model_path:
+                    self.logger.warning("frozen_ppo: missing model_path. Skipping.")
+                    continue
+                ppo_spec = FrozenPPOJALPolicySpec(
+                    name=str(spec.get("name", "frozen_ppo")),
+                    model_path=model_path,
+                    team_name=team_name,
+                    robot_ids=robot_ids,
+                    a_max=int(spec.get("a_max", self.config.get("a_max", 5))),
+                    c_max=int(spec.get("c_max", self.config.get("c_max", 7))),
+                    global_dim=int(spec.get("global_dim", self.config.get("global_dim", 6))),
+                    per_agent_dim=int(spec.get("per_agent_dim", self.config.get("per_agent_dim", 10))),
+                    d_ctx=int(spec.get("d_ctx", self.config.get("d_ctx", 7))),
+                    deterministic=bool(spec.get("deterministic", True)),
+                )
+                ctrl = FrozenPPOJALPolicyController(ppo_spec, networker, device=self.device)
+                self.logger.info(
+                    "Aux controller: frozen_ppo team=%s robots=%s model=%s",
+                    team_name, robot_ids, model_path,
+                )
+                self._aux_controllers.append(ctrl)
+
+            elif controller_type in {"naive", "scripted_naive"}:
+                commander = getattr(networker, "commander", None)
+                team_infos = (
+                    list(commander.team_infos) if commander and hasattr(commander, "team_infos")
+                    else []
+                )
+                ctrl = ScriptedTeamCommandProvider(
+                    team_infos=team_infos,
+                    team_name=team_name,
+                    num_robots=len(robot_ids),
+                    controller_type=controller_type,
+                )
+                self.logger.info(
+                    "Aux controller: %s team=%s robots=%s", controller_type, team_name, robot_ids,
+                )
+                self._aux_controllers.append(ctrl)
+
+            else:
+                self.logger.warning(
+                    "aux_team_policies: unsupported controller_type=%s. Skipping.", controller_type
+                )
+
+        return self._aux_controllers[0] if self._aux_controllers else None
 
     # ------------------------------------------------------------------
     # Model
@@ -458,7 +499,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             self.env = self.setup_environment(num_robots, robot_ids, stage_config=stage_config)
             envs = [self.env]
 
-        # Opponent controller (scripted goalie, etc.) — only for env 0.
+        # Aux controllers (goalies, frozen policies, etc.) — only for env 0.
         self._opp_controller = self._setup_opponent_controller(stage_config, self.networkers[0] if self.networkers else self.networker)
         self._opp_team_name = None
         if self._opp_controller is not None:
@@ -601,18 +642,15 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             for p in np.asarray(action["primitive_idx"]).reshape(-1):
                 win_actions[PRIMITIVE_NAMES[int(p)]] += 1
 
-            # Send scripted opponent commands from last observed game state so
-            # the opponent robot acts each cycle alongside our policy.
-            if (
-                self._opp_controller is not None
-                and self._opp_team_name
-                and self.env._cached_game_state is not None
-            ):
-                try:
-                    opp_cmds = self._opp_controller.predict_commands(self.env._cached_game_state)
-                    self.env.networker.execute_ai_output(opp_cmds, self._opp_team_name)
-                except Exception as e:
-                    self.logger.debug("Opponent command send failed: %s", e)
+            # Send scripted/frozen opponent commands from last observed game state so
+            # auxiliary robots act each cycle alongside our policy.
+            if self.env._cached_game_state is not None:
+                for aux_ctrl in getattr(self, "_aux_controllers", []):
+                    try:
+                        aux_cmds = aux_ctrl.predict_commands(self.env._cached_game_state)
+                        self.env.networker.execute_ai_output(aux_cmds, aux_ctrl.team_name)
+                    except Exception as e:
+                        self.logger.debug("Aux controller command send failed: %s", e)
 
             # Step env.
             next_obs, reward, terminated, truncated, info = self.env.step(action)
@@ -835,16 +873,13 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 for p in np.asarray(action["primitive_idx"]).reshape(-1):
                     win_actions[PRIMITIVE_NAMES[int(p)]] += 1
 
-                if (
-                    self._opp_controller is not None
-                    and self._opp_team_name
-                    and env._cached_game_state is not None
-                ):
-                    try:
-                        opp_cmds = self._opp_controller.predict_commands(env._cached_game_state)
-                        env.networker.execute_ai_output(opp_cmds, self._opp_team_name)
-                    except Exception as e:
-                        self.logger.debug("Opponent command send failed (env %d): %s", i, e)
+                if env._cached_game_state is not None:
+                    for aux_ctrl in getattr(self, "_aux_controllers", []):
+                        try:
+                            aux_cmds = aux_ctrl.predict_commands(env._cached_game_state)
+                            env.networker.execute_ai_output(aux_cmds, aux_ctrl.team_name)
+                        except Exception as e:
+                            self.logger.debug("Aux controller command send failed (env %d): %s", i, e)
 
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = bool(terminated or truncated)

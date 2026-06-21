@@ -79,6 +79,7 @@ class JALTeamEnv(gym.Env):
         reward_config_overrides: Optional[Dict[str, float]] = None,
         some_arg=None,
         opponent_team_name: Optional[str] = None,
+        own_goalie_robot_id: Optional[int] = None,
         ):
 
         super().__init__()
@@ -182,6 +183,10 @@ class JALTeamEnv(gym.Env):
             )
         # Opponent team name for filling context slots (slot 1 = opp goalie).
         self.opponent_team_name: Optional[str] = opponent_team_name
+        # Own goalie robot_id (Stage 4+): friendly HC goalie on our team, not RL-controlled.
+        self.own_goalie_robot_id: Optional[int] = (
+            int(own_goalie_robot_id) if own_goalie_robot_id is not None else None
+        )
 
         # Active masks: which agent slots are controlled robots, which context
         # slots are present. Static within Stage 1 (1 robot, no context); later
@@ -189,6 +194,8 @@ class JALTeamEnv(gym.Env):
         self.agent_active_mask = np.zeros(self.a_max, dtype=np.float32)
         self.agent_active_mask[: self.num_robots] = 1.0
         self.context_active_mask = np.zeros(self.c_max, dtype=np.float32)
+        if self.own_goalie_robot_id is not None:
+            self.context_active_mask[0] = 1.0  # slot 0 = own goalie
         if self.opponent_team_name is not None:
             self.context_active_mask[1] = 1.0  # slot 1 = opp goalie
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
@@ -206,7 +213,15 @@ class JALTeamEnv(gym.Env):
         self.dribble_to_target: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
         self.prev_ball_to_dribble_target_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
         self._prev_action_was_dribble_to: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        
+
+        # Stage 4+: own-goalie coordination tracking
+        self._prev_has_ball: Dict[int, bool] = {rid: False for rid in self.robot_ids}
+        self._prev_opponent_near_ball: bool = False
+        self._prev_clearance_zone_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+
+        # Stage 5+: multi-robot coordination tracking
+        self._prev_ball_carrier: Optional[int] = None
+
         # Action design per robot (8D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, dribble_to_logit, goto_x, goto_y, turn_theta]
         self.action_dim_per_robot = 8
         self.action_space = spaces.Box(
@@ -1083,8 +1098,32 @@ class JALTeamEnv(gym.Env):
                 # dims 8..per_agent_dim-1 reserved → stay 0
 
             # --- context slots (c_max × d_ctx) ---
-            # Layout: slot 0 = our goalie (unused Stage 1/2), slot 1 = opp goalie.
-            # Only fill when an opponent team is configured.
+            # Layout: slot 0 = our goalie, slot 1 = opp goalie.
+            ctx_base = self.global_dim + self.per_agent_dim * self.a_max
+
+            # Context slot 0: own HC goalie (Stage 4+).
+            if self.own_goalie_robot_id is not None:
+                own_gk_pose = pose_by_robot_id.get(self.own_goalie_robot_id)
+                if own_gk_pose is not None and len(own_gk_pose) >= 3:
+                    gk_x = float(own_gk_pose[0])
+                    gk_y = float(own_gk_pose[1])
+                    gk_theta = float(np.deg2rad(own_gk_pose[2]))
+                    prev_gk_xy = self.prev_opp_pose_by_id.get(-self.own_goalie_robot_id)
+                    if prev_gk_xy is not None:
+                        gk_vx = float(gk_x - prev_gk_xy[0])
+                        gk_vy = float(gk_y - prev_gk_xy[1])
+                    else:
+                        gk_vx = gk_vy = 0.0
+                    self.prev_opp_pose_by_id[-self.own_goalie_robot_id] = np.array([gk_x, gk_y], dtype=np.float32)
+
+                    own_gk_off = ctx_base + 0 * self.d_ctx  # slot 0
+                    obs[own_gk_off + 0] = gk_x / self._NORM_POS_X
+                    obs[own_gk_off + 1] = gk_y / self._NORM_POS_Y
+                    obs[own_gk_off + 2] = gk_theta / self._NORM_THETA
+                    obs[own_gk_off + 3] = gk_vx / self._NORM_VEL
+                    obs[own_gk_off + 4] = gk_vy / self._NORM_VEL
+
+            # Context slot 1+: opponent robots. Only fill when an opponent team is configured.
             if self.opponent_team_name is not None:
                 opp_pose_entries = game_state.robot_poses.get(self.opponent_team_name, [])
                 opp_pose_by_id: Dict[int, Any] = {}
@@ -1107,7 +1146,6 @@ class JALTeamEnv(gym.Env):
                         opp_vx = opp_vy = 0.0
                     self.prev_opp_pose_by_id[first_opp_id] = np.array([opp_x, opp_y], dtype=np.float32)
 
-                    ctx_base = self.global_dim + self.per_agent_dim * self.a_max
                     opp_slot_off = ctx_base + 1 * self.d_ctx  # slot 1
                     obs[opp_slot_off + 0] = opp_x / self._NORM_POS_X
                     obs[opp_slot_off + 1] = opp_y / self._NORM_POS_Y
@@ -1504,6 +1542,9 @@ class JALTeamEnv(gym.Env):
         prev_ball_to_goal_dist: Optional[float] = None,
         prev_ball_pos: Optional[Tuple[float, float]] = None,
         prev_facing_goal_cos: Optional[float] = None,
+        # Stage 4+
+        is_nearest_to_ball: bool = True,
+        ally_positions: Tuple[Tuple[float, float], ...] = (),
     ) -> RewardInputs:
         """Build a shared `RewardInputs` object from the current game state."""
 
@@ -1540,6 +1581,17 @@ class JALTeamEnv(gym.Env):
         if anchor is not None:
             dribble_anchor_dist = float(np.hypot(robot_x - anchor[0], robot_y - anchor[1]))
 
+        # Stage 4: own goalie coordination
+        own_goalie_pose = self._own_goalie_pose(current_game_state)
+        own_goalie_pos: Optional[Tuple[float, float]] = None
+        own_goalie_has_ball = False
+        if own_goalie_pose is not None:
+            own_goalie_pos = (own_goalie_pose[0], own_goalie_pose[1])
+            gk_ball_dist = float(math.hypot(
+                ball_x - own_goalie_pose[0], ball_y - own_goalie_pose[1]
+            ))
+            own_goalie_has_ball = bool(gk_ball_dist < self.reward_config.own_goalie_clearance_dist)
+
         return RewardInputs(
             ball_pos=(ball_x, ball_y),
             self_pose_rad=(robot_x, robot_y, robot_theta),
@@ -1560,6 +1612,15 @@ class JALTeamEnv(gym.Env):
             dribble_anchor_dist=dribble_anchor_dist,
             dribble_target=self.dribble_to_target.get(robot_id),
             prev_ball_to_dribble_target_dist=self.prev_ball_to_dribble_target_dist.get(robot_id),
+            # Stage 4
+            own_goalie_pos=own_goalie_pos,
+            own_goalie_has_ball=own_goalie_has_ball,
+            prev_clearance_zone_dist=self._prev_clearance_zone_dist.get(robot_id),
+            prev_has_ball=self._prev_has_ball.get(robot_id, False),
+            prev_opponent_near_ball=self._prev_opponent_near_ball,
+            # Stage 5+
+            ally_positions=ally_positions,
+            is_nearest_to_ball=is_nearest_to_ball,
         )
 
     @staticmethod
@@ -1608,6 +1669,22 @@ class JALTeamEnv(gym.Env):
                         best_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
         return best_pose
 
+    def _own_goalie_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
+        """Return (x, y, theta_deg) of our own HC goalie, or None."""
+
+        if game_state is None or self.own_goalie_robot_id is None:
+            return None
+        for team_name, entries in getattr(game_state, "robot_poses", {}).items():
+            if team_name != self.team_name:
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for rid, pose in entry.items():
+                    if int(rid) == self.own_goalie_robot_id and pose is not None and len(pose) >= 3:
+                        return (float(pose[0]), float(pose[1]), float(pose[2]))
+        return None
+
     @staticmethod
     def _project_kick_y_at_goal_line(pose: Sequence[float]) -> Optional[float]:
         """Project a straight kick from robot pose to the opponent goal line."""
@@ -1640,8 +1717,35 @@ class JALTeamEnv(gym.Env):
         rewards: List[float] = []
         next_ball_to_goal_dist: Optional[float] = None
 
+        # Stage 5+: pre-compute per-robot ball distances for role-gating.
+        ball_x = float(current_game_state.ball_pos[0]) if current_game_state.ball_pos else 0.0
+        ball_y = float(current_game_state.ball_pos[1]) if current_game_state.ball_pos else 0.0
+
+        pose_by_robot_id: Dict[int, Any] = {}
+        team_pose_entries = current_game_state.robot_poses.get(self.team_name, [])
+        for entry in team_pose_entries:
+            if isinstance(entry, dict):
+                pose_by_robot_id.update(entry)
+
+        robot_ball_dists: Dict[int, float] = {}
+        robot_positions: Dict[int, Tuple[float, float]] = {}
+        for rid in self.robot_ids:
+            pose = pose_by_robot_id.get(rid)
+            if pose is not None:
+                rx, ry = float(pose[0]), float(pose[1])
+                robot_positions[rid] = (rx, ry)
+                robot_ball_dists[rid] = float(math.hypot(rx - ball_x, ry - ball_y))
+
+        nearest_rid = min(robot_ball_dists, key=robot_ball_dists.get) if robot_ball_dists else None
+        current_ball_carrier: Optional[int] = None
+
         for robot_id in self.robot_ids:
             try:
+                is_nearest = (robot_id == nearest_rid) if nearest_rid is not None else True
+                ally_pos = tuple(
+                    pos for rid, pos in robot_positions.items() if rid != robot_id
+                )
+
                 reward_inputs = self.build_reward_inputs(
                     current_game_state=current_game_state,
                     robot_id=robot_id,
@@ -1649,17 +1753,39 @@ class JALTeamEnv(gym.Env):
                     prev_ball_to_goal_dist=self.prev_reward_ball_to_goal_dist,
                     prev_ball_pos=self.prev_reward_ball_pos,
                     prev_facing_goal_cos=self.prev_reward_facing_goal_cos_by_id.get(robot_id),
+                    is_nearest_to_ball=is_nearest,
+                    ally_positions=ally_pos,
                 )
             except ValueError:
                 continue
 
             reward_result = evaluate_reward(reward_inputs, config=self.reward_config)
+            intermediates = reward_result.intermediates
             rewards.append(float(reward_result.reward))
-            self.prev_reward_ball_dist_by_id[robot_id] = reward_result.intermediates.ball_dist
-            if reward_result.intermediates.facing_goal_cos is not None:
-                self.prev_reward_facing_goal_cos_by_id[robot_id] = reward_result.intermediates.facing_goal_cos
-            next_ball_to_goal_dist = reward_result.intermediates.ball_to_goal_dist
+            self.prev_reward_ball_dist_by_id[robot_id] = intermediates.ball_dist
+            if intermediates.facing_goal_cos is not None:
+                self.prev_reward_facing_goal_cos_by_id[robot_id] = intermediates.facing_goal_cos
+            next_ball_to_goal_dist = intermediates.ball_to_goal_dist
 
+            # Stage 4: update tracking state
+            self._prev_has_ball[robot_id] = intermediates.has_ball
+            if intermediates.own_goalie_has_ball and self.own_goalie_robot_id is not None:
+                own_gk_pose = self._own_goalie_pose(current_game_state)
+                if own_gk_pose is not None:
+                    rx, ry = robot_positions.get(robot_id, (0.0, 0.0))
+                    clearance_zone_x = 0.0
+                    clearance_zone_y = own_gk_pose[1] * 0.3
+                    self._prev_clearance_zone_dist[robot_id] = float(
+                        math.hypot(rx - clearance_zone_x, ry - clearance_zone_y)
+                    )
+            else:
+                self._prev_clearance_zone_dist[robot_id] = None
+
+            # Stage 5: track ball carrier
+            if intermediates.has_ball:
+                current_ball_carrier = robot_id
+
+        # Update shared tracking state
         if next_ball_to_goal_dist is not None:
             self.prev_reward_ball_to_goal_dist = next_ball_to_goal_dist
 
@@ -1668,6 +1794,34 @@ class JALTeamEnv(gym.Env):
                 float(current_game_state.ball_pos[0]),
                 float(current_game_state.ball_pos[1]),
             )
+
+        # Stage 4: opponent-near-ball tracking for ball recovery detection
+        opp_positions = extract_opponent_positions(
+            robot_poses=getattr(current_game_state, "robot_poses", {}),
+            team_name=self.team_name,
+        )
+        if opp_positions:
+            nearest_opp_ball = min(
+                math.hypot(ox - ball_x, oy - ball_y) for ox, oy in opp_positions
+            )
+            self._prev_opponent_near_ball = bool(
+                nearest_opp_ball < self.reward_config.opponent_near_ball_threshold
+            )
+        else:
+            self._prev_opponent_near_ball = False
+
+        # Stage 5: possession transfer bonus (one-shot)
+        possession_transfer_bonus = float(self.reward_config.possession_transfer_bonus)
+        if (
+            possession_transfer_bonus > 0.0
+            and current_ball_carrier is not None
+            and self._prev_ball_carrier is not None
+            and current_ball_carrier != self._prev_ball_carrier
+            and self._prev_ball_carrier in self.robot_ids
+        ):
+            for i in range(len(rewards)):
+                rewards[i] += possession_transfer_bonus / max(len(rewards), 1)
+        self._prev_ball_carrier = current_ball_carrier
 
         if not rewards:
             return 0.0

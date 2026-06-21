@@ -131,6 +131,28 @@ class RewardConfig:
     # fire time. Prevents "dribble then wild kick" from farming the bonus.
     post_dribble_kick_quality_scale: bool = False
 
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_clearance_dist: float = 5.0
+    clearance_receive_weight: float = 0.0
+    clearance_receive_clip: float = 0.5
+    receive_positioning_bonus: float = 0.0
+    receive_positioning_x_range: Tuple[float, float] = (-5.0, 15.0)
+    own_half_loiter_x: float = -15.0
+    own_half_loiter_penalty: float = 0.0
+    ball_recovery_bonus: float = 0.0
+
+    # ---- Stage 5+: multi-robot coordination (N-robot scalable) ----
+    enable_role_gating: bool = False
+    spread_bonus: float = 0.0
+    spread_min_dist: float = 8.0
+    redundant_chase_penalty: float = 0.0
+    redundant_chase_dist: float = 3.0
+    support_position_bonus: float = 0.0
+    support_position_max_dist: float = 20.0
+    support_position_min_angle_deg: float = 20.0
+    possession_transfer_bonus: float = 0.0
+    team_goal_multiplier: float = 1.0
+
 
 @dataclass(frozen=True)
 class RewardInputs:
@@ -157,6 +179,18 @@ class RewardInputs:
     dribble_target: Optional[Tuple[float, float]] = None
     # Ball-to-dribble-target distance from the previous step (for delta).
     prev_ball_to_dribble_target_dist: Optional[float] = None
+
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_pos: Optional[Tuple[float, float]] = None
+    own_goalie_has_ball: bool = False
+    prev_clearance_zone_dist: Optional[float] = None
+    prev_has_ball: bool = False
+    prev_opponent_near_ball: bool = False
+
+    # ---- Stage 5+: multi-robot coordination ----
+    ally_positions: Tuple[Tuple[float, float], ...] = ()
+    is_nearest_to_ball: bool = True
+    ball_carrier_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +228,20 @@ class RewardIntermediates:
     # Deprecated: kept for backward compat, always False / None.
     valid_dribble: bool = False
     dribble_lateral_progress: Optional[float] = None
+
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_has_ball: bool = False
+    clearance_receive_progress: Optional[float] = None
+    in_receive_position: bool = False
+    in_own_half_loiter: bool = False
+    ball_recovered: bool = False
+
+    # ---- Stage 5+: multi-robot coordination ----
+    is_nearest_to_ball: bool = True
+    nearest_ally_dist: Optional[float] = None
+    is_well_spread: bool = False
+    in_support_position: bool = False
+    is_redundant_chaser: bool = False
 
 
 @dataclass(frozen=True)
@@ -376,6 +424,79 @@ def calculate_reward_intermediates(
         )
         dribble_target_quality_delta = float(max(0.0, target_gap - current_gap))
 
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_has_ball = False
+    clearance_receive_progress = None
+    if inputs.own_goalie_pos is not None:
+        gx, gy = inputs.own_goalie_pos
+        ball_to_own_goalie = float(math.hypot(bx - gx, by - gy))
+        own_goalie_has_ball = bool(ball_to_own_goalie < config.own_goalie_clearance_dist)
+
+        if own_goalie_has_ball and inputs.prev_clearance_zone_dist is not None:
+            clearance_zone_x = 0.0
+            clearance_zone_y = gy * 0.3
+            clearance_zone_dist = float(math.hypot(rx - clearance_zone_x, ry - clearance_zone_y))
+            clearance_receive_progress = float(inputs.prev_clearance_zone_dist - clearance_zone_dist)
+
+    in_receive_position = bool(
+        own_goalie_has_ball
+        and config.receive_positioning_x_range[0] <= rx <= config.receive_positioning_x_range[1]
+    )
+
+    in_own_half_loiter = bool(rx < config.own_half_loiter_x)
+
+    ball_recovered = bool(
+        inputs.has_ball
+        and not inputs.prev_has_ball
+        and inputs.prev_opponent_near_ball
+    )
+
+    # ---- Stage 5+: multi-robot coordination ----
+    nearest_ally_dist = None
+    if inputs.ally_positions:
+        nearest_ally_dist = float(min(
+            math.hypot(rx - ax, ry - ay) for ax, ay in inputs.ally_positions
+        ))
+
+    is_well_spread = bool(
+        nearest_ally_dist is not None
+        and nearest_ally_dist >= config.spread_min_dist
+    )
+
+    in_support_position = False
+    if (
+        not inputs.is_nearest_to_ball
+        and inputs.ally_positions
+        and ball_dist < config.support_position_max_dist
+    ):
+        to_goal_from_ball_x = FIELD_X[1] - bx
+        to_goal_from_ball_y = -by
+        to_robot_from_ball_x = rx - bx
+        to_robot_from_ball_y = ry - by
+        goal_norm = math.hypot(to_goal_from_ball_x, to_goal_from_ball_y)
+        robot_norm = math.hypot(to_robot_from_ball_x, to_robot_from_ball_y)
+        if goal_norm > 1e-6 and robot_norm > 1e-6:
+            cos_angle = (
+                to_goal_from_ball_x * to_robot_from_ball_x
+                + to_goal_from_ball_y * to_robot_from_ball_y
+            ) / (goal_norm * robot_norm)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            is_forward = bool(rx > bx - 5.0)
+            in_support_position = bool(
+                is_forward and angle_deg >= config.support_position_min_angle_deg
+            )
+
+    is_redundant_chaser = bool(
+        not inputs.is_nearest_to_ball
+        and ball_dist < config.redundant_chase_dist
+    )
+
+    opponent_near_ball = bool(
+        nearest_opponent_ball_dist is not None
+        and nearest_opponent_ball_dist < config.opponent_near_ball_threshold
+    )
+
     return RewardIntermediates(
         ball_dist=ball_dist,
         ball_to_goal_dist=ball_to_goal_dist,
@@ -388,10 +509,7 @@ def calculate_reward_intermediates(
         has_ball=bool(inputs.has_ball),
         near_ball=bool(ball_dist < inputs.kickable_dist * config.near_ball_scale),
         nearest_opponent_ball_dist=nearest_opponent_ball_dist,
-        opponent_near_ball=bool(
-            nearest_opponent_ball_dist is not None
-            and nearest_opponent_ball_dist < config.opponent_near_ball_threshold
-        ),
+        opponent_near_ball=opponent_near_ball,
         in_shoot_state=bool(inputs.state == "shoot_on_goal"),
         in_dribble_state=bool(inputs.state == "dribble_to_goal"),
         goal_scored=goal_scored,
@@ -401,6 +519,18 @@ def calculate_reward_intermediates(
         dribble_to_active=dribble_to_active,
         dribble_target_progress=dribble_target_progress,
         dribble_target_quality_delta=dribble_target_quality_delta,
+        # Stage 4
+        own_goalie_has_ball=own_goalie_has_ball,
+        clearance_receive_progress=clearance_receive_progress,
+        in_receive_position=in_receive_position,
+        in_own_half_loiter=in_own_half_loiter,
+        ball_recovered=ball_recovered,
+        # Stage 5+
+        is_nearest_to_ball=inputs.is_nearest_to_ball,
+        nearest_ally_dist=nearest_ally_dist,
+        is_well_spread=is_well_spread,
+        in_support_position=in_support_position,
+        is_redundant_chaser=is_redundant_chaser,
     )
 
 
@@ -438,7 +568,11 @@ def calculate_reward(
 
     reward = 0.0
 
-    if intermediates.approach is not None and not intermediates.has_ball:
+    # Role-gating: when enabled, only the nearest-to-ball robot gets
+    # chase/possession rewards. Non-nearest robots get positioning rewards.
+    is_chaser = not config.enable_role_gating or intermediates.is_nearest_to_ball
+
+    if intermediates.approach is not None and not intermediates.has_ball and is_chaser:
         reward += intermediates.approach * config.approach_weight
 
     if intermediates.goal_progress is not None:
@@ -484,9 +618,9 @@ def calculate_reward(
         if fire_alignment:
             reward += intermediates.facing_goal_cos_delta * config.alignment_weight
 
-    if intermediates.has_ball:
+    if intermediates.has_ball and is_chaser:
         reward += config.has_ball_bonus
-    if intermediates.near_ball:
+    if intermediates.near_ball and is_chaser:
         reward += config.near_ball_bonus
     if intermediates.opponent_near_ball:
         reward += config.opponent_near_ball_penalty
@@ -516,8 +650,41 @@ def calculate_reward(
     ):
         reward += config.dribble_active_bonus
 
+    # ---- Stage 4: own-goalie coordination ----
+    if (
+        intermediates.clearance_receive_progress is not None
+        and config.clearance_receive_weight > 0.0
+        and intermediates.own_goalie_has_ball
+    ):
+        progress = float(np.clip(
+            intermediates.clearance_receive_progress,
+            -config.clearance_receive_clip,
+            config.clearance_receive_clip,
+        ))
+        reward += progress * config.clearance_receive_weight
+
+    if intermediates.in_receive_position and config.receive_positioning_bonus > 0.0:
+        reward += config.receive_positioning_bonus
+
+    if intermediates.in_own_half_loiter and config.own_half_loiter_penalty > 0.0:
+        reward -= config.own_half_loiter_penalty
+
+    if intermediates.ball_recovered and config.ball_recovery_bonus > 0.0:
+        reward += config.ball_recovery_bonus
+
+    # ---- Stage 5+: multi-robot coordination ----
+    if not is_chaser:
+        if config.spread_bonus > 0.0 and intermediates.is_well_spread:
+            reward += config.spread_bonus
+
+        if config.support_position_bonus > 0.0 and intermediates.in_support_position:
+            reward += config.support_position_bonus
+
+    if intermediates.is_redundant_chaser and config.redundant_chase_penalty > 0.0:
+        reward -= config.redundant_chase_penalty
+
     if intermediates.goal_scored:
-        reward += config.goal_reward
+        reward += config.goal_reward * config.team_goal_multiplier
     if intermediates.robot_out_of_bounds:
         reward -= config.robot_out_of_bounds_penalty
     if intermediates.ball_out_of_bounds:

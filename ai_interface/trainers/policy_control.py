@@ -11,9 +11,12 @@ import json
 import torch
 from stable_baselines3 import TD3
 
+import numpy as np
+
 from ai_interface.naive import SoccerAI as HeuristicSoccerAI
 from ai_interface.envs.JAL_env import JALTeamEnv
 from ai_interface.envs.JAL_her_env import JALHEREnv
+from ai_interface.algorithms.ppo_jal import PPOJALAgent
 from networking.data_utils import GameState
 from networking.networker import Networker
 
@@ -90,6 +93,82 @@ class FrozenTD3JALPolicyController:
     def predict_commands(self, game_state: GameState) -> list[str]:
         obs = self.helper_env._game_state_to_obs(game_state)
         action, _ = self.model.predict(obs, deterministic=self.spec.deterministic)
+        commands, _ = self.helper_env._action_to_commands(action, game_state)
+        return commands
+
+
+@dataclass(slots=True)
+class FrozenPPOJALPolicySpec:
+    """Configuration for loading a frozen PPO JAL policy for inference."""
+
+    name: str
+    model_path: str
+    team_name: str
+    robot_ids: list[int]
+    a_max: int = 5
+    c_max: int = 7
+    global_dim: int = 6
+    per_agent_dim: int = 10
+    d_ctx: int = 7
+    num_primitives: int = 8
+    param_dim: int = 5
+    max_steps: int = 200
+    deterministic: bool = True
+
+
+class FrozenPPOJALPolicyController:
+    """Loads a frozen PPO JAL policy and emits commands for a single team."""
+
+    def __init__(
+        self,
+        spec: FrozenPPOJALPolicySpec,
+        networker: Networker,
+        device: torch.device | str,
+    ):
+        self.spec = spec
+        self.team_name = spec.team_name
+        self.num_robots = len(spec.robot_ids)
+
+        obs_dim = spec.global_dim + spec.per_agent_dim * spec.a_max + spec.d_ctx * spec.c_max
+        self.agent = PPOJALAgent(
+            obs_dim=obs_dim,
+            num_robots=self.num_robots,
+            a_max=spec.a_max,
+            c_max=spec.c_max,
+            global_dim=spec.global_dim,
+            per_agent_dim=spec.per_agent_dim,
+            d_ctx=spec.d_ctx,
+            num_primitives=spec.num_primitives,
+            param_dim=spec.param_dim,
+            device=device,
+        )
+        self.agent.load(spec.model_path)
+        self.agent.model.eval()
+
+        self.helper_env = JALTeamEnv(
+            networker=networker,
+            team_name=spec.team_name,
+            robot_ids=list(spec.robot_ids),
+            a_max=spec.a_max,
+            c_max=spec.c_max,
+            global_dim=spec.global_dim,
+            per_agent_dim=spec.per_agent_dim,
+            d_ctx=spec.d_ctx,
+            max_steps=spec.max_steps,
+        )
+
+        self._agent_active_mask = np.zeros(spec.a_max, dtype=np.float32)
+        self._agent_active_mask[: self.num_robots] = 1.0
+        self._context_active_mask = self.helper_env.context_active_mask.copy()
+
+    def predict_commands(self, game_state: GameState) -> list[str]:
+        obs = self.helper_env._game_state_to_obs(game_state)
+        action, _ = self.agent.sample_action(
+            obs,
+            agent_active_mask=self._agent_active_mask,
+            context_active_mask=self._context_active_mask,
+            deterministic=self.spec.deterministic,
+        )
         commands, _ = self.helper_env._action_to_commands(action, game_state)
         return commands
 
@@ -319,6 +398,30 @@ def build_aux_team_command_providers(
                 num_robots=len(robot_ids),
                 controller_type=controller_type,
             )
+            continue
+
+        if controller_type == "frozen_ppo":
+            required_keys = ["model_path", "team_name", "robot_ids"]
+            missing = [key for key in required_keys if key not in spec_data]
+            if missing:
+                raise ValueError(f"Frozen PPO spec '{spec_data.get('name', '<unnamed>')}' is missing keys: {missing}")
+
+            ppo_spec = FrozenPPOJALPolicySpec(
+                name=str(spec_data.get("name", "frozen_ppo")),
+                model_path=str(spec_data["model_path"]),
+                team_name=str(spec_data["team_name"]),
+                robot_ids=list(spec_data["robot_ids"]),
+                a_max=int(spec_data.get("a_max", 5)),
+                c_max=int(spec_data.get("c_max", 7)),
+                global_dim=int(spec_data.get("global_dim", 6)),
+                per_agent_dim=int(spec_data.get("per_agent_dim", 10)),
+                d_ctx=int(spec_data.get("d_ctx", 7)),
+                num_primitives=int(spec_data.get("num_primitives", 8)),
+                param_dim=int(spec_data.get("param_dim", 5)),
+                max_steps=int(spec_data.get("max_steps", 200)),
+                deterministic=bool(spec_data.get("deterministic", True)),
+            )
+            controllers[ppo_spec.team_name] = FrozenPPOJALPolicyController(ppo_spec, networker, device=device)
             continue
 
         required_keys = ["model_path", "team_name", "robot_ids"]
