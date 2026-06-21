@@ -378,6 +378,73 @@
         "goalie_possession_dist": 2.0
       }
     },
+    "stage3_defender": {
+      "description": "STAGE 3 — DRIBBLE PAST A DEFENDER. 1 trained attacker vs 1 scripted goal-side container defender (robot 2) + 1 scripted goalie (robot 1). Builds in-memory on the stage2c gap-shot+dribble policy (run after stage2c; to run standalone set top-level load_model to models/ppo_jal_expandable/stage2c_goalie_balance_complete.pt). The defender holds the direct ball->goal lane and mirrors the ball, so a shot straight at goal earns nothing — use_defender_lane_gate multiplies the kick bonus AND the dense aim gates by how clear the shot lane is of the defender, and defender_lane_penalty punishes kicking through it. dribble_target_quality is now defender-aware (positional_shot_quality = keeper-gap x lane-clear), so dribble_to is rewarded for moving the ball to a spot that opens an angle past BOTH the keeper and the defender; the post-dribble combo bonus then pays the dribble->shoot sequence. The defender is observed via a second opponent context slot (num_opponents=2). Ball spawns in the attacking third (x=[25,34], y=+/-10). Budget 400k.",
+      "num_robots": 1,
+      "timesteps": 400000,
+      "robot_ids": [1],
+      "team_config": "team_config_stage3.json",
+      "aux_team_policies": [
+        {
+          "controller_type": "goalie",
+          "team_name": "TeamB",
+          "robot_ids": [1],
+          "side": "right"
+        },
+        {
+          "controller_type": "defender",
+          "team_name": "TeamB",
+          "robot_ids": [2],
+          "side": "right"
+        }
+      ],
+      "disabled_actions": ["goto"],
+      "spawn_robot_at_ball": false,
+      "random_ball_x": true,
+      "random_ball_x_range": [25.0, 34.0],
+      "random_ball_y": true,
+      "random_ball_y_range": [-10.0, 10.0],
+      "random_spawn_theta": true,
+      "random_spawn_theta_range_deg": [-180.0, 180.0],
+      "invalid_action_penalty": 0.5,
+      "reward_config_overrides": {
+        "has_ball_bonus": 0.05,
+        "near_ball_bonus": 0.05,
+        "approach_weight": 1.0,
+        "step_bonus": -0.1,
+        "goal_progress_weight": 2.0,
+        "goal_progress_clip": 1.5,
+        "ball_speed_bonus_weight": 2.0,
+        "ball_speed_threshold": 0.2,
+        "ball_speed_clip": 2.0,
+        "goal_reward": 70.0,
+        "alignment_weight": 3.0,
+        "alignment_near_ball_only": false,
+        "alignment_has_ball_only": true,
+        "kick_aim_bonus_weight": 20.0,
+        "bad_aim_kick_penalty": 1.0,
+        "bad_aim_grad_scale": 15.0,
+        "use_goalie_aim_gate": true,
+        "goalie_gap_min_quality": 0.3,
+        "kick_into_keeper_penalty": 1.0,
+        "goalie_gap_blend_center": 0.0,
+        "use_defender_lane_gate": true,
+        "defender_lane_block_dist": 2.6,
+        "defender_lane_penalty": 1.0,
+        "defender_lane_min_quality": 0.3,
+        "dribble_target_progress_weight": 1.0,
+        "dribble_target_progress_clip": 0.5,
+        "dribble_target_quality_weight": 3.0,
+        "dribble_active_bonus": 0.03,
+        "post_dribble_kick_bonus": 8.0,
+        "post_dribble_kick_combo_window": 8,
+        "post_dribble_kick_quality_scale": true,
+        "opponent_near_ball_penalty": -0.3,
+        "opponent_near_ball_threshold": 3.0,
+        "kick_near_goalie_penalty": 1.0,
+        "goalie_possession_dist": 2.0
+      }
+    },
     "stage4_2v2": {
       "description": "STAGE 4 — 2v2. 1 RL attacker + 1 HC goalie (our side) vs Stage 3 frozen + HC goalie. Teaches attacker to work with own goalie (receive clearances, positioning after saves, ball recovery).",
       "num_robots": 1,

@@ -32,7 +32,11 @@ import torch
 from ai_interface.algorithms.ppo_jal import PPOJALAgent, PRIMITIVE_NAMES, NUM_PRIMITIVES
 from ai_interface.envs.JAL_env import JALTeamEnv
 from ai_interface.trainers.base_trainer import BaseTrainer
-from ai_interface.trainers.policy_control import ScriptedTeamCommandProvider, GoalieCommandProvider
+from ai_interface.trainers.policy_control import (
+    ScriptedTeamCommandProvider,
+    GoalieCommandProvider,
+    DefenderCommandProvider,
+)
 from networking.networker import Networker, TeamInfo
 
 
@@ -184,6 +188,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         robot_ids: List[int],
         stage_config: Dict[str, Any],
         opponent_team_name: Optional[str] = None,
+        num_opponents: int = 1,
     ) -> JALTeamEnv:
         def _stage_or_top(key, default):
             if key in stage_config:
@@ -228,6 +233,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
             reward_config_overrides=dict(reward_config_overrides) if reward_config_overrides else None,
             opponent_team_name=opponent_team_name,
+            num_opponents=int(num_opponents),
             own_goalie_robot_id=int(own_goalie_robot_id) if own_goalie_robot_id is not None else None,
         )
 
@@ -244,14 +250,17 @@ class PPOJALCurriculumTrainer(BaseTrainer):
 
         # Opponent info: second team in team_infos when they have robots.
         opponent_team_name: Optional[str] = None
+        num_opponents = 1
         if len(team_infos) > 1 and team_infos[1].n_players > 0:
             opponent_team_name = team_infos[1].name
+            num_opponents = int(team_infos[1].n_players)
 
         if self.networker is None:
             self.networker = self._build_networker(team_infos, 0)
 
         self.env = self._build_env(
             self.networker, team_name, robot_ids, stage_config, opponent_team_name,
+            num_opponents=num_opponents,
         )
 
         self.logger.info(
@@ -278,8 +287,10 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         team_name = self.config.get("team_name") or team_infos[0].name
 
         opponent_team_name: Optional[str] = None
+        num_opponents = 1
         if len(team_infos) > 1 and team_infos[1].n_players > 0:
             opponent_team_name = team_infos[1].name
+            num_opponents = int(team_infos[1].n_players)
 
         # Shut down any previously open networkers before recreating.
         for nw in self.networkers:
@@ -295,7 +306,10 @@ class PPOJALCurriculumTrainer(BaseTrainer):
 
         for idx in range(num_envs):
             nw = self._build_networker(team_infos, idx)
-            env = self._build_env(nw, team_name, robot_ids, stage_config, opponent_team_name)
+            env = self._build_env(
+                nw, team_name, robot_ids, stage_config, opponent_team_name,
+                num_opponents=num_opponents,
+            )
             self.networkers.append(nw)
             self.envs.append(env)
             self.logger.info(
@@ -342,6 +356,16 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 ctrl = GoalieCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
                 self.logger.info(
                     "Aux controller: goalie team=%s robot_id=%d side=%s",
+                    team_name, robot_id, side,
+                )
+                self._aux_controllers.append(ctrl)
+
+            elif controller_type == "defender":
+                robot_id = int(robot_ids[0]) if robot_ids else 2
+                side = str(spec.get("side", "right"))
+                ctrl = DefenderCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
+                self.logger.info(
+                    "Aux controller: defender team=%s robot_id=%d side=%s",
                     team_name, robot_id, side,
                 )
                 self._aux_controllers.append(ctrl)
@@ -815,7 +839,11 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         rollout_size = int(self.agent.hparams.get("rollout_size", 4096))
 
         param_active_mask = np.zeros(self.agent.param_dim, dtype=np.float32)
-        if "goto" not in disabled_actions:
+        # Dx,Dy feed both goto and dribble_to targets — keep them active if EITHER
+        # is enabled (matches the single-env loop). Without the dribble_to check a
+        # goto-disabled/dribble-enabled stage (2/3) would mask off the very params
+        # dribble_to needs to aim its target.
+        if "goto" not in disabled_actions or "dribble_to" not in disabled_actions:
             param_active_mask[0] = 1.0
             param_active_mask[1] = 1.0
         if "turn" not in disabled_actions:

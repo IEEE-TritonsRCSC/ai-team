@@ -30,7 +30,9 @@ from ai_interface.envs.reward import (
     evaluate_reward,
     extract_opponent_positions,
     goalie_gap_quality,
+    lane_clear_quality,
     positional_gap_quality,
+    positional_shot_quality,
 )
 from networking.networker import Networker
 from networking.data_utils import GameState
@@ -79,6 +81,7 @@ class JALTeamEnv(gym.Env):
         reward_config_overrides: Optional[Dict[str, float]] = None,
         some_arg=None,
         opponent_team_name: Optional[str] = None,
+        num_opponents: int = 1,
         own_goalie_robot_id: Optional[int] = None,
         ):
 
@@ -183,6 +186,11 @@ class JALTeamEnv(gym.Env):
             )
         # Opponent team name for filling context slots (slot 1 = opp goalie).
         self.opponent_team_name: Optional[str] = opponent_team_name
+        # How many opponent context slots to activate/fill (slots 1..num_opponents).
+        # 1 = goalie only (stages 1-2); 2 = goalie + defender (stage 3); the
+        # backbone is count-agnostic so this just toggles which context slots the
+        # attention attends to, no rebuild. Capped to the available context slots.
+        self.num_opponents: int = max(1, int(num_opponents))
         # Own goalie robot_id (Stage 4+): friendly HC goalie on our team, not RL-controlled.
         self.own_goalie_robot_id: Optional[int] = (
             int(own_goalie_robot_id) if own_goalie_robot_id is not None else None
@@ -197,7 +205,11 @@ class JALTeamEnv(gym.Env):
         if self.own_goalie_robot_id is not None:
             self.context_active_mask[0] = 1.0  # slot 0 = own goalie
         if self.opponent_team_name is not None:
-            self.context_active_mask[1] = 1.0  # slot 1 = opp goalie
+            # Slots 1..num_opponents = opponents (slot 1 = goalie, slot 2 = defender, …).
+            for k in range(self.num_opponents):
+                slot = 1 + k
+                if slot < self.c_max:
+                    self.context_active_mask[slot] = 1.0
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
         self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
 
@@ -618,6 +630,20 @@ class JALTeamEnv(gym.Env):
         goalie_gap_blend_center = float(
             getattr(self.reward_config, "goalie_gap_blend_center", 0.0)
         )
+        # Stage 3: defender lane gate. The placement bonus (and dense gates) are
+        # additionally scaled by how clear the shot lane is of the non-goalie
+        # defender; a kick straight through the defender pays nothing and incurs a
+        # one-shot penalty. Independent of the keeper gate (the two multiply).
+        use_defender_gate = bool(getattr(self.reward_config, "use_defender_lane_gate", False))
+        defender_lane_block_dist = float(
+            getattr(self.reward_config, "defender_lane_block_dist", 2.6)
+        )
+        defender_lane_penalty = float(
+            getattr(self.reward_config, "defender_lane_penalty", 0.0)
+        )
+        defender_lane_min_quality = float(
+            getattr(self.reward_config, "defender_lane_min_quality", 0.3)
+        )
         if (kick_aim_weight > 0.0 or bad_aim_penalty > 0.0) and current_game_state is not None:
             per_robot = action_info.get("per_robot", [])
             pose_by_id: Dict[int, Any] = {}
@@ -628,6 +654,13 @@ class JALTeamEnv(gym.Env):
                 self._opponent_goalie_pose(current_game_state) if use_goalie_gate else None
             )
             gk_y = float(goalie_pose[1]) if goalie_pose is not None else None
+            defender_pose_kick = (
+                self._opponent_defender_pose(current_game_state) if use_defender_gate else None
+            )
+            defender_xy_kick = (
+                (float(defender_pose_kick[0]), float(defender_pose_kick[1]))
+                if defender_pose_kick is not None else None
+            )
             kick_ball_pos = getattr(current_game_state, "ball_pos", None)
             for info_i in per_robot:
                 if info_i.get("action_type") != "kick":
@@ -671,6 +704,20 @@ class JALTeamEnv(gym.Env):
                     continue
                 bad_aim = aim_quality <= 0.0
                 gap_quality: Optional[float] = None
+                # Defender lane clearance for this kick (1.0 = clear / gate off).
+                lane_clear = 1.0
+                if (
+                    use_defender_gate
+                    and defender_xy_kick is not None
+                    and kick_ball_pos is not None
+                    and len(kick_ball_pos) >= 2
+                ):
+                    lane_clear = lane_clear_quality(
+                        (float(kick_ball_pos[0]), float(kick_ball_pos[1])),
+                        (FIELD_X[1], predicted_y_at_goal_line),
+                        defender_xy_kick,
+                        defender_lane_block_dist,
+                    )
                 if bad_aim:
                     if bad_aim_penalty > 0.0:
                         reward -= _miss_penalty(predicted_y_at_goal_line)
@@ -685,7 +732,7 @@ class JALTeamEnv(gym.Env):
                         (1.0 - goalie_gap_blend_center) * gap_quality
                         + goalie_gap_blend_center * aim_quality
                     )
-                    reward += blended_quality * kick_aim_weight
+                    reward += blended_quality * lane_clear * kick_aim_weight
                     if (
                         gap_quality < goalie_gap_min_quality
                         and kick_into_keeper_penalty > 0.0
@@ -693,7 +740,16 @@ class JALTeamEnv(gym.Env):
                         # On target but into the keeper's cover.
                         reward -= kick_into_keeper_penalty
                 else:
-                    reward += aim_quality * kick_aim_weight
+                    reward += aim_quality * lane_clear * kick_aim_weight
+                # Stage 3: penalise an on-target kick fired through the defender.
+                if (
+                    not bad_aim
+                    and use_defender_gate
+                    and defender_xy_kick is not None
+                    and lane_clear < defender_lane_min_quality
+                    and defender_lane_penalty > 0.0
+                ):
+                    reward -= defender_lane_penalty
                 # Diagnostic log: confirms predicted_y vs the actual episode
                 # outcome. If most ball_in_penalty_off_target episodes show
                 # high aim_quality at fire, the divergence is on the physics
@@ -701,11 +757,12 @@ class JALTeamEnv(gym.Env):
                 self.logger.info(
                     "Kick fired: robot=(%.2f, %.2f, %.1f°)  "
                     "predicted_y=%.2f  aim_quality=%.2f  bad_aim=%s  "
-                    "gk_y=%s  gap_quality=%s",
+                    "gk_y=%s  gap_quality=%s  lane_clear=%s",
                     rx, ry, theta_deg, predicted_y_at_goal_line,
                     aim_quality, bad_aim,
                     f"{gk_y:.2f}" if gk_y is not None else "N/A",
                     f"{gap_quality:.2f}" if gap_quality is not None else "N/A",
+                    f"{lane_clear:.2f}" if use_defender_gate else "N/A",
                 )
 
         # One-shot bonus when dribble_to is first selected and the target
@@ -716,6 +773,8 @@ class JALTeamEnv(gym.Env):
             getattr(self.reward_config, "dribble_target_quality_weight", 0.0)
         )
         if dribble_quality_weight > 0.0 and current_game_state is not None:
+            # NOTE: `step()` has no local `ball_pos`; read the current ball here.
+            dribble_ball_pos = getattr(current_game_state, "ball_pos", None)
             for info_i in action_info.get("per_robot", []):
                 if info_i.get("action_type") != "dribble_to":
                     continue
@@ -723,19 +782,36 @@ class JALTeamEnv(gym.Env):
                 if self._prev_action_was_dribble_to.get(rid, False):
                     continue
                 target = self.dribble_to_target.get(rid)
-                if target is None or ball_pos is None:
+                if target is None or dribble_ball_pos is None or len(dribble_ball_pos) < 2:
                     continue
                 gk_pose = self._opponent_goalie_pose(current_game_state)
                 if gk_pose is None:
                     continue
                 gk_y_val = float(gk_pose[1])
-                current_gap = positional_gap_quality(
-                    (float(ball_pos[0]), float(ball_pos[1])),
-                    gk_y_val, goal_half_height,
-                )
-                target_gap = positional_gap_quality(
-                    target, gk_y_val, goal_half_height,
-                )
+                ball_xy_now = (float(dribble_ball_pos[0]), float(dribble_ball_pos[1]))
+                if use_defender_gate:
+                    # Stage 3: reward dribbling to a spot that opens a lane past
+                    # BOTH the keeper and the defender, not just the keeper.
+                    defender_pose_d = self._opponent_defender_pose(current_game_state)
+                    defender_xy_d = (
+                        (float(defender_pose_d[0]), float(defender_pose_d[1]))
+                        if defender_pose_d is not None else None
+                    )
+                    current_gap = positional_shot_quality(
+                        ball_xy_now, gk_y_val, defender_xy_d,
+                        goal_half_height, defender_lane_block_dist,
+                    )
+                    target_gap = positional_shot_quality(
+                        target, gk_y_val, defender_xy_d,
+                        goal_half_height, defender_lane_block_dist,
+                    )
+                else:
+                    current_gap = positional_gap_quality(
+                        ball_xy_now, gk_y_val, goal_half_height,
+                    )
+                    target_gap = positional_gap_quality(
+                        target, gk_y_val, goal_half_height,
+                    )
                 delta = max(0.0, target_gap - current_gap)
                 if delta > 0.0:
                     reward += delta * dribble_quality_weight
@@ -1123,7 +1199,11 @@ class JALTeamEnv(gym.Env):
                     obs[own_gk_off + 3] = gk_vx / self._NORM_VEL
                     obs[own_gk_off + 4] = gk_vy / self._NORM_VEL
 
-            # Context slot 1+: opponent robots. Only fill when an opponent team is configured.
+            # Context slots 1..num_opponents: opponent robots, ordered by robot_id
+            # (slot 1 = goalie robot_id=1 by convention, slot 2 = defender id=2, …).
+            # Filling additional opponents lets the attacker actually observe the
+            # defender it must dribble around (stage 3). Only fill when an opponent
+            # team is configured.
             if self.opponent_team_name is not None:
                 opp_pose_entries = game_state.robot_poses.get(self.opponent_team_name, [])
                 opp_pose_by_id: Dict[int, Any] = {}
@@ -1131,22 +1211,24 @@ class JALTeamEnv(gym.Env):
                     if isinstance(entry, dict):
                         opp_pose_by_id.update(entry)
 
-                # Context slot 1: first opponent robot (goalie robot_id=1 by convention).
-                first_opp_id = min(opp_pose_by_id.keys()) if opp_pose_by_id else None
-                if first_opp_id is not None:
-                    opp_pose = opp_pose_by_id[first_opp_id]
+                sorted_opp_ids = sorted(opp_pose_by_id.keys())
+                for k, opp_id in enumerate(sorted_opp_ids[: self.num_opponents]):
+                    slot = 1 + k
+                    if slot >= self.c_max:
+                        break
+                    opp_pose = opp_pose_by_id[opp_id]
                     opp_x = float(opp_pose[0])
                     opp_y = float(opp_pose[1])
                     opp_theta = float(np.deg2rad(opp_pose[2]))
-                    prev_opp_xy = self.prev_opp_pose_by_id.get(first_opp_id)
+                    prev_opp_xy = self.prev_opp_pose_by_id.get(opp_id)
                     if prev_opp_xy is not None:
                         opp_vx = float(opp_x - prev_opp_xy[0])
                         opp_vy = float(opp_y - prev_opp_xy[1])
                     else:
                         opp_vx = opp_vy = 0.0
-                    self.prev_opp_pose_by_id[first_opp_id] = np.array([opp_x, opp_y], dtype=np.float32)
+                    self.prev_opp_pose_by_id[opp_id] = np.array([opp_x, opp_y], dtype=np.float32)
 
-                    opp_slot_off = ctx_base + 1 * self.d_ctx  # slot 1
+                    opp_slot_off = ctx_base + slot * self.d_ctx
                     obs[opp_slot_off + 0] = opp_x / self._NORM_POS_X
                     obs[opp_slot_off + 1] = opp_y / self._NORM_POS_Y
                     obs[opp_slot_off + 2] = opp_theta / self._NORM_THETA
@@ -1576,6 +1658,11 @@ class JALTeamEnv(gym.Env):
         # Stage 2: goalie y for gap-based aim gating (None in 1v0 stages) and
         # command-level dribble session state for envelope-gated dribble reward.
         goalie_pose = self._opponent_goalie_pose(current_game_state)
+        # Stage 3: non-goalie defender position for lane-clearance gating.
+        defender_pose = (
+            self._opponent_defender_pose(current_game_state)
+            if self.reward_config.use_defender_lane_gate else None
+        )
         anchor = self.dribble_anchor.get(robot_id)
         dribble_anchor_dist = None
         if anchor is not None:
@@ -1608,6 +1695,10 @@ class JALTeamEnv(gym.Env):
             prev_ball_pos=prev_ball_pos,
             prev_facing_goal_cos=prev_facing_goal_cos,
             goalie_y=(float(goalie_pose[1]) if goalie_pose is not None else None),
+            defender_pos=(
+                (float(defender_pose[0]), float(defender_pose[1]))
+                if defender_pose is not None else None
+            ),
             is_dribbling=bool(self.dribble_session_active.get(robot_id, False)),
             dribble_anchor_dist=dribble_anchor_dist,
             dribble_target=self.dribble_to_target.get(robot_id),
@@ -1668,6 +1759,43 @@ class JALTeamEnv(gym.Env):
                         best_dist = d
                         best_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
         return best_pose
+
+    def _opponent_defender_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
+        """Return (x, y, theta_deg) of the non-goalie defender nearest the ball, or None.
+
+        The keeper is the opponent nearest the opponent goal centre (see
+        `_opponent_goalie_pose`); the defender is the remaining opponent closest to
+        the ball — the one whose lane coverage actually matters for the current
+        shot. Returns None when there are fewer than two opponents (stages 1-2).
+        """
+
+        if game_state is None:
+            return None
+        opp_poses: List[Tuple[float, float, float]] = []
+        for team_name, entries in getattr(game_state, "robot_poses", {}).items():
+            if team_name == self.team_name:
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for _rid, pose in entry.items():
+                    if pose is None or len(pose) < 3:
+                        continue
+                    opp_poses.append((float(pose[0]), float(pose[1]), float(pose[2])))
+        if len(opp_poses) < 2:
+            return None
+        keeper = min(
+            opp_poses,
+            key=lambda p: math.hypot(p[0] - float(GOAL_R[0]), p[1] - float(GOAL_R[1])),
+        )
+        rest = [p for p in opp_poses if p is not keeper]
+        if not rest:
+            return None
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is not None and len(ball_pos) >= 2:
+            bx, by = float(ball_pos[0]), float(ball_pos[1])
+            return min(rest, key=lambda p: math.hypot(p[0] - bx, p[1] - by))
+        return rest[0]
 
     def _own_goalie_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) of our own HC goalie, or None."""

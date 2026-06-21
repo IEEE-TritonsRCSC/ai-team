@@ -85,6 +85,25 @@ class RewardConfig:
     # from the stage-1 checkpoint; fade to 0.0 (pure gap) as the stage matures.
     goalie_gap_blend_center: float = 0.0
 
+    # ---- Stage 3: defender lane awareness (1 attacker vs 1 defender + GK) ----
+    # When True, shot AND dribble-target quality are additionally multiplied by
+    # how clear the straight lane to goal is of the non-goalie DEFENDER. A shot
+    # whose lane passes within `defender_lane_block_dist` of the defender earns
+    # proportionally less; a lane straight through the defender earns nothing.
+    # This is the core signal that teaches the attacker to dribble to an angle
+    # the defender doesn't cover before shooting. Falls back to a no-op (lane
+    # clear = 1) whenever no defender pose is available, so it is independent of
+    # use_goalie_aim_gate (the two qualities multiply together).
+    use_defender_lane_gate: bool = False
+    # Distance (sim units) from the defender to the shot segment below which the
+    # lane is considered (partially) blocked. Mirrors AttackerConfig.lane_block_dist.
+    defender_lane_block_dist: float = 2.6
+    # One-shot penalty (applied in JAL_env) when a kick fires through a lane the
+    # defender blocks — i.e. lane clearance below `defender_lane_min_quality`.
+    # Parallels kick_into_keeper_penalty for the keeper. 0.0 disables.
+    defender_lane_penalty: float = 0.0
+    defender_lane_min_quality: float = 0.3
+
     # ---- Stage 2: dribble_to target quality and progress ----
     # Dense per-step reward for ball moving toward the dribble_to target.
     # Positive = ball got closer. Teaches WHERE to target by rewarding
@@ -171,6 +190,9 @@ class RewardInputs:
     prev_facing_goal_cos: Optional[float] = None
     # Stage 2: opponent goalie y (None when no goalie is on the field).
     goalie_y: Optional[float] = None
+    # Stage 3: (x, y) of the non-goalie defender whose lane coverage matters for
+    # the current shot. None when there is no defender (e.g. stages 1-2).
+    defender_pos: Optional[Tuple[float, float]] = None
     # True while the dribble_to phase machine is in GRAB or CARRY.
     is_dribbling: bool = False
     dribble_anchor_dist: Optional[float] = None
@@ -219,6 +241,9 @@ class RewardIntermediates:
     ball_out_of_bounds: bool
     # Stage 2 fields (defaults keep stage-1 callers untouched).
     goalie_y: Optional[float] = None
+    # Stage 3: clearance (0..1) of the actual shot lane (ball-velocity projection)
+    # from the defender. 1.0 = clear / no defender; multiplies the dense aim gates.
+    defender_lane_clear: float = 1.0
     # True when the current action is dribble_to (regardless of phase).
     dribble_to_active: bool = False
     # Per-step ball-to-dribble-target distance reduction (positive = closer).
@@ -310,6 +335,67 @@ def positional_gap_quality(
         return 0.0
     gap = abs(py - float(goalie_y))
     return float(min(gap / goal_half_height, 1.0))
+
+
+def _distance_point_to_segment(
+    point: Tuple[float, float],
+    seg_a: Tuple[float, float],
+    seg_b: Tuple[float, float],
+) -> float:
+    """Shortest distance from `point` to the segment seg_a→seg_b."""
+
+    px, py = float(point[0]), float(point[1])
+    ax, ay = float(seg_a[0]), float(seg_a[1])
+    bx, by = float(seg_b[0]), float(seg_b[1])
+    vx, vy = bx - ax, by - ay
+    seg_len_sq = vx * vx + vy * vy
+    if seg_len_sq <= 1e-9:
+        return float(math.hypot(px - ax, py - ay))
+    t = ((px - ax) * vx + (py - ay) * vy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    cx, cy = ax + t * vx, ay + t * vy
+    return float(math.hypot(px - cx, py - cy))
+
+
+def lane_clear_quality(
+    ball_pos: Tuple[float, float],
+    aim_point: Tuple[float, float],
+    defender_pos: Optional[Tuple[float, float]],
+    block_dist: float,
+) -> float:
+    """Return 0..1 for how clear the ball→aim_point lane is of the defender.
+
+    1.0 when the defender is at least `block_dist` from the shot segment, ramping
+    linearly to 0.0 when the defender sits exactly on the line. No defender (or a
+    non-positive block_dist) means a fully clear lane.
+    """
+
+    if defender_pos is None or block_dist <= 0.0:
+        return 1.0
+    d = _distance_point_to_segment(defender_pos, ball_pos, aim_point)
+    return float(max(0.0, min(1.0, d / float(block_dist))))
+
+
+def positional_shot_quality(
+    point: Tuple[float, float],
+    goalie_y: float,
+    defender_pos: Optional[Tuple[float, float]],
+    goal_half_height: float,
+    lane_block_dist: float,
+) -> float:
+    """Keeper-gap quality of a shot from `point`, discounted by the defender lane.
+
+    Combines `positional_gap_quality` (lateral separation from the keeper) with
+    `lane_clear_quality` for the straight lane from `point` to the goal centre.
+    Used to score dribble_to targets in Stage 3: a good target is one that is
+    BOTH off the keeper's cover AND off the defender's covered lane.
+    """
+
+    base = positional_gap_quality(point, goalie_y, goal_half_height)
+    if base <= 0.0:
+        return 0.0
+    lane = lane_clear_quality(point, (FIELD_X[1], 0.0), defender_pos, lane_block_dist)
+    return float(base * lane)
 
 
 def extract_opponent_positions(
@@ -416,13 +502,41 @@ def calculate_reward_intermediates(
 
     dribble_target_quality_delta = None
     if dribble_to_active and inputs.goalie_y is not None:
-        current_gap = positional_gap_quality(
-            inputs.ball_pos, inputs.goalie_y, config.goal_half_height,
+        if config.use_defender_lane_gate:
+            # Stage 3: target quality also accounts for whether the dribble spot
+            # opens a lane the defender doesn't cover, not just the keeper gap.
+            current_q = positional_shot_quality(
+                inputs.ball_pos, inputs.goalie_y, inputs.defender_pos,
+                config.goal_half_height, config.defender_lane_block_dist,
+            )
+            target_q = positional_shot_quality(
+                inputs.dribble_target, inputs.goalie_y, inputs.defender_pos,
+                config.goal_half_height, config.defender_lane_block_dist,
+            )
+        else:
+            current_q = positional_gap_quality(
+                inputs.ball_pos, inputs.goalie_y, config.goal_half_height,
+            )
+            target_q = positional_gap_quality(
+                inputs.dribble_target, inputs.goalie_y, config.goal_half_height,
+            )
+        dribble_target_quality_delta = float(max(0.0, target_q - current_q))
+
+    # Stage 3: clearance of the ACTUAL shot lane (ball-velocity projection to the
+    # goal line) from the defender. Multiplies into the dense aim gates so pushing
+    # the ball straight at goal through the defender earns essentially nothing.
+    defender_lane_clear = 1.0
+    if (
+        config.use_defender_lane_gate
+        and inputs.defender_pos is not None
+        and predicted_y_at_goal_line is not None
+    ):
+        defender_lane_clear = lane_clear_quality(
+            (bx, by),
+            (FIELD_X[1], float(predicted_y_at_goal_line)),
+            inputs.defender_pos,
+            config.defender_lane_block_dist,
         )
-        target_gap = positional_gap_quality(
-            inputs.dribble_target, inputs.goalie_y, config.goal_half_height,
-        )
-        dribble_target_quality_delta = float(max(0.0, target_gap - current_gap))
 
     # ---- Stage 4: own-goalie coordination ----
     own_goalie_has_ball = False
@@ -516,6 +630,7 @@ def calculate_reward_intermediates(
         robot_out_of_bounds=robot_out_of_bounds,
         ball_out_of_bounds=ball_out_of_bounds,
         goalie_y=inputs.goalie_y,
+        defender_lane_clear=defender_lane_clear,
         dribble_to_active=dribble_to_active,
         dribble_target_progress=dribble_target_progress,
         dribble_target_quality_delta=dribble_target_quality_delta,
@@ -546,15 +661,21 @@ def _dense_aim_quality(
     """
 
     if config.use_goalie_aim_gate:
-        return goalie_gap_quality(
+        quality = goalie_gap_quality(
             intermediates.predicted_y_at_goal_line,
             intermediates.goalie_y,
             config.goal_half_height,
         )
-    return aim_quality_from_prediction(
-        intermediates.predicted_y_at_goal_line,
-        config.goal_half_height,
-    )
+    else:
+        quality = aim_quality_from_prediction(
+            intermediates.predicted_y_at_goal_line,
+            config.goal_half_height,
+        )
+    # Stage 3: a fast/progressing ball aimed through the defender's lane is not a
+    # real chance — discount the dense gates by how clear that lane is.
+    if config.use_defender_lane_gate:
+        quality *= intermediates.defender_lane_clear
+    return quality
 
 
 def calculate_reward(

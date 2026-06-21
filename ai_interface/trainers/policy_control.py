@@ -207,6 +207,49 @@ class GoalieCommandProvider:
         return [cmd]
 
 
+class DefenderCommandProvider:
+    """Drive a single scripted goal-side container defender (Stage 3).
+
+    Unlike the goalie (robot 1), the defender may sit at any robot_id, so the
+    returned command list is padded with leading `None`s to place the command at
+    the defender's 1-indexed unum slot (the simulator routes list position →
+    unum and skips `None` entries), leaving the goalie's own slot untouched.
+    """
+
+    def __init__(self, team_name: str, robot_id: int, side: str = "right"):
+        from ai_interface.defender import Defender
+        self.team_name = team_name
+        self.robot_id = int(robot_id)
+        self.num_robots = 1
+        self._defender = Defender(teamname=team_name, unum=self.robot_id, side=side)
+
+    def _slot_list(self, cmd: str) -> list:
+        return [None] * (self.robot_id - 1) + [cmd]
+
+    def predict_commands(self, game_state: GameState) -> list:
+        if game_state is None:
+            return self._slot_list("turn 0")
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is None:
+            return self._slot_list("turn 0")
+        defender_pose = None
+        for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []):
+            if not isinstance(entry, dict):
+                continue
+            pose = entry.get(self.robot_id)
+            if pose is not None and len(pose) >= 3:
+                defender_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                break
+        if defender_pose is None:
+            return self._slot_list("turn 0")
+        cmd = self._defender.action(
+            ball_pos=ball_pos,
+            defender_pose=defender_pose,
+            game_state=game_state,
+        )
+        return self._slot_list(cmd)
+
+
 class ScriptedTeamCommandProvider:
     """Wrap a hard-coded AI implementation behind the TeamCommandProvider protocol."""
 
