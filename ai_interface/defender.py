@@ -101,13 +101,15 @@ class Defender(Player):
         return cmd if cmd != "done" else "turn 0"
 
     def _clear(self, self_pose_rad, ball_pos: Tuple[float, float]) -> str:
-        """Turn to face away from the defended goal, then kick the ball clear."""
-        dx, dy, theta = self_pose_rad
+        """Catch the ball then kick it clear toward the opposite goal.
+
+        Uses Player.kick() which sequences: face ball → catch (dribbling=False),
+        then turn to clear_angle → kick (dribbling=True), updating self.dribbling
+        automatically each call.
+        """
+        dx, dy, _ = self_pose_rad
         clear_angle = math.atan2(self.clear_goal[1] - dy, self.clear_goal[0] - dx)
-        diff = normalize_angle(clear_angle - theta)
-        if abs(diff) > math.radians(8.0):
-            return f"turn {diff}"
-        return "kick 100 0"
+        return self.kick(clear_angle, self_pose_rad, ball_pos)
 
     def action(self, ball_pos: Tuple[float, float],
                defender_pose: Tuple[float, float, float],
@@ -141,6 +143,10 @@ class Defender(Player):
                 self_pose_rad, bx, by, game_state,
                 margin=0.2, face=(bx, by), speed=CONTAIN_SPEED, full_speed=True,
             )
+
+        # Not challenging: clear any stale dribble state so the next _clear()
+        # starts fresh with the face-ball→catch phase.
+        self.dribbling = False
 
         # CONTAIN: hold a point on the ball->goal line, goal-side of the ball.
         gx, gy = float(self.goal[0]), float(self.goal[1])
