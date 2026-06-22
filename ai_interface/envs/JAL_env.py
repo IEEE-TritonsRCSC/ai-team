@@ -18,7 +18,7 @@ import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
 from ai_interface.utils.basic_commands import (
-    goto, approach_ball, dribble_to, DribbleState,
+    goto, approach_ball, dribble_to, kick, DribbleState,
     DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_GRAB, DRIBBLE_PHASE_RELEASE,
 )
 from ai_interface.constants.field_constants import *
@@ -1497,7 +1497,17 @@ class JALTeamEnv(gym.Env):
                     if kick_blocked_bad_aim:
                         executed_action_type = "turn"
                 else:
-                    command = "kick 100 0"
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    ball_xy = np.array([float(ball_pos[0]), float(ball_pos[1])], dtype=np.float32)
+                    goal_angle = np.arctan2(
+                        float(GOAL_R[1]) - float(pose[1]),
+                        float(GOAL_R[0]) - float(pose[0]),
+                    )
+                    command = kick(self_pose, ball_xy, goal_angle, kick_power=100.0)
                     kick_fired = True
                     # A fired kick releases the ball; reset dribble phase machine.
                     dribble_st.reset()
