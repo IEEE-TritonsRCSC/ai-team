@@ -1,6 +1,6 @@
 diff -u rcssserver-19.0.0/configure.ac rcssserver-19.0.0/configure.ac
---- rcssserver-19.0.0/configure.ac	2024-03-24 19:29:45
-+++ rcssserver-19.0.0/configure.ac	2025-12-20 15:29:14
+--- rcssserver-19.0.0/configure.ac
++++ rcssserver-19.0.0/configure.ac
 @@ -85,18 +85,6 @@
  AC_FUNC_FORK
  AC_FUNC_MALLOC

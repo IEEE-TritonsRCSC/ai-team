@@ -1,6 +1,6 @@
 diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
---- rcssserver-19.0.0/src/player.cpp	2024-03-24 19:29:40
-+++ rcssserver-19.0.0/src/player.cpp	2025-12-18 17:31:20
+--- rcssserver-19.0.0/src/player.cpp
++++ rcssserver-19.0.0/src/player.cpp
 @@ -1249,8 +1249,6 @@
          M_angle_body = normalize_angle( angleBodyCommitted()
                                          + ( 1.0 + drand( -M_randp, M_randp ) ) * omega );
@@ -10,7 +10,36 @@ diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
  }
  
  // void
-@@ -1535,11 +1533,11 @@
+@@ -1517,6 +1515,28 @@
+     M_stadium.kickTaken( *this, accel );
+ 
+     ++M_kick_count;
++}
++
++void
++Player::drop()
++{
++    // Release a held ball. The catch-glue patch re-pins the ball to the
++    // stadium's ball catcher every cycle (Stadium step), for goalie catches
++    // and for the field-player dribble grab alike. Clearing the catcher stops
++    // that re-pinning, so the ball is genuinely released at its current
++    // position and the player loses possession. Body command: mutually
++    // exclusive with kick/dash/catch in a cycle.
++    if ( M_command_done )
++    {
++        return;
++    }
++
++    M_command_done = true;
++
++    if ( this == M_stadium.ballCatcher() )
++    {
++        M_stadium.clearBallCatcher();
++    }
+ }
+ 
+ void
+@@ -1535,11 +1555,11 @@
      //pfr: we should only be able to catch in PlayOn mode
      //tom: actually the goalie can catch the ball in any playmode, but
      //infringements should be awarded.  Maybe later.
@@ -25,17 +54,112 @@ diff -u rcssserver-19.0.0/src/player.cpp rcssserver-19.0.0/src/player.cpp
      {
          M_state |= CATCH_FAULT;
          return;
-@@ -1674,6 +1672,7 @@
-         M_vel = PVector();
- 
-         M_stadium.ballCaught( *this );
-+        M_stadium.setLastCatcher( this );
+diff -u rcssserver-19.0.0/src/player.h rcssserver-19.0.0/src/player.h
+--- rcssserver-19.0.0/src/player.h
++++ rcssserver-19.0.0/src/player.h
+@@ -496,6 +496,7 @@
+     void kick( double power, double dir ) override;
+     void long_kick( double power, double dir ) override;
+     void goalieCatch( double dir ) override;
++    void drop() override;
+     void say( std::string message ) override;
+     /*! This function is called in the begin of each cycle
+       and in case a player sends a sense_body command. */
+diff -u rcssserver-19.0.0/src/stadium.cpp rcssserver-19.0.0/src/stadium.cpp
+--- rcssserver-19.0.0/src/stadium.cpp
++++ rcssserver-19.0.0/src/stadium.cpp
+@@ -74,6 +74,8 @@
+       M_time( 0 ),
+       M_stoppage_time( 0 ),
+       M_ball_catcher( static_cast< const Player * >( 0 ) ),
++      M_last_catcher( static_cast< Player * >( 0 ) ),
++      M_ball_caught_loc( nullptr ),
+       M_kick_off_side( LEFT ),
+       M_last_playon_start( 0 ),
+       M_game_over_wait( 0 ),
+@@ -865,14 +867,6 @@
+     //
+     // update stamina etc
+     //
+-    for ( PlayerCont::reference p : M_players )
+-    {
+-        if ( ! p->isEnabled() ) continue;
+-
+-        p->updateStamina();
+-        p->updateCapacity();
+-    }
+-
+     if ( stoppageTime() == 0
+          && time() > 0
+          && ServerParam::instance().nrNormalHalfs() > 0
+@@ -933,6 +927,10 @@
+                                            M_ball_catcher->angleBodyCommitted() );
+         M_ball->moveTo( M_ball_catcher->pos() + rpos );
      }
-     else
++
++    // ssim catch-glue: the carry foul that fired when a caught ball was moved
++    // too far from the catch location is removed here so a field-player dribble
++    // grab can carry the ball (released explicitly via the `drop` command).
+ }
+ 
+ 
+@@ -1943,9 +1941,10 @@
+               {
+                   ref->ballCaught( catcher );
+               } );
+-
++    
+     if ( playmode() == PM_FreeKick_Left
+-         || playmode() == PM_FreeKick_Right )
++         || playmode() == PM_FreeKick_Right 
++         || catcher.isGoalie() == false)
      {
+         M_ball_catcher = &catcher;
+     }
+diff -u rcssserver-19.0.0/src/stadium.h rcssserver-19.0.0/src/stadium.h
+--- rcssserver-19.0.0/src/stadium.h
++++ rcssserver-19.0.0/src/stadium.h
+@@ -120,6 +120,8 @@
+ 
+ 
+     const Player * M_ball_catcher; /* goalie who has caught ball */
++    Player * M_last_catcher; /* last player who caught ball */
++    PVector * M_ball_caught_loc; /* location where the ball was caught */
+ 
+     Side M_kick_off_side;
+ 
+@@ -267,8 +269,28 @@
+     void clearBallCatcher()
+       {
+           M_ball_catcher = static_cast< Player * >( 0 );
++      }
++
++    void setLastCatcher( Player * player )
++      {
++          if ( M_last_catcher == player ) return;
++          M_last_catcher = player;
++          PVector ball_pos = M_ball->pos();
++          M_ball_caught_loc = new PVector( ball_pos.x, ball_pos.y );
++      }
++
++    void clearLastCatcher()
++      {
++          M_last_catcher = static_cast< Player * >( 0 );
++          delete M_ball_caught_loc;
++          M_ball_caught_loc = nullptr;
+       }
+ 
++    PVector * ballCaughtLocation() const
++      {
++          return M_ball_caught_loc;
++      }
++
+     Side kickOffSide() const
+       {
+           return M_kick_off_side;
 diff -u rcssserver-19.0.0/src/referee.cpp rcssserver-19.0.0/src/referee.cpp
---- rcssserver-19.0.0/src/referee.cpp	2024-02-18 23:29:46
-+++ rcssserver-19.0.0/src/referee.cpp	2025-12-18 17:22:21
+--- rcssserver-19.0.0/src/referee.cpp
++++ rcssserver-19.0.0/src/referee.cpp
 @@ -2477,7 +2477,7 @@
  void
  CatchRef::ballCaught( const Player & catcher )
@@ -63,14 +187,15 @@ diff -u rcssserver-19.0.0/src/referee.cpp rcssserver-19.0.0/src/referee.cpp
           && pm != PM_AfterGoal_Right
           && pm != PM_TimeOver
 diff -u rcssserver-19.0.0/src/referee.h rcssserver-19.0.0/src/referee.h
---- rcssserver-19.0.0/src/referee.h	2024-02-18 23:29:46
-+++ rcssserver-19.0.0/src/referee.h	2025-12-18 17:22:11
-@@ -785,9 +785,10 @@
+--- rcssserver-19.0.0/src/referee.h
++++ rcssserver-19.0.0/src/referee.h
+@@ -784,10 +784,11 @@
+     void analyse() override;
  
      void playModeChange( PlayMode pm ) override;
- 
-+    void callFoul( const Player & tackler );
 +
++    void callFoul( const Player & tackler );
+ 
  private:
  
 -    void callFoul( const Player & tackler );
@@ -78,8 +203,8 @@ diff -u rcssserver-19.0.0/src/referee.h rcssserver-19.0.0/src/referee.h
      void callRedCard( const Player & tackler );
  
 diff -u rcssserver-19.0.0/src/serverparam.cpp rcssserver-19.0.0/src/serverparam.cpp
---- rcssserver-19.0.0/src/serverparam.cpp	2024-03-24 19:29:40
-+++ rcssserver-19.0.0/src/serverparam.cpp	2025-12-19 16:34:44
+--- rcssserver-19.0.0/src/serverparam.cpp
++++ rcssserver-19.0.0/src/serverparam.cpp
 @@ -129,18 +129,18 @@
  const int ServerParam::HALF_TIME = 300;
  const int ServerParam::DROP_TIME = 100;
@@ -187,103 +312,57 @@ diff -u rcssserver-19.0.0/src/serverparam.cpp rcssserver-19.0.0/src/serverparam.
      M_old_coach_hear = false;
  
      M_synch_mode = false;
-Only in rcssserver-19.0.0/src: serverparam.o
-diff -u rcssserver-19.0.0/src/stadium.cpp rcssserver-19.0.0/src/stadium.cpp
---- rcssserver-19.0.0/src/stadium.cpp	2024-03-24 19:29:40
-+++ rcssserver-19.0.0/src/stadium.cpp	2025-12-19 16:20:17
-@@ -74,6 +74,8 @@
-       M_time( 0 ),
-       M_stoppage_time( 0 ),
-       M_ball_catcher( static_cast< const Player * >( 0 ) ),
-+      M_last_catcher( static_cast< Player * >( 0 ) ),
-+      M_ball_caught_loc( nullptr ),
-       M_kick_off_side( LEFT ),
-       M_last_playon_start( 0 ),
-       M_game_over_wait( 0 ),
-@@ -865,14 +867,6 @@
-     //
-     // update stamina etc
-     //
--    for ( PlayerCont::reference p : M_players )
--    {
--        if ( ! p->isEnabled() ) continue;
--
--        p->updateStamina();
--        p->updateCapacity();
--    }
--
-     if ( stoppageTime() == 0
-          && time() > 0
-          && ServerParam::instance().nrNormalHalfs() > 0
-@@ -933,6 +927,19 @@
-                                            M_ball_catcher->angleBodyCommitted() );
-         M_ball->moveTo( M_ball_catcher->pos() + rpos );
-     }
+diff -u rcssserver-19.0.0/src/pcombuilder.h rcssserver-19.0.0/src/pcombuilder.h
+--- rcssserver-19.0.0/src/pcombuilder.h
++++ rcssserver-19.0.0/src/pcombuilder.h
+@@ -86,6 +86,7 @@
+     virtual void kick( double power, double dir ) = 0;
+     virtual void long_kick( double power, double dir ) = 0;
+     virtual void goalieCatch( double dir ) = 0;
++    virtual void drop() = 0;
+     virtual void say( std::string message ) = 0;
+     virtual void sense_body() = 0;
+     virtual void score() = 0;
+diff -u rcssserver-19.0.0/src/player_command_parser.ypp rcssserver-19.0.0/src/player_command_parser.ypp
+--- rcssserver-19.0.0/src/player_command_parser.ypp
++++ rcssserver-19.0.0/src/player_command_parser.ypp
+@@ -76,6 +76,7 @@
+ %token RCSS_PCOM_KICK "kick"
+ %token RCSS_PCOM_LONG_KICK "long_kick"
+ %token RCSS_PCOM_CATCH "catch"
++%token RCSS_PCOM_DROP "drop"
+ %token RCSS_PCOM_SAY "say"
+ %token RCSS_PCOM_UNQ_SAY "unquoted say"
+ %token RCSS_PCOM_SENSE_BODY "sense_body"
+@@ -138,6 +139,7 @@
+           | kick_com
+           | long_kick_com
+           | catch_com
++          | drop_com
+           | say_com
+           | sense_body_com
+           | score_com
+@@ -218,6 +220,12 @@
+             {
+               BUILDER.goalieCatch( $< m_double >3 );
+             }
++;
 +
-+    if ( M_last_catcher )
-+    {
-+        PVector ball_pos = M_ball->pos();
-+        if ( ball_pos.distance( M_last_catcher->pos() ) > ServerParam::instance().catchAreaLength() )
-+        {
-+            clearLastCatcher();
-+        }
-+        else if ( ball_pos.distance( *M_ball_caught_loc ) > ServerParam::CENTER_CIRCLE_R * 2.0 )
-+        {
-+            callFoul( static_cast<Side>(-M_last_catcher->side()), ball_pos);
-+        }
-+    }
- }
++drop_com : RCSS_PCOM_LP RCSS_PCOM_DROP RCSS_PCOM_RP
++           {
++             BUILDER.drop();
++           }
+ ;
  
- 
-@@ -1943,9 +1950,10 @@
-               {
-                   ref->ballCaught( catcher );
-               } );
--
-+    
-     if ( playmode() == PM_FreeKick_Left
--         || playmode() == PM_FreeKick_Right )
-+         || playmode() == PM_FreeKick_Right 
-+         || catcher.isGoalie() == false)
-     {
-         M_ball_catcher = &catcher;
-     }
-diff -u rcssserver-19.0.0/src/stadium.h rcssserver-19.0.0/src/stadium.h
---- rcssserver-19.0.0/src/stadium.h	2024-02-18 23:29:46
-+++ rcssserver-19.0.0/src/stadium.h	2025-12-18 23:09:12
-@@ -120,6 +120,8 @@
- 
- 
-     const Player * M_ball_catcher; /* goalie who has caught ball */
-+    Player * M_last_catcher; /* last player who caught ball */
-+    PVector * M_ball_caught_loc; /* location where the ball was caught */
- 
-     Side M_kick_off_side;
- 
-@@ -267,6 +269,26 @@
-     void clearBallCatcher()
-       {
-           M_ball_catcher = static_cast< Player * >( 0 );
-+      }
-+
-+    void setLastCatcher( Player * player )
-+      {
-+          if ( M_last_catcher == player ) return;
-+          M_last_catcher = player;
-+          PVector ball_pos = M_ball->pos();
-+          M_ball_caught_loc = new PVector( ball_pos.x, ball_pos.y );
-+      }
-+
-+    void clearLastCatcher()
-+      {
-+          M_last_catcher = static_cast< Player * >( 0 );
-+          delete M_ball_caught_loc;
-+          M_ball_caught_loc = nullptr;
-+      }
-+
-+    PVector * ballCaughtLocation() const
-+      {
-+          return M_ball_caught_loc;
-       }
- 
-     Side kickOffSide() const
+ say_com : RCSS_PCOM_UNQ_SAY
+diff -u rcssserver-19.0.0/src/player_command_tok.lpp rcssserver-19.0.0/src/player_command_tok.lpp
+--- rcssserver-19.0.0/src/player_command_tok.lpp
++++ rcssserver-19.0.0/src/player_command_tok.lpp
+@@ -58,6 +58,7 @@
+ kick { return RCSS_PCOM_KICK; }
+ long_kick { return RCSS_PCOM_LONG_KICK; }
+ catch { return RCSS_PCOM_CATCH; }
++drop { return RCSS_PCOM_DROP; }
+ say { return RCSS_PCOM_SAY; }
+ sense_body { return RCSS_PCOM_SENSE_BODY; }
+ score { return RCSS_PCOM_SCORE; }
