@@ -1,7 +1,3 @@
-"""
-Player wrapper around ai_interface.utils.basic_commands.
-"""
-
 from __future__ import annotations
 
 import math
@@ -9,14 +5,11 @@ import numpy as np
 from typing import List, Tuple
 
 from ai_interface.utils import basic_commands
+from ai_interface.utils.algo_utils import in_possession
 from ai_interface.constants.player_constants import *
 
 class Player:
-    """
-    Convenience wrapper for basic command helpers using defaults.
-    """
-
-    kick_power = 100
+    kick_power = 60
     pass_power = 60
     kickable_tolerance = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE
 
@@ -34,6 +27,7 @@ class Player:
         self.unum = unum
         self.dribbling = dribbling
         self.is_goalie = is_goalie
+        self._dribble_state = basic_commands.DribbleState()
 
     def goto(self, x: float, y: float,
              self_pose: List | Tuple,
@@ -56,6 +50,22 @@ class Player:
     
     def reset(self) -> None:
         self.dribbling = False
+        self._dribble_state.reset()
+
+    def dribble_to(self, target: List | Tuple,
+                   self_pose: List | Tuple,
+                   ball_pose: List | Tuple,
+                   game_state,
+                   speed: float | None = None) -> str:
+        return basic_commands.dribble_to(
+            self_pose,
+            ball_pose,
+            target,
+            game_state,
+            state=self._dribble_state,
+            speed=self.goto_speed if speed is None else speed,
+            kickable_tolerance=self.kickable_tolerance,
+        )
 
     def kick(self, target_angle: float,
              self_pose: List | Tuple,
@@ -116,12 +126,4 @@ class Player:
         return cmd
     
     def hasBall(self, self_pose: List | Tuple, ball_pose: List | Tuple, check_angle=False) -> bool:
-        if check_angle:
-            to_ball = np.array(ball_pose[:2]) - np.array(self_pose[:2])
-            heading = self_pose[2]
-            angle_diff=abs(heading - math.atan2(to_ball[1], to_ball[0]))
-            angle_diff = min(angle_diff, 2 * math.pi - angle_diff)
-        robot_to_ball_vec = np.array(ball_pose[:2]) - np.array(self_pose[:2])
-        robot_to_ball_dist = np.linalg.norm(robot_to_ball_vec)
-        return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < KICKABLE_MARGIN / 2 and \
-            (not check_angle or abs(angle_diff) < math.radians(5))
+        return in_possession(self_pose, ball_pose, check_angle=check_angle)

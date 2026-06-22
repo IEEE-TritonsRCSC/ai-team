@@ -1,12 +1,40 @@
 import sys
 import os
 import time
+import math
 
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 import numpy as np
 from scipy.optimize import differential_evolution
-from constants.player_constants import KICKABLE_MARGIN
-from constants.field_constants import GOAL_L, GOAL_R
+from constants.player_constants import KICKABLE_MARGIN, PLAYER_SIZE, BALL_SIZE
+from constants.field_constants import (
+    GOAL_L, GOAL_R,
+    GOAL_L_Y_TOP, GOAL_L_Y_BOTTOM,
+    GOAL_R_Y_TOP, GOAL_R_Y_BOTTOM,
+)
+
+from typing import List, Tuple
+
+
+def _as_float_array(value: np.ndarray | Tuple | List) -> np.ndarray:
+    """Normalize vector-like inputs at function boundaries."""
+    return np.asarray(value, dtype=float)
+
+
+def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[float, float]:
+    """Return distance from point to segment and normalized projection t."""
+    point = _as_float_array(point)
+    start = _as_float_array(start)
+    end = _as_float_array(end)
+    segment = end - start
+    seg_len_sq = float(np.dot(segment, segment))
+    if seg_len_sq == 0.0:
+        return float(np.linalg.norm(point - start)), 0.0
+    t = float(np.dot(point - start, segment) / seg_len_sq)
+    t = float(np.clip(t, 0.0, 1.0))
+    closest = start + t * segment
+    return float(np.linalg.norm(point - closest)), t
+
 
 def normalize_angle(angle: float) -> float:
     """Normalize angle to be within [-pi, pi] radians."""
@@ -60,7 +88,12 @@ def estimate_ball_velocity(positions, alpha):
     return v_next.reshape(-1)
 
 def has_ball(self_pos_xy, ball_pos_xy, kickable_dist: float) -> bool:
-    """Return True if robot is within kickable distance of the ball."""
+    """Return True if robot is within `kickable_dist` of the ball (range check).
+
+    A generous "can the robot reach the ball" test used by the JAL/attention
+    envs. For the tighter in-contact possession test (and optional facing
+    check), use `in_possession`.
+    """
     if self_pos_xy is None or ball_pos_xy is None:
         return False
 
@@ -70,3 +103,34 @@ def has_ball(self_pos_xy, ball_pos_xy, kickable_dist: float) -> bool:
     dx = float(self_pos_xy[0]) - float(ball_pos_xy[0])
     dy = float(self_pos_xy[1]) - float(ball_pos_xy[1])
     return bool(np.hypot(dx, dy) <= float(kickable_dist))
+
+
+def _compute_goal_params(side: str) -> Tuple[Tuple, Tuple, Tuple]:
+    """Return (post_top, post_bottom, goal_center) for the given defending side."""
+    if side == "left":
+        return GOAL_L_Y_TOP, GOAL_L_Y_BOTTOM, GOAL_L
+    return GOAL_R_Y_TOP, GOAL_R_Y_BOTTOM, GOAL_R
+
+
+def infer_side_from_position(goalie_pos: Tuple[float, float]) -> str:
+    """Return 'left' or 'right' defending side inferred from goalie x-position."""
+    return "left" if goalie_pos[0] < 0 else "right"
+
+
+def in_possession(self_pose, ball_pose, check_angle: bool = False) -> bool:
+    """Return True when the ball sits in the contact band, optionally faced.
+
+    self_pose is [x, y, theta] in radians; ball_pose is [x, y(, ...)]. Unlike
+    `has_ball` (a generous range check), possession requires the robot-ball
+    distance to be within KICKABLE_MARGIN/2 of physical contact
+    (PLAYER_SIZE + BALL_SIZE). With `check_angle`, the robot must also face the
+    ball within 5 degrees.
+    """
+    to_ball = _as_float_array(ball_pose[:2]) - _as_float_array(self_pose[:2])
+    dist = float(np.linalg.norm(to_ball))
+    if abs(dist - (PLAYER_SIZE + BALL_SIZE)) >= KICKABLE_MARGIN / 2:
+        return False
+    if not check_angle:
+        return True
+    angle_diff = normalize_angle(math.atan2(to_ball[1], to_ball[0]) - float(self_pose[2]))
+    return abs(angle_diff) < math.radians(5.0)

@@ -7,29 +7,10 @@ from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 import math
 import numpy as np
+
 from constants.player_constants import *
 from constants.field_constants import *
-from .algo_utils import normalize_angle
-
-
-def _as_float_array(value: np.ndarray | Tuple | List) -> np.ndarray:
-    """Normalize vector-like inputs at function boundaries."""
-    return np.asarray(value, dtype=float)
-
-
-def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[float, float]:
-    """Return distance from point to segment and normalized projection t."""
-    point = _as_float_array(point)
-    start = _as_float_array(start)
-    end = _as_float_array(end)
-    segment = end - start
-    seg_len_sq = float(np.dot(segment, segment))
-    if seg_len_sq == 0.0:
-        return float(np.linalg.norm(point - start)), 0.0
-    t = float(np.dot(point - start, segment) / seg_len_sq)
-    t = float(np.clip(t, 0.0, 1.0))
-    closest = start + t * segment
-    return float(np.linalg.norm(point - closest)), t
+from .algo_utils import normalize_angle, _as_float_array, _segment_distance
 
 
 def _select_detour(origin: np.ndarray, destination: np.ndarray,
@@ -187,6 +168,7 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
     angle_to_target = np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0])
     return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling)
     
+
 def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
          target_angle: float, kick_power: float = 80.0, dribbling=False, ) -> str:
     """
@@ -218,6 +200,7 @@ def shoot_at_goal(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | 
     goal = _as_float_array(goal)
     return shoot(self_pose, ball_pose, goal, kick_power, dribbling=dribbling)
 
+
 def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
                      teammate_pose: np.ndarray | Tuple | List, kick_power: float = 60.0, dribbling=False) -> str:
     """
@@ -229,6 +212,7 @@ def pass_to_teammate(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray
     ball_pose = _as_float_array(ball_pose)
     teammate_pose = _as_float_array(teammate_pose)
     return shoot(self_pose, ball_pose, teammate_pose[:2], kick_power, dribbling=dribbling)
+
 
 def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List,
             kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
@@ -253,45 +237,14 @@ def dribble(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple 
     return f"catch 0"
 
 
-# ---------------------------------------------------------------------------
-# dribble_to: rule-compliant ball transport to a target coordinate.
-#
-# RoboCup SSL "Excessive Dribbling": a robot may not dribble the ball further
-# than 1 m from where dribbling started (the ball location at first contact).
-# It may, however, cover large distances by periodically losing possession.
-#
-# This skill mirrors that rule with a small phase machine. Each call returns a
-# single command for the current timestep; per-robot state is held in a caller-
-# owned DribbleState so the helper stays as stateless as its siblings here.
-#
-# One transport cycle:
-#   APPROACH  -> close on the ball until it is kickable.
-#   GRAB      -> dribble() turns to face the ball, then "catch 0" glues it and
-#                opens a new <=1 m segment anchored at the ball's catch location.
-#   CARRY     -> face the target and dash; the caught ball follows. Release with
-#                "drop" once the segment nears the 1 m limit.
-#   RELEASE   -> dash directly away from the ball until there is observable
-#                separation (> kickable + redribble gap), genuinely losing
-#                possession, then return to APPROACH for the next segment.
-# Repeats until the ball is within `arrival_margin` of the target.
-# ---------------------------------------------------------------------------
-
 DRIBBLE_PHASE_APPROACH = "approach"
 DRIBBLE_PHASE_GRAB = "grab"
 DRIBBLE_PHASE_CARRY = "carry"
 DRIBBLE_PHASE_RELEASE = "release"
 DRIBBLE_PHASE_DONE = "done"
 
-
 @dataclass
 class DribbleState:
-    """Per-robot state for `dribble_to`, persisted by the caller across steps.
-
-    phase is one of the DRIBBLE_PHASE_* constants. segment_start is the ball
-    position [x, y] captured at the moment of the catch that opened the current
-    possession segment; the 1 m limit is measured from it.
-    """
-
     phase: str = DRIBBLE_PHASE_APPROACH
     segment_start: Tuple[float, float] | None = None
 
@@ -334,12 +287,10 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
     robot_ball_dist = float(np.linalg.norm(ball_pose - robot_xy))
     angle_to_target = float(np.arctan2(target[1] - robot_xy[1], target[0] - robot_xy[0]))
 
-    # Global arrival check: stop once the ball itself is on target.
     if float(np.linalg.norm(ball_pose - target)) <= arrival_margin:
         state.phase = DRIBBLE_PHASE_DONE
         return "drop" if robot_ball_dist <= kickable_tolerance else "done"
 
-    # APPROACH: close on the ball, facing the target so the grab is aimed.
     if state.phase == DRIBBLE_PHASE_APPROACH:
         if robot_ball_dist > kickable_tolerance:
             return goto(
@@ -347,14 +298,13 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
                 margin=kickable_tolerance, theta=angle_to_target, speed=speed,
                 obstacle_avoidance=False,
             )
-        state.phase = DRIBBLE_PHASE_GRAB  # within reach; fall through to grab
+        state.phase = DRIBBLE_PHASE_GRAB
 
-    # GRAB: turn to face the ball, then catch it to open a new segment.
     if state.phase == DRIBBLE_PHASE_GRAB:
         cmd = dribble(self_pose, ball_pose,
                       kickable_tolerance=kickable_tolerance,
                       angle_tolerance=angle_tolerance)
-        if cmd == "failed":  # ball drifted out of reach; chase it again
+        if cmd == "failed":
             state.phase = DRIBBLE_PHASE_APPROACH
             return goto(
                 self_pose, float(ball_pose[0]), float(ball_pose[1]), game_state,
@@ -364,9 +314,8 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
         if cmd == "catch 0":
             state.segment_start = (float(ball_pose[0]), float(ball_pose[1]))
             state.phase = DRIBBLE_PHASE_CARRY
-        return cmd  # "turn …" (still aligning) or "catch 0" (grabbed this step)
+        return cmd
 
-    # CARRY: ball is glued; face the target and dash, watching the 1 m limit.
     if state.phase == DRIBBLE_PHASE_CARRY:
         if state.segment_start is None:
             state.segment_start = (float(ball_pose[0]), float(ball_pose[1]))
@@ -378,21 +327,20 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
                 obstacle_avoidance=False,
             )
         carried = float(np.linalg.norm(ball_pose - _as_float_array(state.segment_start)))
-        if carried >= segment_limit:  # approaching the foul line: release
+        if carried >= segment_limit:
             state.phase = DRIBBLE_PHASE_RELEASE
             return "drop"
         angle_diff = normalize_angle(angle_to_target - heading)
         if abs(angle_diff) > angle_tolerance:
-            return f"turn {angle_diff}"  # keep the ball pointed at the target
+            return f"turn {angle_diff}"
         return f"dash {speed} {0.0}"
 
-    # RELEASE: create observable separation before the next segment is legal.
     if state.phase == DRIBBLE_PHASE_RELEASE:
         if robot_ball_dist <= separation_gap:
             away_angle = float(np.arctan2(robot_xy[1] - ball_pose[1],
                                           robot_xy[0] - ball_pose[0]))
             rel = normalize_angle(away_angle - heading)
-            return f"dash {speed} {rel}"  # reverse straight away from the ball
+            return f"dash {speed} {rel}"
         state.phase = DRIBBLE_PHASE_APPROACH
         state.segment_start = None
         return goto(
@@ -401,7 +349,6 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
             obstacle_avoidance=False,
         )
 
-    # DONE or unknown phase: idle.
     return "done"
 
     
