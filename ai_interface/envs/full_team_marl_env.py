@@ -155,11 +155,7 @@ class FullTeamMARLEnv(gym.Env):
             spaces.Box(low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
             for _ in range(num_agents)
         ])
-        self.action_space = spaces.Box(
-            low=np.array([[-2.0, -2.0, -2.0, 0.0]] * num_agents, dtype=np.float32),
-            high=np.array([[2.0, 2.0, 2.0, 1.0]] * num_agents, dtype=np.float32),
-            dtype=np.float32,
-        )
+        self.action_space = spaces.MultiDiscrete([len(HSMState)] * num_agents)
 
         self.current_step = 0
         self.prev_game_state = None
@@ -212,25 +208,28 @@ class FullTeamMARLEnv(gym.Env):
     def step(
         self, actions: np.ndarray
     ) -> Tuple[List[np.ndarray], float, bool, Dict]:
-        actions = np.asarray(actions, dtype=np.float32)
-        if actions.ndim == 1:
-            actions = actions.reshape(self.num_agents, 4)
+        """Execute one step with discrete HSM-state actions.
+
+        Args:
+            actions: (N,) array of ints, each an index into HSMState.
+        """
+        actions = np.asarray(actions, dtype=np.int64).flatten()
+        hsm_actions = [list(HSMState)[int(a)] for a in actions]
 
         game_state_before = self.networker.get_game_state()
         roles_before = self.coordinator.assign_roles(
             game_state_before, self.team_name, step=self.current_step,
             forced_roles=self.forced_roles,
         )
-        states_before = self._transition_states(game_state_before, roles_before)
 
-        # Execute opponent commands first if a controller is active
         if self.opponent_controller is not None and self.opponent_team_name:
             self._execute_opponent(game_state_before)
 
-        # Execute training-team commands
         commands = []
         for agent_id in range(self.num_agents):
-            cmd = self._action_to_command(agent_id, actions[agent_id], game_state_before)
+            cmd = self._hsm_state_to_command(
+                agent_id, hsm_actions[agent_id], game_state_before
+            )
             if cmd is not None:
                 commands.append(cmd)
         if commands:
@@ -250,26 +249,22 @@ class FullTeamMARLEnv(gym.Env):
         states = self._transition_states(game_state, roles)
         observations = self._build_observations(game_state, roles, states)
 
-        # Per-agent HSM rewards (role-specific shaping)
         per_agent_rewards = []
         for agent_id in range(self.num_agents):
-            r = self.reward_model.compute_role_reward(
+            r = self.reward_model.compute_discrete_reward(
                 role=roles.get(agent_id, Role.SUPPORT),
+                chosen_state=hsm_actions[agent_id],
                 agent_id=agent_id,
                 game_state=game_state,
                 team_name=self.team_name,
                 role_assignments=roles,
-                actions=actions.tolist(),
                 prev_game_state=self.prev_game_state,
             )
             per_agent_rewards.append(float(r))
 
-        # Team-level formation bonuses (zero when weights are 0)
         team_bonus = self._team_bonus_rewards(game_state, roles)
-
         team_reward = float(np.mean(per_agent_rewards)) + team_bonus
 
-        # Track robot positions for movement rewards next step
         self._prev_robot_positions = {
             i: pos[:2] for i, pos in self._team_positions(game_state).items()
         }
@@ -286,6 +281,7 @@ class FullTeamMARLEnv(gym.Env):
             "ball_out_of_bounds": ball_oob,
             "roles": {i: r.value for i, r in roles.items()},
             "states": {i: s.value for i, s in states.items()},
+            "chosen_actions": [a.value for a in hsm_actions],
             "role_rewards": per_agent_rewards,
             "team_bonus": team_bonus,
         }
@@ -454,14 +450,13 @@ class FullTeamMARLEnv(gym.Env):
             opp_role_list = [opp_roles[i] for i in range(n_opp)]
 
             opp_actions, _, _ = ctrl.select_actions(opp_obs, opp_role_list, deterministic=True)
-            opp_actions = np.asarray(opp_actions, dtype=np.float32).reshape(n_opp, 4)
+            opp_hsm_states = [list(HSMState)[int(a)] for a in opp_actions.flatten()]
 
             commands = []
             for new_id in range(n_opp):
-                orig_id = opp_agent_map[new_id]
-                orig_pos = opp_team_positions_full[orig_id]
-                # Convert action to command using opponent's actual position
-                cmd = self._action_to_command_at_pos(opp_actions[new_id], orig_pos, game_state, flip_x=True)
+                cmd = self._hsm_state_to_command(
+                    opp_agent_map[new_id], opp_hsm_states[new_id], game_state
+                )
                 if cmd is not None:
                     commands.append(cmd)
             try:
@@ -525,47 +520,97 @@ class FullTeamMARLEnv(gym.Env):
         return obs_list
 
     # ------------------------------------------------------------------
-    # Action → simulator command
+    # HSM state → simulator command
     # ------------------------------------------------------------------
 
-    def _action_to_command(
-        self, agent_id: int, action: np.ndarray, game_state
+    def _hsm_state_to_command(
+        self, agent_id: int, state: HSMState, game_state
     ) -> Optional[str]:
-        pos = self._team_positions(game_state).get(agent_id, (0.0, 0.0, 0.0))
-        return self._action_to_command_at_pos(action, pos, game_state, flip_x=False)
-
-    def _action_to_command_at_pos(
-        self,
-        action: np.ndarray,
-        pos: Tuple[float, float, float],
-        game_state,
-        flip_x: bool = False,
-    ) -> Optional[str]:
-        vx, vy, omega, kick_speed = [float(x) for x in action]
-        rx, ry, _ = pos
-        if flip_x:
-            rx = -rx
-
-        ball_x, ball_y = (game_state.ball_pos if game_state and game_state.ball_pos else (0.0, 0.0))
+        """Convert a discrete HSM state choice into a simulator command."""
+        team_pos = self._team_positions(game_state)
+        pos = team_pos.get(agent_id, (0.0, 0.0, 0.0))
+        rx, ry, rtheta = pos
+        ball_x, ball_y = (
+            game_state.ball_pos if game_state and game_state.ball_pos else (0.0, 0.0)
+        )
         ball_dist = math.hypot(ball_x - rx, ball_y - ry)
 
-        # Kick when near ball and kick_speed signal is strong
-        if kick_speed > 0.2 and ball_dist < self.kickable_dist * 1.2:
-            kick_power = float(np.clip(kick_speed * 100.0, 10.0, 100.0))
-            goal_x = -self.field_half_x if flip_x else self.field_half_x
-            goal_dir = math.atan2(-ry, goal_x - rx)
-            return f"kick {kick_power:.2f} {goal_dir:.4f}"
+        if state == HSMState.IDLE:
+            return None
 
-        # Turn when omega is dominant and speed is low
-        if abs(omega) > 0.8 and math.hypot(vx, vy) < 0.3:
-            turn_power = float(np.clip(omega, -2.0, 2.0))
-            return f"turn {turn_power:.4f}"
+        if state == HSMState.MOVE_TO_BALL:
+            direction = math.atan2(ball_y - ry, ball_x - rx)
+            power = min(80.0, max(30.0, ball_dist * 8.0))
+            return f"dash {power:.2f} {direction:.4f}"
 
-        # Dash
-        speed = math.hypot(vx, vy)
-        direction = math.atan2(vy, vx) if speed > 1e-6 else 0.0
-        dash_power = float(np.clip(speed * 40.0, 0.0, 80.0))
-        return f"dash {dash_power:.2f} {direction:.4f}"
+        if state == HSMState.DRIBBLE:
+            goal_x, goal_y = self.field_half_x, 0.0
+            direction = math.atan2(goal_y - ry, goal_x - rx)
+            if ball_dist < self.kickable_dist * 1.5:
+                return f"kick 15.00 {direction:.4f}"
+            return f"dash 50.00 {direction:.4f}"
+
+        if state == HSMState.SHOOT:
+            if ball_dist < self.kickable_dist * 1.5:
+                goal_dir = math.atan2(-ry, self.field_half_x - rx)
+                return f"kick 100.00 {goal_dir:.4f}"
+            direction = math.atan2(ball_y - ry, ball_x - rx)
+            return f"dash 80.00 {direction:.4f}"
+
+        if state == HSMState.PASS:
+            teammates = {
+                k: v for k, v in team_pos.items() if k != agent_id
+            }
+            if teammates and ball_dist < self.kickable_dist * 1.5:
+                nearest_id = min(
+                    teammates,
+                    key=lambda k: math.hypot(
+                        teammates[k][0] - rx, teammates[k][1] - ry
+                    ),
+                )
+                tx, ty, _ = teammates[nearest_id]
+                pass_dir = math.atan2(ty - ry, tx - rx)
+                dist_to_tm = math.hypot(tx - rx, ty - ry)
+                power = min(80.0, max(20.0, dist_to_tm * 4.0))
+                return f"kick {power:.2f} {pass_dir:.4f}"
+            direction = math.atan2(ball_y - ry, ball_x - rx)
+            return f"dash 60.00 {direction:.4f}"
+
+        if state == HSMState.MARK:
+            opp_pos = self._opponent_positions(game_state)
+            if opp_pos:
+                nearest_opp = min(
+                    opp_pos.values(),
+                    key=lambda p: math.hypot(p[0] - rx, p[1] - ry),
+                )
+                ox, oy, _ = nearest_opp
+                mid_x = (ox + ball_x) / 2.0
+                mid_y = (oy + ball_y) / 2.0
+                direction = math.atan2(mid_y - ry, mid_x - rx)
+                return f"dash 50.00 {direction:.4f}"
+            return None
+
+        if state == HSMState.BLOCK:
+            own_goal_x = -self.field_half_x
+            block_x = (rx + own_goal_x) / 2.0
+            block_y = ball_y * 0.5
+            direction = math.atan2(block_y - ry, block_x - rx)
+            return f"dash 60.00 {direction:.4f}"
+
+        if state == HSMState.INTERCEPT:
+            direction = math.atan2(ball_y - ry, ball_x - rx)
+            power = min(80.0, max(40.0, ball_dist * 6.0))
+            return f"dash {power:.2f} {direction:.4f}"
+
+        if state == HSMState.GOAL_KEEP:
+            target_x = -self.field_half_x + 2.0
+            target_y = max(-self.goal_half_y, min(self.goal_half_y, ball_y * 0.6))
+            direction = math.atan2(target_y - ry, target_x - rx)
+            dist_to_target = math.hypot(target_x - rx, target_y - ry)
+            power = min(50.0, max(10.0, dist_to_target * 10.0))
+            return f"dash {power:.2f} {direction:.4f}"
+
+        return None
 
     # ------------------------------------------------------------------
     # Team bonus rewards (new for 6-agent coordination)

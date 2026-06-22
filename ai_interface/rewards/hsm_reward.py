@@ -15,6 +15,139 @@ class HSMReward:
     def __init__(self, baseline_env: Optional[MultiAgentSoccerEnv] = None):
         self.baseline_env = baseline_env
 
+    def compute_discrete_reward(
+        self,
+        role: Role,
+        chosen_state: "HSMState",
+        agent_id: int,
+        game_state,
+        team_name: str,
+        role_assignments: Dict[int, Role],
+        prev_game_state=None,
+    ) -> float:
+        """Reward for discrete HSM-state action selection.
+
+        Combines outcome-based rewards (goal, ball progress) with a bonus
+        for choosing the state that the deterministic HSM would have chosen.
+        """
+        from ai_interface.hsm.state_machine import HSMState
+
+        if game_state is None:
+            return -0.1
+
+        ball_x, ball_y = game_state.ball_pos or (0.0, 0.0)
+        ball_pos = (ball_x, ball_y)
+        team_positions = self._team_positions(game_state, team_name)
+        opponent_positions = self._opponent_positions(game_state, team_name)
+        self_pos = team_positions.get(agent_id, (0.0, 0.0))
+        dist_to_ball = self._distance(self_pos, ball_pos)
+
+        reward = 0.0
+
+        # Large reward for scoring
+        if self._is_goal_scored(game_state):
+            reward += 5.0
+
+        # Ball progress toward opponent goal
+        if prev_game_state is not None:
+            reward += self._ball_toward_goal_bonus(prev_game_state, game_state)
+
+        # Possession bonus
+        if dist_to_ball < 1.4:
+            reward += 0.3
+
+        # Context-appropriate action bonus: reward choosing what the
+        # deterministic HSM transition would have selected.
+        ideal_state = self._ideal_state_for_role(
+            role, self_pos, ball_pos, dist_to_ball,
+            opponent_positions, team_positions, agent_id,
+            prev_game_state, game_state,
+        )
+        if chosen_state == ideal_state:
+            reward += 0.5
+        elif self._states_compatible(chosen_state, ideal_state):
+            reward += 0.2
+
+        # Role-specific outcome shaping (lighter than the continuous version)
+        if role == Role.STRIKER:
+            reward += 0.3 * self._goal_lane_openness(ball_pos, opponent_positions)
+            if prev_game_state is not None:
+                prev_pos = self._team_positions(prev_game_state, team_name).get(agent_id)
+                if prev_pos is not None:
+                    prev_dist = self._distance(prev_pos, ball_pos)
+                    reward += self._clip(0.8 * (prev_dist - dist_to_ball), -0.4, 0.4)
+        elif role == Role.DEFENDER:
+            if opponent_positions:
+                nearest_opp = min(opponent_positions, key=lambda p: self._distance(self_pos, p))
+                marking = max(0.0, 1.0 - abs(self._distance(self_pos, nearest_opp) - 2.5) / 2.5)
+                reward += 0.3 * marking
+        elif role == Role.GOALIE:
+            target_x, target_y = -43.0, ball_y * 0.4
+            positioning = max(0.0, 1.0 - self._distance(self_pos, (target_x, target_y)) / 8.0)
+            reward += 0.3 * positioning
+
+        return float(self._clip(reward, -5.0, 8.0))
+
+    def _ideal_state_for_role(
+        self, role, self_pos, ball_pos, dist_to_ball,
+        opponent_positions, team_positions, agent_id,
+        prev_game_state, game_state,
+    ):
+        """Return the HSM state the deterministic state machine would pick."""
+        from ai_interface.hsm.state_machine import HSMState
+
+        has_possession = dist_to_ball < 1.4
+        shot_open = self._goal_lane_openness(ball_pos, opponent_positions) > 0.5
+        tm_dists = [
+            self._distance(self_pos, p)
+            for k, p in team_positions.items() if k != agent_id
+        ]
+        nearest_tm = min(tm_dists) if tm_dists else 100.0
+        pass_open = nearest_tm < 15.0
+
+        if role == Role.STRIKER:
+            if not has_possession:
+                return HSMState.MOVE_TO_BALL
+            if shot_open and self_pos[0] > 10.0:
+                return HSMState.SHOOT
+            if pass_open:
+                return HSMState.PASS
+            return HSMState.DRIBBLE
+        elif role == Role.SUPPORT:
+            if has_possession and pass_open:
+                return HSMState.PASS
+            if ball_pos[0] < -20.0 and abs(ball_pos[1]) < 15.0:
+                return HSMState.BLOCK
+            if dist_to_ball < 2.0:
+                return HSMState.MOVE_TO_BALL
+            return HSMState.MARK
+        elif role == Role.DEFENDER:
+            goal_threat = ball_pos[0] < -20.0 and abs(ball_pos[1]) < 15.0
+            if goal_threat:
+                return HSMState.INTERCEPT
+            if dist_to_ball < 1.7:
+                return HSMState.INTERCEPT
+            return HSMState.MARK
+        else:  # GOALIE
+            if ball_pos[0] < -20.0 and abs(ball_pos[1]) < 15.0:
+                return HSMState.INTERCEPT
+            return HSMState.GOAL_KEEP
+
+    @staticmethod
+    def _states_compatible(chosen, ideal):
+        """Check if the chosen state is a reasonable alternative to the ideal."""
+        from ai_interface.hsm.state_machine import HSMState
+        compatible_groups = [
+            {HSMState.MOVE_TO_BALL, HSMState.INTERCEPT, HSMState.DRIBBLE},
+            {HSMState.SHOOT, HSMState.PASS},
+            {HSMState.MARK, HSMState.BLOCK},
+            {HSMState.GOAL_KEEP, HSMState.BLOCK, HSMState.INTERCEPT},
+        ]
+        for group in compatible_groups:
+            if chosen in group and ideal in group:
+                return True
+        return False
+
     def compute_role_reward(
         self,
         role: Role,

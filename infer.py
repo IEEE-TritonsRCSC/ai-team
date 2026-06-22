@@ -3,15 +3,18 @@ Inference entry point using the simulator via Networker, with modular RL compone
 
 Loads a saved model and runs deterministic actions inside the appropriate
 environment. Supports:
-  - Hierarchical PPO  (--trainer hier_ppo)
-  - Discrete PPO      (--trainer discrete_ppo)
-  - Stable Baselines3 (--trainer sb3_ppo)
+  - Hierarchical PPO    (--trainer hier_ppo)
+  - Discrete PPO        (--trainer discrete_ppo)
+  - Stable Baselines3   (--trainer sb3_ppo)
+  - Attention MAPPO     (--trainer attention_mappo)
 
 Usage examples:
     python infer.py --trainer hier_ppo --model_path models/hier_ppo_policy.pth
     python infer.py --trainer discrete_ppo --model_path models/discrete_ppo_policy.pth
     python infer.py --trainer discreteq_learning --model_path models/qlearning_policy.pth
     python infer.py --trainer sb3_ppo --model_path models/sb3_ppo_policy.zip
+    python infer.py --trainer attention_mappo --model_path models/attention_mappo/attention_mappo_stage1_final.pth \
+        --config configs/attention_mappo_config.json --stage stage1
 """
 import argparse
 import datetime as _dt
@@ -912,6 +915,197 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         trace_file.close()
 
 
+def _run_attention_mappo(args, networker: Networker, team_name: str):
+    """Run inference with the Attention MAPPO agent (multi-agent, role-based).
+
+    Loads curriculum stage settings from the config to reconstruct the
+    FullTeamMARLEnv with matching num_agents, forced_roles, reward_weights,
+    and spawn config. Actions are selected deterministically (Gaussian mean).
+    """
+    from ai_interface.algorithms.attention_mappo import (
+        AttentionMAPPOAgent, AttentionMAPPOConfig,
+    )
+    from ai_interface.envs.full_team_marl_env import FullTeamMARLEnv
+    from ai_interface.hsm.state_machine import Role
+
+    device = _resolve_device()
+
+    with open(args.config, "r") as f:
+        config = json.load(f)
+    stage_config = config["curriculum"][args.stage]
+
+    num_agents = int(stage_config.get("num_agents", 6))
+    max_steps = int(stage_config.get("max_steps", config.get("max_steps", 100)))
+    obs_dim = int(config.get("obs_dim", 57))
+
+    role_map = {
+        "STRIKER": Role.STRIKER,
+        "SUPPORT": Role.SUPPORT,
+        "DEFENDER": Role.DEFENDER,
+        "GOALIE": Role.GOALIE,
+    }
+    forced_roles = {
+        int(k): role_map.get(str(v).upper(), Role.SUPPORT)
+        for k, v in stage_config.get("forced_roles", {}).items()
+    }
+    reward_weights = stage_config.get("reward_weights", {})
+    spawn_config = stage_config.get("spawn_config", {})
+    hsm_thresholds = config.get("hsm_thresholds", {})
+
+    env = FullTeamMARLEnv(
+        networker=networker,
+        team_name=team_name,
+        num_agents=num_agents,
+        max_steps=max_steps,
+        hsm_thresholds=hsm_thresholds,
+        forced_roles=forced_roles,
+        reward_weights=reward_weights,
+        spawn_config=spawn_config,
+    )
+    env.set_forced_roles(forced_roles)
+
+    algo_cfg_raw = config.get("algorithm", {})
+    algo_config = AttentionMAPPOConfig(
+        gamma=float(algo_cfg_raw.get("gamma", 0.99)),
+        gae_lambda=float(algo_cfg_raw.get("gae_lambda", 0.95)),
+        lr_actor=float(algo_cfg_raw.get("lr_actor", 3e-4)),
+        lr_critic=float(algo_cfg_raw.get("lr_critic", 1e-3)),
+        lr_encoder=float(algo_cfg_raw.get("lr_encoder", 5e-4)),
+        clip_eps=float(algo_cfg_raw.get("clip_eps", 0.2)),
+        entropy_coef=float(algo_cfg_raw.get("entropy_coef", 0.01)),
+        value_coef=float(algo_cfg_raw.get("value_coef", 0.5)),
+        max_grad_norm=float(algo_cfg_raw.get("max_grad_norm", 0.5)),
+        ppo_epochs=int(algo_cfg_raw.get("ppo_epochs", 4)),
+        rollout_length=int(algo_cfg_raw.get("rollout_length", 2048)),
+        minibatch_size=int(algo_cfg_raw.get("minibatch_size", 256)),
+        min_std=float(algo_cfg_raw.get("min_std", 0.1)),
+        agent_embed_dim=int(algo_cfg_raw.get("agent_embed_dim", 128)),
+        num_attn_heads=int(algo_cfg_raw.get("num_attn_heads", 4)),
+        num_attn_layers=int(algo_cfg_raw.get("num_attn_layers", 2)),
+        actor_hidden=(
+            int(algo_cfg_raw.get("actor_hidden", [256, 256])[0]),
+            int(algo_cfg_raw.get("actor_hidden", [256, 256])[1]),
+        ),
+    )
+
+    agent = AttentionMAPPOAgent(
+        num_agents=num_agents,
+        obs_dim=obs_dim,
+        config=algo_config,
+        device=device,
+    )
+
+    log_dir = (
+        Path(args.log_dir)
+        if args.log_dir
+        else _make_infer_log_dir(args.model_path)
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    collector, log_file = _setup_inference_logging(
+        log_dir=log_dir, debug=bool(args.debug_infer)
+    )
+    _SUMMARY_LOG.info("Inference log dir: %s", log_dir)
+
+    print(f"Loading Attention MAPPO model from {args.model_path} (stage={args.stage})")
+    agent.load(args.model_path, weights_only=True)
+
+    observations = env.reset()
+    episode_count = 0
+    elapsed_steps = 0
+    total_reward = 0.0
+
+    outcomes: list[str] = []
+    episode_rewards: list[float] = []
+    actions_total: Counter = Counter()
+    actions_window: Counter = Counter()
+    last_kick_idx = 0
+    WINDOW = 20
+
+    for step in range(int(args.steps)):
+        current_roles = [
+            env.current_roles.get(i, Role.SUPPORT)
+            for i in range(num_agents)
+        ]
+
+        actions_arr, _logprobs, _value = agent.select_actions(
+            observations, current_roles, deterministic=True,
+        )
+
+        from ai_interface.hsm.state_machine import HSMState as _HSMState
+        for a in actions_arr.flatten():
+            name = list(_HSMState)[int(a)].value
+            actions_total[name] += 1
+            actions_window[name] += 1
+
+        next_obs, reward, done, info = env.step(actions_arr)
+        total_reward += float(reward)
+        elapsed_steps += 1
+
+        if done:
+            episode_count += 1
+            reason = info.get("termination_reason") if isinstance(info, dict) else None
+            if not reason:
+                reason = "max_steps" if not info.get("goal_scored", False) else "goal_scored"
+            outcomes.append(reason)
+            episode_rewards.append(total_reward)
+
+            if episode_count % WINDOW == 0:
+                window_kicks = collector.kicks[last_kick_idx:]
+                last_kick_idx = len(collector.kicks)
+                _print_window_summary(
+                    label=f"eps {episode_count - WINDOW + 1}-{episode_count}",
+                    outcomes=outcomes[-WINDOW:],
+                    rewards=episode_rewards[-WINDOW:],
+                    kicks=window_kicks,
+                    actions=actions_window,
+                )
+                actions_window = Counter()
+
+            total_reward = 0.0
+            observations = env.reset()
+        else:
+            observations = next_obs
+
+    _SUMMARY_LOG.info("=" * 72)
+    _SUMMARY_LOG.info(
+        "Attention MAPPO inference complete — %d episodes, %d steps (%s)",
+        episode_count, elapsed_steps, args.model_path,
+    )
+    _SUMMARY_LOG.info("=" * 72)
+    all_stats = _print_window_summary(
+        label="ALL",
+        outcomes=outcomes,
+        rewards=episode_rewards,
+        kicks=collector.kicks,
+        actions=actions_total,
+    )
+    last_stats = None
+    if len(outcomes) > 100:
+        last_stats = _print_window_summary(
+            label="last 100",
+            outcomes=outcomes[-100:],
+            rewards=episode_rewards[-100:],
+            kicks=[],
+            actions=Counter(),
+        )
+
+    summary_payload = {
+        "model_path": args.model_path,
+        "stage": args.stage,
+        "config_path": args.config,
+        "requested_steps": int(args.steps),
+        "elapsed_steps": elapsed_steps,
+        "episodes": episode_count,
+        "all": all_stats,
+        "last_100": last_stats,
+    }
+    summary_file = log_dir / "summary.json"
+    with summary_file.open("w") as f:
+        json.dump(summary_payload, f, indent=2, default=str)
+    _SUMMARY_LOG.info("Saved summary to %s", summary_file)
+    _SUMMARY_LOG.info("Full log: %s", log_file)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -924,6 +1118,7 @@ _TRAINER_RUNNERS = {
     "td3_jal": _run_td3_jal,
     "td3_jal_her": _run_td3_jal_her,
     "ppo_jal": _run_ppo_jal,
+    "attention_mappo": _run_attention_mappo,
 }
 
 
