@@ -210,6 +210,7 @@ class Goalie(Player):
                  unum: int,
                  side: str = None,
                  charge_distance: float = 6.0,
+                 reaction_lag: int = 0,
                  dribbling: bool = False) -> None:
         """
         Initialize the Goalie.
@@ -221,11 +222,18 @@ class Goalie(Player):
                   from position.
             charge_distance: Ball distance from goal center below which the keeper
                              may charge a loose ball (default: 6.0)
+            reaction_lag: Perception latency in cycles applied ONLY to the steady-state
+                          POSITION bisector tracking. The keeper steers toward where the
+                          ball was `reaction_lag` cycles ago, so a lateral carry trails it
+                          and opens a lane. Shot detection / BLOCK / CHARGE / catch stay on
+                          the true ball, so real shots are still defended instantly.
+                          0 = no lag (perfect tracking).
             dribbling: Whether the goalie is currently dribbling
         """
         super().__init__(teamname, unum, dribbling=dribbling, is_goalie=True)
         self.side = side
         self.charge_distance = charge_distance
+        self.reaction_lag = int(reaction_lag)
 
         # Ball state estimation
         self._ball_history = deque(maxlen=8)  # (cycle, x, y)
@@ -523,6 +531,30 @@ class Goalie(Player):
         )
         return cmd
 
+    def _lagged_ball_pos(self, ball_pos: Tuple[float, float]) -> Tuple[float, float]:
+        """
+        Return the ball position the keeper *perceives* for steady-state tracking,
+        i.e. where the ball was ~`reaction_lag` cycles ago. Models perception +
+        actuation latency: while the striker carries the ball laterally the keeper
+        steers toward the stale position and trails, opening a lane.
+
+        Reads from `_ball_history` (the true ball is appended each cycle by
+        `_update_ball_estimate`, which runs before this in `action()`). Falls back to
+        the current ball when lag is disabled or history is too short.
+        """
+        if self.reaction_lag <= 0 or not self._ball_history:
+            return ball_pos
+        target_cycle = self._last_cycle - self.reaction_lag if self._last_cycle is not None else None
+        if target_cycle is None:
+            return ball_pos
+        # Walk newest->oldest; pick the most recent entry at or before target_cycle.
+        for cycle, px, py in reversed(self._ball_history):
+            if cycle <= target_cycle:
+                return (px, py)
+        # Lag exceeds buffered history: use the oldest entry we have.
+        _, ox, oy = self._ball_history[0]
+        return (ox, oy)
+
     def _position_command(self, ball_pos, goalie_pose_rad, goalie_pos,
                           side: str, game_state) -> str:
         post_top, post_bottom, goal_center = _compute_goal_params(side)
@@ -538,7 +570,10 @@ class Goalie(Player):
             target = (goal_x + inward * 1.0,
                       _clamp(by, post_y_bottom + 1.0, post_y_top - 1.0))
         else:
-            target = compute_bisector_target(ball_pos, goalie_pos, side)
+            # Steady-state tracking uses the *perceived* (lagged) ball so a lateral
+            # carry trails the keeper and opens a lane; shot defense (BLOCK) uses the
+            # true ball elsewhere and is unaffected.
+            target = compute_bisector_target(self._lagged_ball_pos(ball_pos), goalie_pos, side)
 
         gx, gy = goalie_pos
         facing = math.atan2(by - gy, bx - gx)

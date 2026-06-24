@@ -51,6 +51,89 @@ class _KickAimCollector(logging.Handler):
             self.kicks.append((float(m.group(1)), m.group(2) == "True"))
 
 
+def _accumulate_real_robot_actions(
+    info: dict,
+    requested: Counter,
+    executed: Counter,
+) -> None:
+    """Count requested/executed actions for environment-reported robots only."""
+
+    action_info = info.get("action_info") or {}
+    for robot_info in action_info.get("per_robot", []) or []:
+        requested_name = (
+            robot_info.get("requested_action_type")
+            or robot_info.get("raw_action_type")
+        )
+        executed_name = robot_info.get("action_type")
+        if requested_name:
+            requested[requested_name] += 1
+        if executed_name:
+            executed[executed_name] += 1
+
+
+def _shot_distance_bin(distance: float | None) -> str:
+    """Human-readable keeper-distance bucket for shot probe summaries."""
+
+    if distance is None:
+        return "unknown"
+    edges = [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0]
+    lower = 0.0
+    for upper in edges:
+        if distance < upper:
+            return f"{lower:g}-{upper:g}"
+        lower = upper
+    return "15+"
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    return (sum(values) / len(values)) if values else None
+
+
+def _summarize_shot_probe_events(events: list[dict]) -> dict:
+    """Summarize terminal-shot outcomes by distance-to-keeper at fire."""
+
+    terminal_events = [e for e in events if e.get("terminal_kick")]
+    by_bin: dict[str, dict] = {}
+    for event in terminal_events:
+        label = _shot_distance_bin(event.get("fire_dist_to_keeper"))
+        bucket = by_bin.setdefault(label, {
+            "count": 0,
+            "outcomes": Counter(),
+            "gap_quality_at_fire": [],
+            "aim_quality": [],
+            "keeper_zone_factor": [],
+        })
+        bucket["count"] += 1
+        bucket["outcomes"][str(event.get("outcome") or "unknown")] += 1
+        for key in ["gap_quality_at_fire", "aim_quality", "keeper_zone_factor"]:
+            value = event.get(key)
+            if value is not None:
+                bucket[key].append(float(value))
+
+    summarized_bins = {}
+    for label, bucket in by_bin.items():
+        count = int(bucket["count"])
+        outcomes = dict(bucket["outcomes"])
+        summarized_bins[label] = {
+            "count": count,
+            "outcomes": outcomes,
+            "goal_rate": outcomes.get("goal_scored", 0) / count if count else 0.0,
+            "catch_rate": outcomes.get("goalie_catch", 0) / count if count else 0.0,
+            "off_target_rate": outcomes.get("ball_in_penalty_off_target", 0) / count
+            if count else 0.0,
+            "mean_gap_quality_at_fire": _mean_or_none(bucket["gap_quality_at_fire"]),
+            "mean_aim_quality": _mean_or_none(bucket["aim_quality"]),
+            "mean_keeper_zone_factor": _mean_or_none(bucket["keeper_zone_factor"]),
+        }
+
+    return {
+        "total_fired_kicks": len(events),
+        "terminal_fired_kicks": len(terminal_events),
+        "distance_bin_units": "field metres/units from kick fire origin to keeper pose",
+        "distance_bins": summarized_bins,
+    }
+
+
 def _make_infer_log_dir(model_path: str, log_root: str = "infer_logs") -> Path:
     """Create infer_logs/<timestamp>_<model_basename>/ and return its Path."""
     stem = Path(model_path).stem  # e.g. stage1_9_approach_turn_kick_steps180000
@@ -117,11 +200,19 @@ def _print_window_summary(
     rewards: list[float],
     kicks: list[tuple[float, bool]],
     actions: Counter,
+    carry_segments: int | None = None,
+    carry_steps: int | None = None,
 ) -> dict:
     """Log a compact aggregate for a window of episodes.
 
     Goes through the ``infer.summary`` logger so it shows up in both stdout
     and the on-disk log. Returns a dict of the stats for downstream JSON dump.
+
+    ``carry_segments`` / ``carry_steps`` (PPO JAL only) report REAL dribbling —
+    distinct ball-carry segments and the steps actually spent in the verified CARRY
+    phase — as opposed to the ``actions`` line, which only counts how often the
+    dribble_to MACRO was selected (most of whose steps are just walking to the
+    ball). Pass None to omit the segment (e.g. the TD3 runner).
     """
     n = len(outcomes)
     if n == 0:
@@ -148,10 +239,24 @@ def _print_window_summary(
     else:
         top = "—"
     breakdown_str = ", ".join(f"{k}={v}" for k, v in breakdown.most_common())
+    # Real-dribbling segment: distinguish "carried the ball" from "selected the
+    # dribble_to macro" (the latter is mostly walking to the ball).
+    carry_str = ""
+    if carry_segments is not None and carry_steps is not None:
+        dribble_picks = int(actions.get("dribble_to", 0))
+        carry_of_picks = (
+            f", carried on {_format_pct(carry_steps, dribble_picks)} of dribble_to picks"
+            if dribble_picks > 0 else ""
+        )
+        carry_str = (
+            f" | dribble: {carry_segments} carries, "
+            f"{carry_steps} carry-steps{carry_of_picks}"
+        )
     _SUMMARY_LOG.info(
         "[%s] %d eps  goal_rate=%s  avg_reward=%.1f | outcomes: %s | "
-        "kicks: %s | actions: %s",
+        "kicks: %s | actions: %s%s",
         label, n, _format_pct(goals, n), avg_r, breakdown_str, kick_str, top,
+        carry_str,
     )
     return {
         "label": label,
@@ -164,6 +269,8 @@ def _print_window_summary(
         "aim_avg": aim_avg,
         "bad_aim_rate": (bad / len(kicks)) if kicks else None,
         "actions": dict(actions),
+        "carry_segments": carry_segments,
+        "carry_steps": carry_steps,
     }
 
 
@@ -427,10 +534,10 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
 
     outcomes: list[str] = []
     episode_rewards: list[float] = []
-    actions_total: Counter = Counter()
-    actions_window: Counter = Counter()
     requested_actions_total: Counter = Counter()
     requested_actions_window: Counter = Counter()
+    actions_total: Counter = Counter()
+    actions_window: Counter = Counter()
     invalid_action_total = 0
     invalid_action_window = 0
     blocked_bad_aim_total = 0
@@ -623,12 +730,13 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     robot_ids = stage_config.get("robot_ids", list(range(1, num_robots + 1)))
     reward_overrides = stage_config.get("reward_config_overrides")
 
-    # Stage 2: scripted opponent keeper (driven by the env) + opponent
-    # observability. The opponent team name is the second team in team_config,
-    # same source the Networker used to enable the keeper player.
+    # Stage 2: the opponent keeper. The env only fills the keeper's OBSERVATION
+    # slot via opponent_team_name; the keeper is MOVED by sending it commands
+    # each cycle, exactly as PPOJALCurriculumTrainer's rollout loop does. The
+    # opponent team name is the second team in team_config, same source the
+    # Networker used to enable the keeper player.
     team_infos = load_team_config(args.team_config)
     opponent_goalie_team = team_infos[1].name if len(team_infos) > 1 else None
-    ball_cleared_x_threshold = stage_config.get("ball_cleared_x_threshold", None)
 
     # Mirror PPOJALCurriculumTrainer.setup_environment exactly so the obs the
     # policy sees at inference matches training (same spawn / reward / mask).
@@ -655,17 +763,41 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         random_ball_y_range=tuple(stage_config.get("random_ball_y_range", [-3.0, 3.0])),
         random_spawn_theta=bool(stage_config.get("random_spawn_theta", False)),
         random_spawn_theta_range_deg=tuple(stage_config.get("random_spawn_theta_range_deg", [-45.0, 45.0])),
+        ball_action_recovery=bool(stage_config.get("ball_action_recovery", False)),
+        ball_claimant_robot_ids=stage_config.get("ball_claimant_robot_ids"),
+        ball_claimant_switch_margin=float(stage_config.get("ball_claimant_switch_margin", 0.75)),
+        turn_stall_limit=int(stage_config.get("turn_stall_limit", 12)),
+        turn_stall_displacement=float(stage_config.get("turn_stall_displacement", 0.05)),
+        kick_requires_aim=bool(stage_config.get("kick_requires_aim", False)),
+        kick_min_aim_quality=float(stage_config.get("kick_min_aim_quality", 0.0)),
         reward_config_overrides=dict(reward_overrides) if reward_overrides else None,
-        scripted_opponent_goalie=bool(stage_config.get("scripted_opponent_goalie", False)),
-        opponent_goalie_team=opponent_goalie_team,
-        observe_opponents=bool(stage_config.get("observe_opponents", False)),
-        ball_cleared_x_threshold=(
-            float(ball_cleared_x_threshold)
-            if ball_cleared_x_threshold is not None else None
-        ),
+        opponent_team_name=opponent_goalie_team,
     )
 
     disabled_actions = list(stage_config.get("disabled_actions", []))
+
+    # Build the scripted opponent keeper controller from the stage's
+    # aux_team_policies, mirroring PPOJALCurriculumTrainer._setup_opponent_controller.
+    # Without this the keeper just stands on its spawn and never intercepts.
+    opp_controller = None
+    opp_team_name = None
+    aux_specs = stage_config.get("aux_team_policies", [])
+    if aux_specs and isinstance(aux_specs[0], dict):
+        spec = aux_specs[0]
+        if str(spec.get("controller_type", "")).lower() == "goalie":
+            from ai_interface.trainers.policy_control import GoalieCommandProvider
+            opp_team_name = str(spec.get("team_name", "")) or opponent_goalie_team
+            opp_controller = GoalieCommandProvider(
+                team_name=opp_team_name,
+                robot_id=int((spec.get("robot_ids", [1]) or [1])[0]),
+                side=str(spec.get("side", "right")),
+                reaction_lag=int(spec.get("reaction_lag", 0)),
+            )
+            _SUMMARY_LOG.info(
+                "Scripted opponent goalie active: team=%s robot=%s side=%s reaction_lag=%s",
+                opp_team_name, spec.get("robot_ids", [1]), spec.get("side", "right"),
+                spec.get("reaction_lag", 0),
+            )
 
     log_dir = (
         Path(args.log_dir)
@@ -730,10 +862,24 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
 
     outcomes: list[str] = []
     episode_rewards: list[float] = []
+    requested_actions_total: Counter = Counter()
+    requested_actions_window: Counter = Counter()
     actions_total: Counter = Counter()
     actions_window: Counter = Counter()
+    # Real-dribbling trackers: a "carry" is verified transport plus its bounded
+    # ALIGN_RELEASE phase, read from env.dribble_session_active each step. carry_*
+    # _segments counts distinct grabs (not-carrying -> carrying transitions);
+    # carry_*_steps counts steps actually spent carrying. These separate true
+    # ball transport from mere dribble_to macro selection (mostly walking).
+    carry_segments_total = 0
+    carry_steps_total = 0
+    carry_segments_window = 0
+    carry_steps_window = 0
+    prev_carrying = False
     last_kick_idx = 0
     WINDOW = 20
+    shot_probe_events: list[dict] = []
+    episode_shot_probe_events: list[dict] = []
 
     # Per-step diagnostic trace (debug only) — one JSON line per step capturing
     # the turn-vs-kick decision so we can confirm/deny the "continuous turning"
@@ -753,6 +899,9 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
             agent_active_mask=agent_mask,
             context_active_mask=context_mask,
             param_active_mask=param_active_mask,
+            primitive_valid_mask=env.get_primitive_valid_mask(
+                num_primitives=agent.num_primitives
+            ),
             deterministic=not bool(args.ppo_stochastic),
         )
         # Deployment-friendly variant: deterministic argmax primitive, but inject
@@ -764,18 +913,77 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                 0.0, float(args.ppo_param_noise_std), size=params.shape
             ).astype(np.float32)
             action["params"] = np.clip(params, -1.0, 1.0)
-        for p in np.asarray(action["primitive_idx"]).reshape(-1):
-            name = PRIMITIVE_NAMES[int(p)]
-            actions_total[name] += 1
-            actions_window[name] += 1
+        # Drive the scripted opponent keeper each cycle from the last observed
+        # game state, then step (matches the trainer's rollout ordering).
+        if (
+            opp_controller is not None
+            and opp_team_name
+            and getattr(env, "_cached_game_state", None) is not None
+        ):
+            try:
+                opp_cmds = opp_controller.predict_commands(env._cached_game_state)
+                env.networker.execute_ai_output(opp_cmds, opp_team_name)
+            except Exception as e:
+                _SUMMARY_LOG.debug("Opponent command send failed: %s", e)
 
         obs, reward, terminated, truncated, info = env.step(action)
         if isinstance(info, dict):
             agent_mask = info.get("agent_active_mask", agent_mask)
             context_mask = info.get("context_active_mask", context_mask)
+            # Count only real robots reported by the environment. Sampling
+            # returns a_max primitive slots, including inactive padding, so
+            # counting action["primitive_idx"] inflates totals and attributes
+            # padding choices to the model. Keep requested and executed counts
+            # separate because macros/recovery can intentionally override the
+            # sampled primitive.
+            _accumulate_real_robot_actions(
+                info, requested_actions_total, actions_total
+            )
+            _accumulate_real_robot_actions(
+                info, requested_actions_window, actions_window
+            )
+            for robot_info in (info.get("action_info") or {}).get("per_robot", []) or []:
+                if not robot_info.get("kick_fired", False):
+                    continue
+                event = {
+                    "ep": episode_count,
+                    "ep_step": ep_step + 1,
+                    "robot_id": robot_info.get("robot_id"),
+                    "fire_x": robot_info.get("kick_fire_x"),
+                    "fire_y": robot_info.get("kick_fire_y"),
+                    "fire_dist_to_keeper": robot_info.get("kick_fire_dist_to_keeper"),
+                    "fire_dist_to_goal_line": robot_info.get("kick_fire_dist_to_goal_line"),
+                    "keeper_x": robot_info.get("kick_keeper_x"),
+                    "keeper_y": robot_info.get("kick_keeper_y"),
+                    "predicted_y_at_goal_line": robot_info.get("kick_predicted_y_at_goal_line"),
+                    "aim_quality": robot_info.get("kick_aim_quality"),
+                    "gap_quality_at_fire": robot_info.get("kick_gap_quality_at_fire"),
+                    "keeper_zone_factor": robot_info.get("kick_keeper_zone_factor"),
+                    "opposite_keeper_side": robot_info.get("kick_opposite_keeper_side"),
+                    "requested_primitive": robot_info.get("requested_action_type"),
+                    "executed_primitive": robot_info.get("action_type"),
+                    "terminal_kick": False,
+                    "outcome": None,
+                }
+                shot_probe_events.append(event)
+                episode_shot_probe_events.append(event)
         total_reward += float(reward)
         elapsed_steps += 1
         ep_step += 1
+
+        # Real-dribbling tally: env.dribble_session_active[rid] is True while the
+        # robot is in verified CARRY/ALIGN_RELEASE ownership (set inside env.step).
+        # Count carrying steps and distinct segments (not-carrying -> carrying).
+        carrying = any(
+            bool(v) for v in getattr(env, "dribble_session_active", {}).values()
+        )
+        if carrying:
+            carry_steps_total += 1
+            carry_steps_window += 1
+            if not prev_carrying:
+                carry_segments_total += 1
+                carry_segments_window += 1
+        prev_carrying = carrying
 
         if trace_file is not None and isinstance(info, dict):
             ai = info.get("action_info") or {}
@@ -814,18 +1022,56 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                     "ep_step": ep_step,
                     "robot": ri,
                     "primitive": robot_info.get("action_type"),
+                    "requested_primitive": robot_info.get("requested_action_type"),
+                    "fallback_reason": robot_info.get("fallback_reason"),
+                    "ball_claimant_id": robot_info.get("ball_claimant_id"),
+                    "is_ball_claimant": robot_info.get("is_ball_claimant"),
+                    "robot_ball_dist": robot_info.get("robot_ball_dist"),
+                    "turn_stall_steps": robot_info.get("turn_stall_steps"),
                     "has_ball": bool(robot_info.get("has_ball_now", False)),
                     "turn_theta": robot_info.get("turn_theta"),
                     "theta_deg": theta_deg,
                     "head_err_goal": head_err_goal,
                     "head_err_ball": head_err_ball,
+                    "sim_count": robot_info.get("dribble_sim_count"),
+                    "dribble_phase": robot_info.get("dribble_phase"),
+                    "dribble_committed": bool(robot_info.get("dribble_committed", False)),
+                    "dribble_catch_attempts": robot_info.get("dribble_catch_attempts"),
+                    "dribble_verify_steps": robot_info.get("dribble_verify_steps"),
+                    "dribble_align_steps": robot_info.get("dribble_align_steps"),
+                    "dribble_verify_robot_moved": robot_info.get("dribble_verify_robot_moved"),
+                    "dribble_verify_ball_moved": robot_info.get("dribble_verify_ball_moved"),
+                    "dribble_verify_offset_change": robot_info.get("dribble_verify_offset_change"),
+                    "dribble_target": robot_info.get("dribble_target"),
+                    "dribble_target_heading_error": robot_info.get("dribble_target_heading_error"),
+                    "dribble_penalty_guard_applied": bool(robot_info.get("dribble_penalty_guard_applied", False)),
                     "rx": rx, "ry": ry, "ball": ball_xy,
                     "turn_logit": turn_logit,
                     "kick_logit": kick_logit,
                     "kick_margin": (kick_logit - turn_logit)
                     if (turn_logit is not None and kick_logit is not None) else None,
                     "kick_fired": bool(robot_info.get("kick_fired", False)),
+                    "kick_macro_active": bool(robot_info.get("kick_macro_active", False)),
+                    "kick_macro_continuation": bool(robot_info.get("kick_macro_continuation", False)),
+                    "kick_macro_align_steps": robot_info.get("kick_macro_align_steps"),
+                    "kick_target_y": robot_info.get("kick_target_y"),
+                    "kick_target_angle": robot_info.get("kick_target_angle"),
+                    "kick_target_heading_error": robot_info.get("kick_target_heading_error"),
+                    "kick_retarget_applied": bool(robot_info.get("kick_retarget_applied", False)),
+                    "kick_retarget_count": robot_info.get("kick_retarget_count"),
+                    "kick_retarget_quality_before": robot_info.get("kick_retarget_quality_before"),
                     "kick_aim_quality": robot_info.get("kick_aim_quality"),
+                    "kick_predicted_y_at_goal_line": robot_info.get("kick_predicted_y_at_goal_line"),
+                    "kick_gap_quality": robot_info.get("kick_gap_quality"),
+                    "kick_gap_quality_at_fire": robot_info.get("kick_gap_quality_at_fire"),
+                    "kick_keeper_zone_factor": robot_info.get("kick_keeper_zone_factor"),
+                    "kick_fire_x": robot_info.get("kick_fire_x"),
+                    "kick_fire_y": robot_info.get("kick_fire_y"),
+                    "kick_fire_dist_to_keeper": robot_info.get("kick_fire_dist_to_keeper"),
+                    "kick_fire_dist_to_goal_line": robot_info.get("kick_fire_dist_to_goal_line"),
+                    "kick_keeper_x": robot_info.get("kick_keeper_x"),
+                    "kick_keeper_y": robot_info.get("kick_keeper_y"),
+                    "kick_opposite_keeper_side": robot_info.get("kick_opposite_keeper_side"),
                     "command": robot_info.get("command"),
                 }, default=str) + "\n")
 
@@ -835,6 +1081,11 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
             reason = info.get("termination_reason") if isinstance(info, dict) else None
             if not reason:
                 reason = "max_steps" if truncated else "unknown"
+            if episode_shot_probe_events:
+                for event in episode_shot_probe_events:
+                    event["outcome"] = reason
+                    event["terminal_kick"] = False
+                episode_shot_probe_events[-1]["terminal_kick"] = True
             outcomes.append(reason)
             episode_rewards.append(total_reward)
 
@@ -847,10 +1098,24 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                     rewards=episode_rewards[-WINDOW:],
                     kicks=window_kicks,
                     actions=actions_window,
+                    carry_segments=carry_segments_window,
+                    carry_steps=carry_steps_window,
+                )
+                _SUMMARY_LOG.info(
+                    "[eps %d-%d] requested: %s",
+                    episode_count - WINDOW + 1,
+                    episode_count,
+                    " ".join(
+                        f"{k}={v}" for k, v in sorted(requested_actions_window.items())
+                    ) or "—",
                 )
                 actions_window = Counter()
+                requested_actions_window = Counter()
+                carry_segments_window = 0
+                carry_steps_window = 0
 
             total_reward = 0.0
+            episode_shot_probe_events = []
             obs, info = env.reset()
             agent_mask = info.get("agent_active_mask", agent_mask)
             context_mask = info.get("context_active_mask", context_mask)
@@ -868,6 +1133,12 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         rewards=episode_rewards,
         kicks=collector.kicks,
         actions=actions_total,
+        carry_segments=carry_segments_total,
+        carry_steps=carry_steps_total,
+    )
+    _SUMMARY_LOG.info(
+        "[ALL] requested: %s",
+        " ".join(f"{k}={v}" for k, v in sorted(requested_actions_total.items())) or "—",
     )
     last_stats = None
     if len(outcomes) > 100:
@@ -879,6 +1150,19 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
             actions=Counter(),
         )
 
+    shot_probe_summary = None
+    if shot_probe_events:
+        shot_probe_path = log_dir / "shot_probe_events.jsonl"
+        with shot_probe_path.open("w") as f:
+            for event in shot_probe_events:
+                f.write(json.dumps(event, default=str) + "\n")
+        shot_probe_summary = _summarize_shot_probe_events(shot_probe_events)
+        shot_probe_summary_path = log_dir / "shot_probe_summary.json"
+        with shot_probe_summary_path.open("w") as f:
+            json.dump(shot_probe_summary, f, indent=2, default=str)
+        _SUMMARY_LOG.info("Saved shot probe events to %s", shot_probe_path)
+        _SUMMARY_LOG.info("Saved shot probe summary to %s", shot_probe_summary_path)
+
     summary_payload = {
         "model_path": args.model_path,
         "stage": args.stage,
@@ -888,7 +1172,9 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         "episodes": episode_count,
         "all": all_stats,
         "last_100": last_stats,
+        "requested_actions": dict(requested_actions_total),
         "executed_actions": dict(actions_total),
+        "shot_probe": shot_probe_summary,
     }
     summary_file = log_dir / "summary.json"
     with summary_file.open("w") as f:
@@ -921,8 +1207,9 @@ def main():
     parser.add_argument(
         "--trainer",
         choices=list(_TRAINER_RUNNERS.keys()),
-        required=True,
-        help="Which trainer/algorithm the saved model was trained with",
+        default="ppo_jal",
+        help="Which trainer/algorithm the saved model was trained with "
+             "(default: ppo_jal)",
     )
     parser.add_argument("--team_config", type=str, default="team_config.json",
                         help="Path to team configuration JSON file")

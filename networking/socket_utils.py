@@ -6,11 +6,16 @@ and commanding both simulated and physical robots through various network protoc
 """
 
 import re
+import gc
+import fcntl
 import math
+import os
 import random
 import time
 import socket
+import tempfile
 import threading
+from contextlib import contextmanager
 from typing import Optional
 import sslclient
 from .data_utils import GameState, TeamInfo, Deserializer
@@ -74,6 +79,45 @@ def _compute_init_pose(side: str, first: bool, goalie: bool):
     return (x, y, theta)
 
 
+# Play modes the embedded engine can recover from with a soft reset
+# (PM_PlayOn + move_ball/move_player). These are either active play, the
+# kick-off lifecycle, or modes the *env* terminated on while the engine was
+# still in play (OOB / keeper-cleared detected by ball position). Any OTHER
+# mode is a referee set-piece (free kick, goal kick, corner, catch, foul, …)
+# that latches held-ball state inside the native engine which set_play_mode
+# does NOT clear — the next step() re-snaps the ball and bricks the sim, so
+# those require a full engine rebuild instead. See EmbeddedSimulatorBackend.reset.
+_SOFT_RESETTABLE_PLAYMODES = frozenset({
+    "PM_PlayOn",
+    "PM_BeforeKickOff",
+    "PM_KickOff_Left",
+    "PM_KickOff_Right",
+    "PM_AfterGoal_Left",
+    "PM_AfterGoal_Right",
+    "PM_Null",
+})
+
+
+@contextmanager
+def _embedded_sim_init_lock():
+    """Serialize native embedded-server port discovery and socket binding.
+
+    The C++ wrapper finds an unused three-port block before Stadium::init()
+    binds it. Those operations are individually correct but not atomic across
+    inference subprocesses: concurrent initializers can select overlapping
+    blocks and all but one then fail to bind. The lock covers initialization
+    only; simulator stepping remains fully parallel afterward.
+    """
+    lock_path = os.path.join(tempfile.gettempdir(),
+                             "rcssserver_embedded_init.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 class EmbeddedSimulatorBackend:
     """Shared synchronous simulator backend used by Listener and Commander."""
 
@@ -95,8 +139,26 @@ class EmbeddedSimulatorBackend:
         self._initialize_simulator()
 
     def _initialize_simulator(self):
-        sim = embedded_sim.EmbeddedSimulator()
-        sim.init()
+        # When rebuilding mid-run (sticky referee-state recovery in reset), the
+        # previous native simulator must be released *before* constructing the
+        # replacement: its server socket is still bound, so a fresh init() would
+        # otherwise fail with "Address already in use" and come up dead. Dropping
+        # the last Python reference runs the C++ destructor (which closes the
+        # socket); gc.collect() also breaks any reference cycles holding it.
+        if self._sim is not None:
+            self._sim = None
+            self._last_state = None
+            gc.collect()
+
+        # The native wrapper performs free-port discovery followed by socket
+        # binding. Keep that pair atomic across embedded inference processes.
+        with _embedded_sim_init_lock():
+            sim = embedded_sim.EmbeddedSimulator()
+            if not sim.init():
+                raise RuntimeError(
+                    "Embedded simulator initialization failed; native "
+                    "rcssserver could not initialize its server sockets."
+                )
 
         left_team, right_team = self.team_infos
         sim.set_team_name(embedded_sim.Side.LEFT, left_team.name)
@@ -132,6 +194,8 @@ class EmbeddedSimulatorBackend:
 
         self._sim = sim
         self._pending_commands.clear()
+        # A fresh engine holds no ball; clear any tracked catch-glue ownership.
+        self._ball_caught_by = None
         self.desired_init_poses[:] = desired_init_poses
         self._last_state = self._sim.snapshot()
 
@@ -167,6 +231,18 @@ class EmbeddedSimulatorBackend:
             command_text = self._normalize_command(command)
             if not command_text:
                 continue
+            # Track catch-glue ownership. A `catch` glues the ball to this player;
+            # `drop`/`kick` release it. If an episode ENDS while the ball is still
+            # caught (e.g. max_steps hits mid-carry), the engine re-snaps the held
+            # ball onto the holder on the next episode's first step, tripping the
+            # ball_teleport guard and bricking every following episode (all 1-step,
+            # playmode stays play_on so the referee-mode recovery never fires).
+            # reset() reads this to rebuild the engine and clear the latched hold.
+            inner = command_text.strip("()").strip()
+            if inner.startswith("catch"):
+                self._ball_caught_by = (side, unum)
+            elif inner.startswith("drop") or inner.startswith("kick"):
+                self._ball_caught_by = None
             queued.append(embedded_sim.PlayerCommand(side, unum, command_text))
 
         with self._lock:
@@ -274,6 +350,24 @@ class EmbeddedSimulatorBackend:
                 convention) and converted to radians for the engine.
         """
         with self._lock:
+            # If the previous episode left the engine in a referee set-piece mode
+            # (free kick, goal kick, corner, catch, foul, …), a PM_PlayOn +
+            # move_ball soft reset does NOT clear the latched held-ball state:
+            # the next step() re-snaps the ball to the set-piece spot and bricks
+            # the sim for every following episode. Detect that here from the last
+            # observed play mode and rebuild the engine from a clean slate, which
+            # has no latched referee state. Goals/kick-offs/PlayOn-terminated
+            # episodes (OOB, keeper-cleared) stay on the cheap soft-reset path.
+            prev_pm = getattr(self._last_state, "playmode", None)
+            prev_pm_name = getattr(prev_pm, "name", None) or ""
+            # Rebuild when the engine left a sticky referee set-piece OR when the
+            # ball is still caught (glued to a player) — both latch held-ball state
+            # that a PM_PlayOn + move_ball soft reset cannot clear. The caught case
+            # stays on play_on, so it must be detected from tracked catch ownership
+            # rather than the play mode. _initialize_simulator clears _ball_caught_by.
+            if prev_pm_name not in _SOFT_RESETTABLE_PLAYMODES or self._ball_caught_by is not None:
+                self._initialize_simulator()
+
             # PlayOn first so subsequent teleports are not overwritten by a
             # kick-off ball reset, and so the next step advances real physics.
             self._sim.set_play_mode(embedded_sim.PlayMode.PM_PlayOn)

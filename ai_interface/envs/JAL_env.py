@@ -17,7 +17,14 @@ from gymnasium import spaces
 import numpy as np
 
 from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
-from ai_interface.utils.basic_commands import goto, approach_ball
+from ai_interface.utils.basic_commands import (
+    goto, approach_ball, kick, dribble_to, DribbleState,
+    DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_ALIGN_RELEASE,
+    DRIBBLE_PHASE_GRAB, DRIBBLE_PHASE_SETTLE,
+    DRIBBLE_PHASE_VERIFY,
+    DRIBBLE_PHASE_RELEASE,
+    DRIBBLE_PHASE_DONE,
+)
 from ai_interface.constants.field_constants import *
 from ai_interface.constants.player_constants import *
 from ai_interface.envs.reward import (
@@ -27,13 +34,16 @@ from ai_interface.envs.reward import (
     evaluate_reward,
     extract_opponent_positions,
     goalie_gap_quality,
+    post_safe_goalie_gap_quality,
+    positional_gap_quality,
+    reachable_gap_delta,
 )
 from networking.networker import Networker
-from networking.data_utils import GameState
+from networking.data_utils import GameState, limit_turn_rate
 
 
 class JALTeamEnv(gym.Env):
-    ACTION_TYPES = ["goto", "turn", "kick", "start_dribble", "stop_dribble"]
+    ACTION_TYPES = ["goto", "turn", "kick", "dribble_to"]
 
     def __init__(
         self, 
@@ -72,12 +82,14 @@ class JALTeamEnv(gym.Env):
         kick_tie_break_epsilon: float = 0.0,
         approach_defer_when_has_ball: bool = False,
         approach_defer_epsilon: float = 0.0,
+        ball_action_recovery: bool = False,
+        ball_claimant_robot_ids: Optional[List[int]] = None,
+        ball_claimant_switch_margin: float = 0.75,
+        turn_stall_limit: int = 12,
+        turn_stall_displacement: float = 0.05,
         reward_config_overrides: Optional[Dict[str, float]] = None,
-        scripted_opponent_goalie: bool = False,
-        opponent_goalie_team: Optional[str] = None,
-        observe_opponents: bool = False,
-        ball_cleared_x_threshold: Optional[float] = None,
-        some_arg=None
+        some_arg=None,
+        opponent_team_name: Optional[str] = None,
         ):
 
         super().__init__()
@@ -131,26 +143,19 @@ class JALTeamEnv(gym.Env):
         self.kick_tie_break_epsilon: float = max(0.0, float(kick_tie_break_epsilon))
         self.approach_defer_when_has_ball: bool = bool(approach_defer_when_has_ball)
         self.approach_defer_epsilon: float = max(0.0, float(approach_defer_epsilon))
-
-        # Stage 2: scripted opponent goalie (ai_interface/goalie.py) driven by
-        # the env each step so both trainer and inference field the same keeper.
-        # observe_opponents fills context slot 0+ with opponent poses (keeper
-        # first) and flips context_active_mask — the obs stays 105-D; only the
-        # previously-zero context block becomes live. ball_cleared_x_threshold
-        # terminates the episode when the keeper clears the ball back upfield
-        # (the duel is decided; don't burn the remaining max_steps).
-        self.scripted_opponent_goalie: bool = bool(scripted_opponent_goalie)
-        self.opponent_goalie_team: Optional[str] = opponent_goalie_team
-        self.observe_opponents: bool = bool(observe_opponents)
-        self.ball_cleared_x_threshold: Optional[float] = (
-            float(ball_cleared_x_threshold)
-            if ball_cleared_x_threshold is not None else None
-        )
-        self._scripted_goalie = None  # fresh Goalie instance per episode
-        # Prev opponent poses by context slot for velocity differencing
-        # (opponents are slot-ordered nearest-to-GOAL_R first, so slot 0 is
-        # always the keeper while it holds its goal).
-        self.prev_opponent_pose_by_slot: Dict[int, np.ndarray] = {}
+        self.ball_action_recovery: bool = bool(ball_action_recovery)
+        eligible_ids = self.robot_ids if ball_claimant_robot_ids is None else ball_claimant_robot_ids
+        self.ball_claimant_robot_ids: List[int] = [
+            int(rid) for rid in eligible_ids if int(rid) in self.robot_ids
+        ]
+        self.ball_claimant_switch_margin: float = max(0.0, float(ball_claimant_switch_margin))
+        self.turn_stall_limit: int = max(1, int(turn_stall_limit))
+        self.turn_stall_displacement: float = max(0.0, float(turn_stall_displacement))
+        self.ball_claimant_id: Optional[int] = None
+        self.turn_stall_steps: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
+        self._turn_stall_last_pose: Dict[int, Optional[Tuple[float, float]]] = {
+            rid: None for rid in self.robot_ids
+        }
 
         # Build a RewardConfig with optional overrides from caller. Field names
         # must match the RewardConfig dataclass attributes in reward.py.
@@ -199,36 +204,38 @@ class JALTeamEnv(gym.Env):
             shape=(self.obs_dim,),
             dtype=np.float32
             )
+        # Opponent team name for filling context slots (slot 1 = opp goalie).
+        self.opponent_team_name: Optional[str] = opponent_team_name
+
         # Active masks: which agent slots are controlled robots, which context
         # slots are present. Static within Stage 1 (1 robot, no context); later
         # stages / foul-randomization will vary them per episode.
         self.agent_active_mask = np.zeros(self.a_max, dtype=np.float32)
         self.agent_active_mask[: self.num_robots] = 1.0
-        self.context_active_mask = np.zeros(self.c_max, dtype=np.float32)  # TODO(opponent-stage)
+        self.context_active_mask = np.zeros(self.c_max, dtype=np.float32)
+        if self.opponent_team_name is not None:
+            self.context_active_mask[1] = 1.0  # slot 1 = opp goalie
         self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
         self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
 
-        # Stage 2 dribble session state (command-level, distinct from the
-        # proximity-based is_dribbling/start_dribble_pos used by the obs).
-        # A session opens on a VALID start_dribble (catch) and is anchored at
-        # the robot's position; it ends on stop_dribble (drop), a fired kick,
-        # or exhaustion (anchor distance >= reward_config.dribble_max_radius,
-        # which forces a drop). After any session ends the robot must create
-        # visible separation from the ball (robot-ball dist > kickable_dist +
-        # dribble_redribble_gap_margin) before start_dribble is valid again.
+        # Per-robot DribbleState for the dribble_to phase machine (basic_commands).
+        self.dribble_states: Dict[int, DribbleState] = {rid: DribbleState() for rid in self.robot_ids}
+        # Dribble session tracking derived from DribbleState phases, used by
+        # reward code and info reporting.
         self.dribble_session_active: Dict[int, bool] = {rid: False for rid in self.robot_ids}
         self.dribble_anchor: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
-        self.dribble_exhausted: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        self.awaiting_redribble_gap: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        
-        # Action design per robot (9D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, start_dribble_logit, stop_dribble_logit, goto_x, goto_y, turn_theta]
-        # Matches the layout used to train `stage1_6_final_58pct.zip` so that
-        # checkpoint can be warm-started directly. In the 58% run only turn
-        # (slot 2) and kick (slot 3) were enabled, so those slots carry
-        # trained weights; goto / approach_ball / start_dribble / stop_dribble
-        # were masked and have effectively untrained weights. For stage1_9 we
-        # enable approach_ball alongside the already-trained turn/kick.
-        self.action_dim_per_robot = 9
+        # Steps since the last dribble release per robot (phase CARRY→RELEASE).
+        self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
+        # dribble_to reward tracking: target chosen, prev distance, action transition.
+        self.dribble_to_target: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
+        self.prev_ball_to_dribble_target_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+        self._prev_action_was_dribble_to: Dict[int, bool] = {rid: False for rid in self.robot_ids}
+        # Positional_gap_quality at the spot where the current carry segment
+        # opened; used to pay the achieved-gap reward when the segment closes.
+        self.dribble_carry_start_gap: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+
+        # Action design per robot (8D): [goto_logit, approach_ball_logit, turn_logit, kick_logit, dribble_to_logit, goto_x, goto_y, turn_theta]
+        self.action_dim_per_robot = 8
         self.action_space = spaces.Box(
             low=-1.0, 
             high=1.0, 
@@ -266,11 +273,44 @@ class JALTeamEnv(gym.Env):
 
         # Per-robot pose history for velocity estimation
         self.prev_robot_pose_by_id: Dict[int, np.ndarray] = {}
+        self.prev_opp_pose_by_id: Dict[int, np.ndarray] = {}
         self.prev_reward_ball_dist_by_id: Dict[int, float] = {}
         self.prev_reward_ball_to_goal_dist: Optional[float] = None
         self.prev_reward_ball_pos: Optional[Tuple[float, float]] = None
         self.prev_reward_facing_goal_cos_by_id: Dict[int, float] = {}
         self._stopped_ball_counter: int = 0
+
+        # Frozen-state detection: counts consecutive steps where BOTH the
+        # ball position AND our robots' poses are bit-identical to the prior
+        # step. A stalled/stale sim connection (or a stuck-ball edge case)
+        # repeats the same frame indefinitely; without this, reward terms
+        # computed from static pose (e.g. kick_aim_bonus) get re-granted
+        # every step with no actual progress, letting an episode rack up a
+        # huge total_reward purely from a frozen frame. Unlike
+        # _stopped_ball_counter (which only ends episodes when
+        # approach_ball/goto are both disabled), this runs unconditionally.
+        self._frozen_state_counter: int = 0
+
+        # Per-robot (rx, ry, theta, bx, by) snapshot at the last step a kick
+        # was actually rewarded. If a subsequent kick fires from the exact
+        # same snapshot, the underlying frame didn't change — skip awarding
+        # kick_aim_bonus/bad_aim_penalty again so a frozen frame can't farm
+        # the bonus once per step. See _frozen_state_counter above for the
+        # episode-level backstop.
+        self._last_rewarded_kick_state: Dict[int, Tuple[float, float, float, float, float]] = {}
+        # Debug/probe diagnostics for the latest real fired kick in the current
+        # episode. `infer.py --debug_infer` uses these per-step fields plus the
+        # final episode outcome to compute catch rate by fire distance.
+        self._last_kick_probe_by_id: Dict[int, Dict[str, Any]] = {}
+        # Per-robot kick macro state. With the real turn cap (20 deg/s), a
+        # kick request often needs many simulator cycles of internal alignment
+        # before the primitive can fire. Keep that alignment committed across
+        # policy steps so a sampled dribble_to/approach does not interrupt it.
+        self.kick_macro_active: Dict[int, bool] = {rid: False for rid in self.robot_ids}
+        self.kick_macro_target_y: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+        self.kick_macro_align_steps: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
+        self.kick_macro_retarget_count: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
+        self.kick_macro_max_align_steps: int = 120
 
         # Statistics
         self.total_rewards = 0.0
@@ -288,6 +328,136 @@ class JALTeamEnv(gym.Env):
             f"random_spawn_theta={self.random_spawn_theta}"
         )
 
+    def _ball_claimant(
+        self,
+        game_state,
+        pose_by_robot_id: Optional[Dict[int, Any]] = None,
+    ) -> Optional[int]:
+        """Return the one controlled robot allowed to execute ball-seeking actions.
+
+        A committed dribble owns the claim. Otherwise possession-range robots take
+        priority, then the nearest configured eligible robot. The current claimant
+        is retained within ``ball_claimant_switch_margin`` of the nearest candidate
+        to prevent two nearby teammates from swapping ownership every simulator
+        cycle. Goalkeepers or fixed support robots can be excluded through
+        ``ball_claimant_robot_ids``.
+        """
+        if not getattr(self, "ball_action_recovery", False) or game_state is None:
+            return None
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is None or len(ball_pos) < 2:
+            return getattr(self, "ball_claimant_id", None)
+        if pose_by_robot_id is None:
+            pose_by_robot_id = {}
+            for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []) or []:
+                if isinstance(entry, dict):
+                    pose_by_robot_id.update(entry)
+
+        eligible = getattr(self, "ball_claimant_robot_ids", self.robot_ids)
+        distances = {
+            rid: float(np.hypot(
+                float(pose_by_robot_id[rid][0]) - float(ball_pos[0]),
+                float(pose_by_robot_id[rid][1]) - float(ball_pos[1]),
+            ))
+            for rid in eligible
+            if rid in pose_by_robot_id
+        }
+        if not distances:
+            self.ball_claimant_id = None
+            return None
+
+        dribble_states = getattr(self, "dribble_states", {})
+        kick_macro_active = getattr(self, "kick_macro_active", {})
+        committed = [
+            rid for rid in distances
+            if (
+                bool(getattr(dribble_states.get(rid), "committed", False))
+                or bool(kick_macro_active.get(rid, False))
+            )
+        ]
+        if committed:
+            claimant = min(committed, key=distances.__getitem__)
+            self.ball_claimant_id = claimant
+            return claimant
+
+        kickable_dist = float(getattr(self, "kickable_dist", 0.0))
+        possessing = [rid for rid, dist in distances.items() if dist <= kickable_dist]
+        candidates = possessing if possessing else list(distances)
+        nearest = min(candidates, key=distances.__getitem__)
+        current = getattr(self, "ball_claimant_id", None)
+        switch_margin = float(getattr(self, "ball_claimant_switch_margin", 0.75))
+        if current in candidates and distances[current] <= distances[nearest] + switch_margin:
+            claimant = current
+        else:
+            claimant = nearest
+        self.ball_claimant_id = claimant
+        return claimant
+
+    def get_primitive_valid_mask(
+        self,
+        game_state=None,
+        num_primitives: int = 12,
+    ) -> np.ndarray:
+        """Build the per-slot runtime primitive mask used by PPO sampling.
+
+        Only the claimant may approach, kick, or dribble. For the claimant,
+        approach is valid only outside possession range and kick/dribble only
+        inside it. A claimant that has issued too many stationary turns has turn
+        temporarily masked, forcing the categorical policy to choose approach.
+        Stage-disabled and reserved primitive masks are applied separately by the
+        PPO agent.
+        """
+        mask = np.ones((self.a_max, int(num_primitives)), dtype=np.float32)
+        if not getattr(self, "ball_action_recovery", False):
+            return mask
+        if game_state is None:
+            game_state = getattr(self, "_cached_game_state", None)
+        if game_state is None:
+            return mask
+
+        pose_by_robot_id: Dict[int, Any] = {}
+        for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []) or []:
+            if isinstance(entry, dict):
+                pose_by_robot_id.update(entry)
+        ball_pos = getattr(game_state, "ball_pos", None)
+        claimant = self._ball_claimant(game_state, pose_by_robot_id)
+        for slot, rid in enumerate(self.robot_ids):
+            if slot >= self.a_max or rid not in pose_by_robot_id or ball_pos is None:
+                continue
+            dist = float(np.hypot(
+                float(pose_by_robot_id[rid][0]) - float(ball_pos[0]),
+                float(pose_by_robot_id[rid][1]) - float(ball_pos[1]),
+            ))
+            dribble_state = getattr(self, "dribble_states", {}).get(rid)
+            if bool(getattr(self, "kick_macro_active", {}).get(rid, False)):
+                # A committed kick alignment owns the ball until it fires,
+                # times out, or loses possession. Do not let the sampler switch
+                # to dribble_to/approach mid-aim under the 20 deg/s turn cap.
+                mask[slot, :5] = 0.0
+                mask[slot, 3] = 1.0
+                continue
+            if bool(getattr(dribble_state, "committed", False)):
+                # A committed macro owns the transition. The policy may either
+                # continue it or interrupt with kick; all other sampled actions
+                # would be ignored and violate PPO's action/transition contract.
+                mask[slot, :5] = 0.0
+                mask[slot, 3] = 1.0  # kick interrupt
+                mask[slot, 4] = 1.0  # parameterless continuation (target latched)
+                continue
+            if rid != claimant:
+                mask[slot, 1] = 0.0  # approach_ball
+                mask[slot, 3] = 0.0  # kick
+                mask[slot, 4] = 0.0  # dribble_to
+                continue
+            if dist > self.kickable_dist:
+                mask[slot, 3] = 0.0
+                mask[slot, 4] = 0.0
+            else:
+                mask[slot, 1] = 0.0
+            if getattr(self, "turn_stall_steps", {}).get(rid, 0) >= self.turn_stall_limit:
+                mask[slot, 2] = 0.0
+        return mask
+
     def _select_action_index(
         self,
         logits: np.ndarray,
@@ -297,7 +467,7 @@ class JALTeamEnv(gym.Env):
         if has_ball_now:
             allowed_indices = np.array([0, 1, 2, 3, 4], dtype=np.int64)
         else:
-            allowed_indices = np.array([0, 1], dtype=np.int64)
+            allowed_indices = np.array([0, 1, 4], dtype=np.int64)
 
         allowed_logits = logits[allowed_indices]
         allowed_logits_shifted = allowed_logits - np.max(allowed_logits)
@@ -416,31 +586,33 @@ class JALTeamEnv(gym.Env):
 
         # Clear robot pose memory
         self.prev_robot_pose_by_id = {}
+        self.prev_opp_pose_by_id = {}
         self.prev_reward_ball_dist_by_id = {}
         self.prev_reward_ball_to_goal_dist = None
         self.prev_reward_ball_pos = None
         self.prev_reward_facing_goal_cos_by_id = {}
         self._stopped_ball_counter = 0
+        self._frozen_state_counter = 0
+        self._last_rewarded_kick_state = {}
+        self._last_kick_probe_by_id = {}
+        self.kick_macro_active = {rid: False for rid in self.robot_ids}
+        self.kick_macro_target_y = {rid: None for rid in self.robot_ids}
+        self.kick_macro_align_steps = {rid: 0 for rid in self.robot_ids}
+        self.kick_macro_retarget_count = {rid: 0 for rid in self.robot_ids}
 
-        # Clear stage 2 dribble session state
+        # Clear dribble_to phase machine and session tracking state
+        for rid in self.robot_ids:
+            self.dribble_states[rid].reset()
         self.dribble_session_active = {rid: False for rid in self.robot_ids}
         self.dribble_anchor = {rid: None for rid in self.robot_ids}
-        self.dribble_exhausted = {rid: False for rid in self.robot_ids}
-        self.awaiting_redribble_gap = {rid: False for rid in self.robot_ids}
-
-        # Stage 2: fresh scripted keeper per episode. A new instance clears its
-        # ball-velocity history and mode state machine, which would otherwise
-        # see the episode-reset teleport as a fast-moving ball (false BLOCK).
-        self.prev_opponent_pose_by_slot = {}
-        if self.scripted_opponent_goalie:
-            from ai_interface.goalie import Goalie  # local import: keep stage-1 paths free of Player deps
-            self._scripted_goalie = Goalie(
-                teamname=self.opponent_goalie_team or "TeamB",
-                unum=1,
-                side="right",
-            )
-        else:
-            self._scripted_goalie = None
+        self.steps_since_stop_dribble = {rid: None for rid in self.robot_ids}
+        self.dribble_to_target = {rid: None for rid in self.robot_ids}
+        self.prev_ball_to_dribble_target_dist = {rid: None for rid in self.robot_ids}
+        self._prev_action_was_dribble_to = {rid: False for rid in self.robot_ids}
+        self.dribble_carry_start_gap = {rid: None for rid in self.robot_ids}
+        self.ball_claimant_id = None
+        self.turn_stall_steps = {rid: 0 for rid in self.robot_ids}
+        self._turn_stall_last_pose = {rid: None for rid in self.robot_ids}
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -543,12 +715,6 @@ class JALTeamEnv(gym.Env):
         # Send commands to simulator
         self._send_commands(commands)
 
-        # Stage 2: queue the scripted keeper's command BEFORE advancing the
-        # sim (the embedded backend applies all pending commands from both
-        # teams in one watch_game() step), so keeper and policy act in the
-        # same cycle.
-        self._drive_scripted_goalie(current_game_state)
-
         # Read next state after sending commands, then build next observation.
         next_game_state = self._get_game_state(
             retries=self.state_retry_count,
@@ -626,6 +792,7 @@ class JALTeamEnv(gym.Env):
                 self._opponent_goalie_pose(current_game_state) if use_goalie_gate else None
             )
             gk_y = float(goalie_pose[1]) if goalie_pose is not None else None
+            kick_ball_pos = getattr(current_game_state, "ball_pos", None)
             for info_i in per_robot:
                 if info_i.get("action_type") != "kick":
                     continue
@@ -640,11 +807,60 @@ class JALTeamEnv(gym.Env):
                 if pose is None:
                     continue
                 rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
-                aim_quality, predicted_y_at_goal_line = self._kick_aim_quality_from_pose(pose)
+                robot_id_i = info_i.get("robot_id")
+                if kick_ball_pos is not None and len(kick_ball_pos) >= 2:
+                    kick_state_snapshot = (
+                        round(rx, 3), round(ry, 3), round(theta_deg, 1),
+                        round(float(kick_ball_pos[0]), 3), round(float(kick_ball_pos[1]), 3),
+                    )
+                    # Identical (pose, ball) snapshot as the last kick we
+                    # rewarded for this robot means the frame hasn't actually
+                    # advanced (frozen/stale state) — the kick didn't do
+                    # anything new, so don't pay the aim bonus again.
+                    if self._last_rewarded_kick_state.get(robot_id_i) == kick_state_snapshot:
+                        continue
+                    self._last_rewarded_kick_state[robot_id_i] = kick_state_snapshot
+                aim_quality, predicted_y_at_goal_line = self._kick_aim_quality_from_pose(
+                    pose, kick_ball_pos
+                )
+                # The command-generation path may leave these as None because
+                # a requested kick can first execute as an internal alignment
+                # turn. Once a kick truly fires, the reward path computes the
+                # authoritative shot projection; write it back into the
+                # per-step info so infer.py's shot probe records the same
+                # values that the reward/log line used.
+                info_i["kick_aim_quality"] = aim_quality
+                info_i["kick_predicted_y_at_goal_line"] = predicted_y_at_goal_line
+                if kick_ball_pos is not None and len(kick_ball_pos) >= 2:
+                    fire_x = float(kick_ball_pos[0])
+                    fire_y = float(kick_ball_pos[1])
+                else:
+                    fire_x = rx
+                    fire_y = ry
+                if goalie_pose is not None:
+                    gk_x = float(goalie_pose[0])
+                    gk_y_probe = float(goalie_pose[1])
+                    fire_dist_to_keeper = math.hypot(fire_x - gk_x, fire_y - gk_y_probe)
+                else:
+                    gk_x = None
+                    gk_y_probe = None
+                    fire_dist_to_keeper = None
+                fire_dist_to_goal_line = max(0.0, float(FIELD_X[1]) - fire_x)
+                info_i["kick_fire_x"] = fire_x
+                info_i["kick_fire_y"] = fire_y
+                info_i["kick_fire_dist_to_keeper"] = fire_dist_to_keeper
+                info_i["kick_fire_dist_to_goal_line"] = fire_dist_to_goal_line
+                info_i["kick_keeper_x"] = gk_x
+                info_i["kick_keeper_y"] = gk_y_probe
                 # Facing away from / parallel to the goal line: kick can
                 # never cross x=FIELD_X[1]. Guaranteed miss — apply the
                 # bad-aim penalty and move on.
                 if predicted_y_at_goal_line is None:
+                    info_i["kick_gap_quality"] = None
+                    info_i["kick_gap_quality_at_fire"] = None
+                    info_i["kick_keeper_zone_factor"] = self._keeper_zone_factor(
+                        (fire_x, fire_y), goalie_pose
+                    )
                     if bad_aim_penalty > 0.0:
                         reward -= bad_aim_penalty
                     self.logger.info(
@@ -655,6 +871,9 @@ class JALTeamEnv(gym.Env):
                     continue
                 bad_aim = aim_quality <= 0.0
                 gap_quality: Optional[float] = None
+                # Suppress gap-scaled credit for a shot taken from inside the
+                # keeper's catch zone (where gap_quality perversely peaks).
+                kz = self._keeper_zone_factor((fire_x, fire_y), goalie_pose)
                 if bad_aim:
                     if bad_aim_penalty > 0.0:
                         reward -= _miss_penalty(predicted_y_at_goal_line)
@@ -662,14 +881,15 @@ class JALTeamEnv(gym.Env):
                     # Pay placement: 0 at the keeper's y, 1 at max in-mouth
                     # separation. The blend term eases transfer from the
                     # stage-1 center-aim checkpoint early in the stage.
-                    gap_quality = goalie_gap_quality(
-                        predicted_y_at_goal_line, gk_y, goal_half_height
+                    gap_quality = post_safe_goalie_gap_quality(
+                        predicted_y_at_goal_line, gk_y, goal_half_height,
+                        float(getattr(self.reward_config, "goal_post_safety_margin", 0.0)),
                     )
                     blended_quality = (
                         (1.0 - goalie_gap_blend_center) * gap_quality
                         + goalie_gap_blend_center * aim_quality
                     )
-                    reward += blended_quality * kick_aim_weight
+                    reward += blended_quality * kick_aim_weight * kz
                     if (
                         gap_quality < goalie_gap_min_quality
                         and kick_into_keeper_penalty > 0.0
@@ -677,7 +897,39 @@ class JALTeamEnv(gym.Env):
                         # On target but into the keeper's cover.
                         reward -= kick_into_keeper_penalty
                 else:
-                    reward += aim_quality * kick_aim_weight
+                    reward += aim_quality * kick_aim_weight * kz
+                # Stash the goalie-gap quality of this kick so the dribble→kick
+                # combo bonus below can scale by GAP (corner placement) rather
+                # than center-mouth aim — a centered kick after a useless dribble
+                # then earns ~0 combo. None when bad-aim or no goalie gate
+                # (combo falls back to center-mouth aim in that case).
+                info_i["kick_gap_quality"] = gap_quality
+                info_i["kick_gap_quality_at_fire"] = gap_quality
+                info_i["kick_keeper_zone_factor"] = kz
+                info_i["kick_opposite_keeper_side"] = bool(
+                    gk_y is not None
+                    and predicted_y_at_goal_line * gk_y < 0.0
+                )
+                probe = {
+                    "robot_id": robot_id_i,
+                    "step": int(self.current_step),
+                    "fire_x": fire_x,
+                    "fire_y": fire_y,
+                    "fire_dist_to_keeper": fire_dist_to_keeper,
+                    "fire_dist_to_goal_line": fire_dist_to_goal_line,
+                    "keeper_x": gk_x,
+                    "keeper_y": gk_y_probe,
+                    "predicted_y_at_goal_line": predicted_y_at_goal_line,
+                    "aim_quality": aim_quality,
+                    "bad_aim": bad_aim,
+                    "gap_quality_at_fire": gap_quality,
+                    "keeper_zone_factor": kz,
+                    "opposite_keeper_side": info_i["kick_opposite_keeper_side"],
+                    "steps_since_dribble": self.steps_since_stop_dribble.get(robot_id_i),
+                }
+                if robot_id_i is not None:
+                    self._last_kick_probe_by_id[int(robot_id_i)] = probe
+                info_i["kick_probe"] = dict(probe)
                 # Diagnostic log: confirms predicted_y vs the actual episode
                 # outcome. If most ball_in_penalty_off_target episodes show
                 # high aim_quality at fire, the divergence is on the physics
@@ -685,25 +937,187 @@ class JALTeamEnv(gym.Env):
                 self.logger.info(
                     "Kick fired: robot=(%.2f, %.2f, %.1f°)  "
                     "predicted_y=%.2f  aim_quality=%.2f  bad_aim=%s  "
-                    "gk_y=%s  gap_quality=%s",
+                    "gk_y=%s  gap_quality=%s  fire_dist_to_keeper=%s  "
+                    "steps_since_dribble=%s",
                     rx, ry, theta_deg, predicted_y_at_goal_line,
                     aim_quality, bad_aim,
                     f"{gk_y:.2f}" if gk_y is not None else "N/A",
                     f"{gap_quality:.2f}" if gap_quality is not None else "N/A",
+                    f"{fire_dist_to_keeper:.2f}" if fire_dist_to_keeper is not None else "N/A",
+                    self.steps_since_stop_dribble.get(robot_id_i),
                 )
 
-        # Stage 2: one-shot bonus for deliberately releasing the ball late in
-        # a dribble session (instead of spamming start_dribble at the limit),
-        # setting up the stop -> re-approach -> turn -> kick chain.
-        stop_release_bonus = float(
-            getattr(self.reward_config, "stop_dribble_release_bonus", 0.0)
+        # Immediate signed target-quality reward. The target parameters exist
+        # only on the fresh commitment transition, so reward them there rather
+        # than after a potentially long GRAB/catch delay. Evaluate the endpoint
+        # reachable in one legal 0.85 m segment, not the distant declared target.
+        dribble_quality_weight = float(
+            getattr(self.reward_config, "dribble_target_quality_weight", 0.0)
         )
-        if stop_release_bonus > 0.0:
+        if dribble_quality_weight > 0.0 and current_game_state is not None:
+            gs_ball_pos = getattr(current_game_state, "ball_pos", None)
             for info_i in action_info.get("per_robot", []):
-                if info_i.get("stop_dribble_fired") and info_i.get("stop_dribble_at_limit"):
-                    reward += stop_release_bonus
+                if not info_i.get("dribble_committed"):
+                    continue
+                rid = info_i.get("robot_id")
+                target = self.dribble_to_target.get(rid)
+                gk_pose = self._opponent_goalie_pose(current_game_state)
+                if target is None or gs_ball_pos is None or gk_pose is None:
+                    self.logger.info(
+                        "Dribble target committed: rid=%s gap=N/A "
+                        "(target/ball/goalie missing)", rid,
+                    )
+                    continue
+                gk_y_val = float(gk_pose[1])
+                current_gap = positional_gap_quality(
+                    (float(gs_ball_pos[0]), float(gs_ball_pos[1])),
+                    gk_y_val, goal_half_height,
+                )
+                raw_delta, reachable_target = reachable_gap_delta(
+                    (float(gs_ball_pos[0]), float(gs_ball_pos[1])),
+                    target,
+                    gk_y_val,
+                    goal_half_height,
+                    segment_limit=0.85,
+                )
+                target_gap = positional_gap_quality(
+                    reachable_target, gk_y_val, goal_half_height,
+                )
+                kz_tq = self._keeper_zone_factor(reachable_target, gk_pose)
+                self.logger.info(
+                    "Dribble target committed: rid=%s current_gap=%.3f "
+                    "reachable_gap=%.3f gap_delta=%+.3f useful=%s endpoint=(%.2f,%.2f) "
+                    "keeper_zone_factor=%.2f",
+                    rid, current_gap, target_gap, raw_delta,
+                    bool(raw_delta > 0.0),
+                    reachable_target[0], reachable_target[1], kz_tq,
+                )
+                reward += (
+                    float(np.clip(raw_delta, -1.0, 1.0))
+                    * dribble_quality_weight
+                    * kz_tq
+                )
 
-        self.total_rewards += reward
+        # Achieved-gap reward: credit the REALIZED shooting-gap change of a
+        # carry — positional_gap_quality at the ball's spot when the segment
+        # CLOSES minus when it OPENED — rather than the latched hypothetical
+        # target (which dribble_target_quality_weight above pays at open). A
+        # carry that merely orbits the ball in place ends near where it started
+        # and nets ~0 here even if its target looked good; a carry that worsens
+        # the angle is penalized. The start gap is recorded on carry_started and
+        # the realized delta is paid when the segment closes (stop_dribble_fired
+        # = release at the segment limit, or a mid-dribble abandon).
+        achieved_gap_weight = float(
+            getattr(self.reward_config, "dribble_achieved_gap_weight", 0.0)
+        )
+        if achieved_gap_weight > 0.0 and current_game_state is not None:
+            ag_ball_pos = getattr(current_game_state, "ball_pos", None)
+            ag_gk_pose = self._opponent_goalie_pose(current_game_state)
+            for info_i in action_info.get("per_robot", []):
+                rid = info_i.get("robot_id")
+                if rid is None or ag_ball_pos is None or ag_gk_pose is None:
+                    continue
+                ball_gap_now = positional_gap_quality(
+                    (float(ag_ball_pos[0]), float(ag_ball_pos[1])),
+                    float(ag_gk_pose[1]), goal_half_height,
+                )
+                if info_i.get("carry_started"):
+                    self.dribble_carry_start_gap[rid] = ball_gap_now
+                    self.logger.info(
+                        "Dribble carry opened: rid=%s current_gap=%.3f",
+                        rid, ball_gap_now,
+                    )
+                if info_i.get("stop_dribble_fired"):
+                    start_gap = self.dribble_carry_start_gap.get(rid)
+                    if start_gap is not None:
+                        achieved_delta = ball_gap_now - start_gap
+                        kz_ag = self._keeper_zone_factor(
+                            (float(ag_ball_pos[0]), float(ag_ball_pos[1])),
+                            ag_gk_pose,
+                        )
+                        ag_bonus = achieved_delta * achieved_gap_weight * kz_ag
+                        reward += ag_bonus
+                        self.logger.info(
+                            "Dribble achieved-gap: rid=%s start=%.3f end=%.3f "
+                            "delta=%+.3f keeper_zone_factor=%.2f reward=%+.2f",
+                            rid, start_gap, ball_gap_now, achieved_delta,
+                            kz_ag, ag_bonus,
+                        )
+                    self.dribble_carry_start_gap[rid] = None
+
+        # Stage 2: penalty for kicking while the ball is already in the
+        # goalie's possession (tug-of-war suppression). Fires when a kick
+        # command was actually sent AND the ball is within goalie_possession_dist
+        # of the keeper. Complemented by the early termination in _check_terminal.
+        kick_near_goalie_penalty = float(
+            getattr(self.reward_config, "kick_near_goalie_penalty", 0.0)
+        )
+        if kick_near_goalie_penalty > 0.0 and current_game_state is not None:
+            gk_pose = self._opponent_goalie_pose(current_game_state)
+            if gk_pose is not None:
+                gk_x, gk_y = gk_pose[0], gk_pose[1]
+                goalie_possession_dist = float(
+                    getattr(self.reward_config, "goalie_possession_dist", 2.0)
+                )
+                ball_pos_now = getattr(current_game_state, "ball_pos", None)
+                if ball_pos_now is not None:
+                    ball_gk_dist = math.hypot(
+                        float(ball_pos_now[0]) - gk_x,
+                        float(ball_pos_now[1]) - gk_y,
+                    )
+                    if ball_gk_dist < goalie_possession_dist:
+                        for info_i in action_info.get("per_robot", []):
+                            if info_i.get("kick_fired"):
+                                reward -= kick_near_goalie_penalty
+
+        # Dribble→kick combo bonus. Rewards the dribble release → kick chain
+        # as a unit. Update the per-robot release age counter first,
+        # then check whether any kick this step qualifies for the bonus.
+        combo_bonus = float(getattr(self.reward_config, "post_dribble_kick_bonus", 0.0))
+        combo_window = int(getattr(self.reward_config, "post_dribble_kick_combo_window", 5))
+        per_robot_info_list = action_info.get("per_robot", [])
+        for info_i in per_robot_info_list:
+            rid = info_i.get("robot_id")
+            if rid is None:
+                continue
+            if info_i.get("stop_dribble_fired"):
+                self.steps_since_stop_dribble[rid] = 0
+            elif self.steps_since_stop_dribble.get(rid) is not None:
+                self.steps_since_stop_dribble[rid] += 1
+        combo_quality_scale = bool(
+            getattr(self.reward_config, "post_dribble_kick_quality_scale", False)
+        )
+        if combo_bonus > 0.0:
+            for info_i in per_robot_info_list:
+                rid = info_i.get("robot_id")
+                if not info_i.get("kick_fired"):
+                    continue
+                age = self.steps_since_stop_dribble.get(rid)
+                if age is not None and age <= combo_window:
+                    scale = 1.0
+                    if combo_quality_scale:
+                        # Prefer GOALIE-GAP quality (corner placement) so the
+                        # combo only pays when the dribble→kick chain produces a
+                        # shot that beats the keeper — a centered kick after a
+                        # useless dribble scores gap≈0 → ~0 combo. Fall back to
+                        # center-mouth aim only when no gap was computed (no
+                        # goalie gate); bad-aim kicks yield 0 either way.
+                        gap_q = info_i.get("kick_gap_quality")
+                        if gap_q is not None:
+                            scale = max(0.0, float(gap_q))
+                        else:
+                            aim_q = info_i.get("kick_aim_quality")
+                            scale = max(0.0, float(aim_q)) if aim_q is not None else 0.0
+                    # Suppress the combo inside the keeper zone too (same factor
+                    # applied to the kick_aim bonus for this kick).
+                    scale *= float(info_i.get("kick_keeper_zone_factor", 1.0))
+                    bonus = combo_bonus * scale
+                    reward += bonus
+                    self.logger.info(
+                        "Dribble→kick combo bonus +%.1f (steps_since_stop=%d, scale=%.2f)",
+                        bonus, age, scale,
+                    )
+
         terminated, term_reason = self._check_terminal(next_game_state, prev_game_state=current_game_state)
         # Off-target terminal penalty disabled: a -3 penalty here flipped the
         # net-EV of "kick" to slightly negative once the policy was at all
@@ -713,7 +1127,13 @@ class JALTeamEnv(gym.Env):
         # exploit it was meant to address is better fixed at the shaping
         # level (aim-gate goal_progress) than at the terminal level.
         if terminated and term_reason == "ball_in_penalty_off_target":
-            pass
+            penalty = float(getattr(
+                self.reward_config, "ball_in_penalty_off_target_penalty", 0.0
+            ))
+            reward -= penalty
+        if terminated and term_reason == "goalie_catch":
+            goal_reward = float(getattr(self.reward_config, "goal_reward", 70.0))
+            reward -= goal_reward
         # Small penalty for "wasted kick" outcomes — ball went dead via a
         # non-goal playmode (kick_in/corner/goal_kick), or came to rest where
         # the robot can't recover it. Small enough not to crush kick
@@ -733,7 +1153,6 @@ class JALTeamEnv(gym.Env):
             and (term_reason.startswith("ball_dead_") or term_reason == "ball_stopped_unreachable")
         ):
             reward -= 3.0
-            self.total_rewards -= 3.0
         truncated = (not terminated) and self.current_step >= self.max_steps
         # max_steps terminal penalty: punishes "stand still for 300 steps"
         # so that turn-only / no-kick behavior isn't a stable 0-reward
@@ -744,7 +1163,7 @@ class JALTeamEnv(gym.Env):
         # toward acting.
         if truncated:
             reward -= 10.0
-            self.total_rewards -= 10.0
+        self.total_rewards += reward
 
         if terminated or truncated:
             total = len(self.episode_actions)
@@ -763,8 +1182,40 @@ class JALTeamEnv(gym.Env):
                 "Episode %d ended — reason=%s  steps=%d  total_reward=%.2f",
                 self.episode_num, end_reason, self.current_step, self.total_rewards,
             )
+            if self._last_kick_probe_by_id:
+                for probe in self._last_kick_probe_by_id.values():
+                    self.logger.info(
+                        "Shot probe: outcome=%s fire=(%.2f, %.2f) "
+                        "dist_to_keeper=%s dist_to_goal=%.2f gap_quality=%s "
+                        "aim_quality=%.2f keeper_zone_factor=%.2f",
+                        end_reason,
+                        probe["fire_x"], probe["fire_y"],
+                        f"{probe['fire_dist_to_keeper']:.2f}"
+                        if probe.get("fire_dist_to_keeper") is not None else "N/A",
+                        probe["fire_dist_to_goal_line"],
+                        f"{probe['gap_quality_at_fire']:.2f}"
+                        if probe.get("gap_quality_at_fire") is not None else "N/A",
+                        probe["aim_quality"],
+                        probe["keeper_zone_factor"],
+                    )
             if terminated:
                 self._cached_game_state = None
+
+        # Update dribble_to reward tracking for next step.
+        next_ball_pos = getattr(next_game_state, "ball_pos", None) if next_game_state is not None else None
+        for rid in self.robot_ids:
+            target = self.dribble_to_target.get(rid)
+            if target is not None and next_ball_pos is not None:
+                self.prev_ball_to_dribble_target_dist[rid] = float(math.hypot(
+                    float(next_ball_pos[0]) - target[0],
+                    float(next_ball_pos[1]) - target[1],
+                ))
+            else:
+                self.prev_ball_to_dribble_target_dist[rid] = None
+        for info_i in action_info.get("per_robot", []):
+            rid = info_i.get("robot_id")
+            if rid is not None:
+                self._prev_action_was_dribble_to[rid] = (info_i.get("action_type") == "dribble_to")
 
         info = {
             "action_info": action_info,
@@ -772,6 +1223,8 @@ class JALTeamEnv(gym.Env):
             "total_reward": self.total_rewards,
             "invalid_action_count": invalid_action_count,
             "termination_reason": term_reason if terminated else ("max_steps" if truncated else ""),
+            "last_kick_probe": dict(next(iter(self._last_kick_probe_by_id.values()), {}))
+            if (terminated or truncated) else {},
             "agent_active_mask": self.agent_active_mask.copy(),
             "context_active_mask": self.context_active_mask.copy(),
         }
@@ -975,53 +1428,39 @@ class JALTeamEnv(gym.Env):
                 obs[off + 7] = float(start_dribble_pos[1]) / self._NORM_POS_Y
                 # dims 8..per_agent_dim-1 reserved → stay 0
 
-            # --- context slots (c_max × d_ctx): opponent poses, keeper first ---
-            # Filled only when observe_opponents is enabled (stage 2+). Slots
-            # are ordered nearest-to-GOAL_R first so slot 0 is always the
-            # opponent keeper while it holds its goal (same identification rule
-            # as _opponent_goalie_pose). Live dims: [x, y, theta, vx, vy],
-            # analytically normalized like the agent slots; the 2 reserved dims
-            # stay 0. Absent slots stay zero and masked off, so 1v0 stages see
-            # the exact obs they always did.
-            self.context_active_mask[:] = 0.0
-            if self.observe_opponents:
-                opponent_poses = []
-                for other_team, entries in game_state.robot_poses.items():
-                    if other_team == self.team_name:
-                        continue
-                    for entry in entries:
-                        if not isinstance(entry, dict):
-                            continue
-                        for _unum, p in entry.items():
-                            if p is not None and len(p) >= 3:
-                                opponent_poses.append(
-                                    (float(p[0]), float(p[1]), float(p[2]))
-                                )
-                opponent_poses.sort(
-                    key=lambda p: math.hypot(p[0] - GOAL_R[0], p[1] - GOAL_R[1])
-                )
-                ctx_base = self.global_dim + self.per_agent_dim * self.a_max
-                for slot, (ox, oy, otheta_deg) in enumerate(
-                    opponent_poses[: self.c_max]
-                ):
-                    otheta = float(np.deg2rad(otheta_deg))
-                    cur_xy = np.array([ox, oy], dtype=np.float32)
-                    prev_xy = self.prev_opponent_pose_by_slot.get(slot)
-                    if prev_xy is None:
-                        ovx = ovy = 0.0
-                    else:
-                        ovx = float(cur_xy[0] - prev_xy[0])
-                        ovy = float(cur_xy[1] - prev_xy[1])
-                    self.prev_opponent_pose_by_slot[slot] = cur_xy
+            # --- context slots (c_max × d_ctx) ---
+            # Layout: slot 0 = our goalie (unused Stage 1/2), slot 1 = opp goalie.
+            # Only fill when an opponent team is configured.
+            if self.opponent_team_name is not None:
+                opp_pose_entries = game_state.robot_poses.get(self.opponent_team_name, [])
+                opp_pose_by_id: Dict[int, Any] = {}
+                for entry in opp_pose_entries:
+                    if isinstance(entry, dict):
+                        opp_pose_by_id.update(entry)
 
-                    off = ctx_base + slot * self.d_ctx
-                    obs[off + 0] = ox / self._NORM_POS_X
-                    obs[off + 1] = oy / self._NORM_POS_Y
-                    obs[off + 2] = otheta / self._NORM_THETA
-                    obs[off + 3] = ovx / self._NORM_VEL
-                    obs[off + 4] = ovy / self._NORM_VEL
+                # Context slot 1: first opponent robot (goalie robot_id=1 by convention).
+                first_opp_id = min(opp_pose_by_id.keys()) if opp_pose_by_id else None
+                if first_opp_id is not None:
+                    opp_pose = opp_pose_by_id[first_opp_id]
+                    opp_x = float(opp_pose[0])
+                    opp_y = float(opp_pose[1])
+                    opp_theta = float(np.deg2rad(opp_pose[2]))
+                    prev_opp_xy = self.prev_opp_pose_by_id.get(first_opp_id)
+                    if prev_opp_xy is not None:
+                        opp_vx = float(opp_x - prev_opp_xy[0])
+                        opp_vy = float(opp_y - prev_opp_xy[1])
+                    else:
+                        opp_vx = opp_vy = 0.0
+                    self.prev_opp_pose_by_id[first_opp_id] = np.array([opp_x, opp_y], dtype=np.float32)
+
+                    ctx_base = self.global_dim + self.per_agent_dim * self.a_max
+                    opp_slot_off = ctx_base + 1 * self.d_ctx  # slot 1
+                    obs[opp_slot_off + 0] = opp_x / self._NORM_POS_X
+                    obs[opp_slot_off + 1] = opp_y / self._NORM_POS_Y
+                    obs[opp_slot_off + 2] = opp_theta / self._NORM_THETA
+                    obs[opp_slot_off + 3] = opp_vx / self._NORM_VEL
+                    obs[opp_slot_off + 4] = opp_vy / self._NORM_VEL
                     # dims 5..d_ctx-1 reserved → stay 0
-                    self.context_active_mask[slot] = 1.0
 
             return obs
             
@@ -1035,12 +1474,11 @@ class JALTeamEnv(gym.Env):
 
         Two accepted action formats:
 
-        1. Legacy TD3 flat Box vector, shape (9 * num_robots,):
-            [0..5] logits over {goto, approach_ball, turn, kick,
-                                start_dribble, stop_dribble}
-            [6] goto_x_raw ∈ [-1, 1]
-            [7] goto_y_raw ∈ [-1, 1]
-            [8] turn_theta_raw ∈ [-1, 1]
+        1. Legacy TD3 flat Box vector, shape (8 * num_robots,):
+            [0..4] logits over {goto, approach_ball, turn, kick, dribble_to}
+            [5] goto_x_raw ∈ [-1, 1]
+            [6] goto_y_raw ∈ [-1, 1]
+            [7] turn_theta_raw ∈ [-1, 1]
 
         2. New PPO hybrid dict:
             {
@@ -1058,11 +1496,14 @@ class JALTeamEnv(gym.Env):
             commands: List of simulator command strings in robot_ids order
             action_info: Dictionary with action details (for logging/debugging)
         """
-        action_types = ["goto", "approach_ball", "turn", "kick", "start_dribble", "stop_dribble"]
+        action_types = ["goto", "approach_ball", "turn", "kick", "dribble_to"]
 
         # Detect format and extract per-robot (action_type, goto_x, goto_y, turn_theta).
         per_robot_decoded: List[Dict[str, Any]] = []
         is_ppo_dict = isinstance(action, dict) and "primitive_idx" in action
+        runtime_mask_applied = bool(
+            action.get("runtime_mask_applied", False)
+        ) if is_ppo_dict else False
 
         if is_ppo_dict:
             # The expandable policy emits actions for all a_max agent slots, each
@@ -1125,7 +1566,6 @@ class JALTeamEnv(gym.Env):
                     float(action_arr[base + 2]),
                     float(action_arr[base + 3]),
                     float(action_arr[base + 4]),
-                    float(action_arr[base + 5]),
                 ], dtype=np.float32)
                 if self.disabled_actions:
                     for j, name in enumerate(action_types):
@@ -1139,9 +1579,9 @@ class JALTeamEnv(gym.Env):
                 per_robot_decoded.append({
                     "action_idx": action_idx,
                     "action_type": action_type,
-                    "goto_x_raw": float(action_arr[base + 6]),
-                    "goto_y_raw": float(action_arr[base + 7]),
-                    "turn_theta_raw": float(action_arr[base + 8]),
+                    "goto_x_raw": float(action_arr[base + 5]),
+                    "goto_y_raw": float(action_arr[base + 6]),
+                    "turn_theta_raw": float(action_arr[base + 7]),
                     "logits": logits.tolist(),
                     "probs": probs.tolist(),
                 })
@@ -1157,6 +1597,7 @@ class JALTeamEnv(gym.Env):
         per_robot_info: List[Dict[str, Any]] = []
         invalid_action_count = 0
         ball_pos = game_state.ball_pos if game_state is not None else None
+        claimant_id = self._ball_claimant(game_state, pose_by_robot_id)
 
         for i, robot_id in enumerate(self.robot_ids):
             decoded = per_robot_decoded[i]
@@ -1188,63 +1629,47 @@ class JALTeamEnv(gym.Env):
             kick_blocked_bad_aim = False
             kick_tie_break_applied = False
             approach_defer_applied = False
-            kick_aim_quality: Optional[float] = None
-            kick_predicted_y_at_goal_line: Optional[float] = None
-
-            # ---- Stage 2 dribble session bookkeeping (see __init__) ----
-            dribble_max_radius = float(
-                getattr(self.reward_config, "dribble_max_radius", 1.0)
-            )
-            redribble_gap_dist = self.kickable_dist + float(
-                getattr(self.reward_config, "dribble_redribble_gap_margin", 0.2)
-            )
-            robot_ball_dist = None
+            fallback_reason: Optional[str] = None
+            robot_ball_dist: Optional[float] = None
             if pose is not None and ball_pos is not None and len(ball_pos) >= 2:
                 robot_ball_dist = float(np.hypot(
                     float(pose[0]) - float(ball_pos[0]),
                     float(pose[1]) - float(ball_pos[1]),
                 ))
-            session_active = self.dribble_session_active.get(robot_id, False)
-            if session_active and not has_ball_now:
-                # Ball escaped the dribbler (stolen / rolled away): session over.
-                self._end_dribble_session(robot_id)
-                session_active = False
+            kick_aim_quality: Optional[float] = None
+            kick_predicted_y_at_goal_line: Optional[float] = None
+            kick_macro_continuation = False
+            kick_target_y: Optional[float] = self.kick_macro_target_y.get(robot_id)
+            kick_target_angle: Optional[float] = None
+            kick_target_heading_error: Optional[float] = None
+            kick_retarget_applied = False
+            kick_retarget_quality_before: Optional[float] = None
+
+            # ---- dribble_to session tracking (derived from DribbleState) ----
+            dribble_st = self.dribble_states.get(robot_id)
+            if dribble_st is None:
+                dribble_st = DribbleState()
+                self.dribble_states[robot_id] = dribble_st
+            prev_dribble_phase = dribble_st.phase
             anchor = self.dribble_anchor.get(robot_id)
             anchor_dist = None
             if pose is not None and anchor is not None:
                 anchor_dist = float(np.hypot(
                     float(pose[0]) - anchor[0], float(pose[1]) - anchor[1]
                 ))
-            # Exhaustion: an active session that reached the radius limit. The
-            # session must release; start_dribble is invalid until re-approach.
-            dribble_exhausted_now = bool(
-                session_active
-                and anchor_dist is not None
-                and anchor_dist >= dribble_max_radius
-            )
-            if dribble_exhausted_now:
-                self.dribble_exhausted[robot_id] = True
-                self.awaiting_redribble_gap[robot_id] = True
-            # The re-dribble gap clears once the robot visibly separates from
-            # the ball after the last session ended.
-            if (
-                self.awaiting_redribble_gap.get(robot_id, False)
-                and not session_active
-                and robot_ball_dist is not None
-                and robot_ball_dist > redribble_gap_dist
-            ):
-                self.awaiting_redribble_gap[robot_id] = False
-                self.dribble_exhausted[robot_id] = False
-            start_dribble_blocked = (
-                action_type == "start_dribble"
-                and has_ball_now
-                and (
-                    self.awaiting_redribble_gap.get(robot_id, False)
-                    or self.dribble_exhausted.get(robot_id, False)
-                )
-            )
             stop_dribble_fired = False
             stop_dribble_at_limit = False
+            carry_started = False
+            dribble_committed = False
+            reported_dribble_phase = dribble_st.phase
+            reported_catch_attempts = dribble_st.catch_attempts
+            reported_verify_steps = dribble_st.verify_steps
+            reported_align_steps = dribble_st.align_steps
+            reported_verify_robot_moved = dribble_st.last_verify_robot_moved
+            reported_verify_ball_moved = dribble_st.last_verify_ball_moved
+            reported_verify_offset_change = dribble_st.last_verify_offset_change
+            reported_target_heading_error = dribble_st.last_target_heading_error
+            reported_dribble_target = dribble_st.target
 
             # TD3 exposes discrete primitive choice as continuous logits, then
             # uses argmax. When turn and kick saturate at the same bound,
@@ -1265,7 +1690,7 @@ class JALTeamEnv(gym.Env):
                 kick_enabled = kick_logit > -1e8
                 if turn_enabled and kick_enabled:
                     kick_aim_quality, kick_predicted_y_at_goal_line = (
-                        self._kick_aim_quality_from_pose(pose)
+                        self._kick_aim_quality_from_pose(pose, ball_pos)
                     )
                     if (
                         kick_aim_quality >= self.kick_min_aim_quality
@@ -1300,69 +1725,404 @@ class JALTeamEnv(gym.Env):
                     executed_action_type = action_type
                     approach_defer_applied = raw_action_type == "approach_ball"
 
+            # Runtime safety net for stale/unmasked actions. The PPO path normally
+            # prevents these selections with get_primitive_valid_mask(); these
+            # guards cover the state change between sampling and execution and
+            # legacy callers that do not yet pass the mask.
+            recovery_enabled = bool(getattr(self, "ball_action_recovery", False))
+            is_claimant = claimant_id is not None and robot_id == claimant_id
+            recovery_invalid_requested = False
+            if bool(self.kick_macro_active.get(robot_id, False)):
+                claimant_conflict = claimant_id is not None and robot_id != claimant_id
+                if claimant_conflict or not can_kick or pose is None or ball_pos is None:
+                    self._reset_kick_macro(robot_id)
+                    kick_target_y = None
+                    fallback_reason = "kick_macro_aborted_lost_ball"
+                else:
+                    if action_type != "kick":
+                        kick_macro_continuation = True
+                        action_type = "kick"
+                        action_idx = 3
+                        executed_action_type = "kick"
+                        fallback_reason = "kick_macro_continuation"
+            if recovery_enabled and not is_claimant and action_type in (
+                "approach_ball", "kick", "dribble_to"
+            ):
+                # A non-claimant must never be converted into another ball chaser.
+                action_type = "turn"
+                turn_theta = 0.0
+                executed_action_type = "hold"
+                fallback_reason = "non_claimant_ball_action_blocked"
+                recovery_invalid_requested = True
+            elif (
+                recovery_enabled
+                and is_claimant
+                and action_type == "dribble_to"
+                and robot_ball_dist is not None
+                and robot_ball_dist > self.kickable_dist
+            ):
+                action_type = "approach_ball"
+                executed_action_type = "approach_ball"
+                fallback_reason = "dribble_out_of_range_to_approach"
+                recovery_invalid_requested = True
+            elif (
+                recovery_enabled
+                and is_claimant
+                and action_type == "approach_ball"
+                and has_ball_now
+            ):
+                action_type = "turn"
+                executed_action_type = "turn"
+                fallback_reason = "approach_complete_to_turn"
+                recovery_invalid_requested = True
+
+            # A claimant repeatedly selecting turn while stationary and still far
+            # from the ball is the deterministic fixed point seen in Stage-2g
+            # inference. Track actual displacement, then force one approach step
+            # after a bounded run. Non-claimants are deliberately excluded: they
+            # may need to hold/turn while maintaining team shape.
+            turn_stall_steps = getattr(self, "turn_stall_steps", {})
+            last_pose_by_id = getattr(self, "_turn_stall_last_pose", {})
+            previous_xy = last_pose_by_id.get(robot_id)
+            current_xy = (
+                (float(pose[0]), float(pose[1])) if pose is not None else None
+            )
+            if (
+                recovery_enabled
+                and is_claimant
+                and action_type == "turn"
+                and raw_action_type == "turn"
+                and robot_ball_dist is not None
+                and robot_ball_dist > self.kickable_dist
+            ):
+                moved = (
+                    float(np.hypot(current_xy[0] - previous_xy[0], current_xy[1] - previous_xy[1]))
+                    if current_xy is not None and previous_xy is not None
+                    else float("inf")
+                )
+                if moved <= float(getattr(self, "turn_stall_displacement", 0.05)):
+                    turn_stall_steps[robot_id] = turn_stall_steps.get(robot_id, 0) + 1
+                else:
+                    turn_stall_steps[robot_id] = 0
+                if (
+                    turn_stall_steps[robot_id] >= int(getattr(self, "turn_stall_limit", 12))
+                    and not runtime_mask_applied
+                ):
+                    action_type = "approach_ball"
+                    executed_action_type = "approach_ball"
+                    fallback_reason = "turn_stall_to_approach"
+                    recovery_invalid_requested = True
+                    turn_stall_steps[robot_id] = 0
+            else:
+                turn_stall_steps[robot_id] = 0
+            last_pose_by_id[robot_id] = current_xy
+            self.turn_stall_steps = turn_stall_steps
+            self._turn_stall_last_pose = last_pose_by_id
+
             if action_type == "kick" and can_kick and self.kick_requires_aim and pose is not None:
                 if kick_aim_quality is None:
-                    kick_aim_quality, kick_predicted_y_at_goal_line = self._kick_aim_quality_from_pose(pose)
+                    kick_aim_quality, kick_predicted_y_at_goal_line = self._kick_aim_quality_from_pose(
+                        pose, ball_pos
+                    )
                 if kick_aim_quality < self.kick_min_aim_quality:
                     kick_blocked_bad_aim = True
 
             invalid_action_requested = (
                 (action_type == "kick" and not can_kick)
-                or (action_type == "start_dribble" and not has_ball_now)
-                or (action_type == "stop_dribble" and not has_ball_now)
-                or start_dribble_blocked
-                or kick_blocked_bad_aim
+                or recovery_invalid_requested
             )
             if invalid_action_requested:
                 invalid_action_count += 1
 
-            if action_type == "kick":
-                if not can_kick or kick_blocked_bad_aim:
-                    # Use the policy's own turn_theta rather than "turn 0" so
-                    # the state changes each step, allowing Q(kick) to receive
-                    # proper TD targets instead of bootstrapping off itself in
-                    # a stationary (s == s') loop.
-                    command = f"turn {turn_theta:.2f}"
-                    if kick_blocked_bad_aim:
-                        executed_action_type = "turn"
-                else:
-                    command = "kick 100 0"
-                    kick_fired = True
-                    if session_active:
-                        # A fired kick releases the ball, ending the session.
-                        self._end_dribble_session(robot_id)
-            elif action_type == "start_dribble":
-                if not has_ball_now:
-                    command = "turn 0"
-                elif start_dribble_blocked:
-                    if dribble_exhausted_now:
-                        # At the radius limit with the ball still caught:
-                        # force the release instead of sustaining the dribble.
-                        command = "drop"
-                        executed_action_type = "stop_dribble"
-                        self._end_dribble_session(robot_id)
-                    else:
-                        # Re-catch before creating separation: refuse with a no-op.
-                        command = "turn 0"
-                        executed_action_type = "turn"
-                else:
-                    command = "catch 0"  # Start dribble
-                    if not session_active and pose is not None:
-                        self.dribble_session_active[robot_id] = True
-                        self.dribble_anchor[robot_id] = (float(pose[0]), float(pose[1]))
-                        self.dribble_exhausted[robot_id] = False
-            elif action_type == "stop_dribble":
-                if not has_ball_now:
-                    command = "turn 0"
-                else:
-                    command = "drop"  # Stop dribble
-                    if session_active:
-                        stop_dribble_fired = True
-                        stop_dribble_at_limit = bool(
-                            anchor_dist is not None
-                            and anchor_dist
-                            >= self._STOP_DRIBBLE_RELEASE_FRACTION * dribble_max_radius
+            # Dribble targets get an optional |y| clamp so the policy can only
+            # aim near the goal mouth (where a carry actually opens the shooting
+            # angle), not anywhere in +/-field_half_height. 0.0 = no clamp.
+            # Applied to BOTH the reward-tracking target and the target handed
+            # to dribble_to() below so they stay consistent.
+            dribble_target_y_clip = float(
+                getattr(self.reward_config, "dribble_target_y_clip", 0.0)
+            )
+            # Goal-RELATIVE dribble target (when dribble_fwd_max>0): carry forward
+            # along the ball->goal vector so the head's neutral output (~0,0) is a
+            # forward carry toward goal centre — already gap-improving — instead of
+            # the absolute decode that put the neutral target at midfield (0,0)
+            # (dx=45, gap~0.07 << current ~0.32), making every carry a backward dead
+            # target the head never escaped (§34/§35 + 6/20 lag runs: 0% useful).
+            # Falls back to the legacy absolute (goto_x, goto_y) decode when the
+            # knob is 0 or the ball pose is unknown.
+            dribble_fwd_max = float(getattr(self.reward_config, "dribble_fwd_max", 0.0))
+            dribble_lat_max = float(getattr(self.reward_config, "dribble_lat_max", 0.0))
+            if dribble_fwd_max > 0.0 and ball_pos is not None and len(ball_pos) >= 2:
+                bx_t, by_t = float(ball_pos[0]), float(ball_pos[1])
+                gcx, gcy = float(FIELD_X[1]), 0.0
+                norm = float(np.hypot(gcx - bx_t, gcy - by_t)) or 1.0
+                dirx, diry = (gcx - bx_t) / norm, (gcy - by_t) / norm
+                perpx, perpy = -diry, dirx
+                fwd = (goto_x_raw * 0.5 + 0.5) * dribble_fwd_max  # [-1,1] -> [0,max]
+                lat = goto_y_raw * dribble_lat_max                # steer to open side
+                dribble_goto_x = float(min(bx_t + dirx * fwd + perpx * lat, gcx - 1.0))
+                dribble_goto_y = float(by_t + diry * fwd + perpy * lat)
+            else:
+                dribble_goto_x = goto_x
+                dribble_goto_y = goto_y
+            if dribble_target_y_clip > 0.0:
+                dribble_goto_y = float(
+                    np.clip(dribble_goto_y, -dribble_target_y_clip, dribble_target_y_clip)
+                )
+            dribble_penalty_area_y_clip = float(
+                getattr(self.reward_config, "dribble_penalty_area_y_clip", 0.0)
+            )
+            dribble_penalty_area_guard_margin = float(
+                getattr(self.reward_config, "dribble_penalty_area_guard_margin", 0.0)
+            )
+            dribble_penalty_guard_applied = False
+            if (
+                dribble_penalty_area_y_clip > 0.0
+                and dribble_penalty_area_guard_margin > 0.0
+            ):
+                boundary_x = (
+                    self._RIGHT_PENALTY_AREA_X - dribble_penalty_area_guard_margin
+                )
+                by_now = (
+                    float(ball_pos[1])
+                    if (ball_pos is not None and len(ball_pos) >= 2)
+                    else 0.0
+                )
+                # Penalty-area ENTRY guard. Clamping only the target y is not
+                # enough: a ball that is still WIDE of the goal mouth, carried
+                # toward a y-clamped target inside the box, crosses the penalty
+                # line (x=_RIGHT_PENALTY_AREA_X) at a wide y MID-segment and
+                # terminates as ball_in_penalty_off_target before the carry can
+                # pull it central (confirmed: all off-target episodes at +/-15
+                # were dribble carries, no fired shot). So while the ball is wide
+                # (|y| > goal mouth half), cap the target x to the boundary so the
+                # carry pulls the ball toward centre OUTSIDE the box; entry past
+                # the boundary resumes only once |y| is within the mouth.
+                if (
+                    abs(by_now) > self._GOAL_HALF_HEIGHT
+                    and dribble_goto_x > boundary_x
+                ):
+                    dribble_goto_x = boundary_x
+                    dribble_penalty_guard_applied = True
+                if dribble_goto_x >= boundary_x:
+                    before_y = dribble_goto_y
+                    dribble_goto_y = float(
+                        np.clip(
+                            dribble_goto_y,
+                            -dribble_penalty_area_y_clip,
+                            dribble_penalty_area_y_clip,
                         )
+                    )
+                    if not math.isclose(before_y, dribble_goto_y, abs_tol=1e-6):
+                        dribble_penalty_guard_applied = True
+
+            # dribble_to is a MACRO: the moment the policy COMMITS to a dribble
+            # (selects dribble_to while the ball is in possession range, opening the
+            # GRAB phase), the env keeps driving the phase machine toward the LATCHED
+            # target every step — through GRAB (align + catch), SETTLE, VERIFY
+            # (probe), CARRY (directional dash), ALIGN_RELEASE, and RELEASE — until the segment completes
+            # (arrival / segment limit
+            # / stall) or the ball is genuinely lost, regardless of the policy's
+            # per-step primitive. Only a kick may interrupt (release + shoot).
+            #
+            # GRAB must be inside the macro, not just CARRY/RELEASE. Opening a carry
+            # needs a few uninterrupted turn-to-align steps before the catch, but the
+            # stochastic policy oscillates approach_ball/turn/dribble_to at the ball,
+            # and each non-dribble step's own turn knocks the heading off target, so
+            # the grab almost never converged (infer trace: `catch` fired 1× in 3000
+            # steps; the robot stood on the ball spinning for 100+ steps). The
+            # `committed` flag (set on a real dribble_to pick, cleared on DONE/kick
+            # via DribbleState.reset()) gates this so the macro only takes over AFTER
+            # a genuine pick — the default GRAB phase before any pick does NOT hijack
+            # ordinary approach steps.
+            carry_continuation = (
+                dribble_st.committed
+                and dribble_st.phase in (
+                    DRIBBLE_PHASE_GRAB, DRIBBLE_PHASE_SETTLE, DRIBBLE_PHASE_VERIFY,
+                    DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_ALIGN_RELEASE,
+                    DRIBBLE_PHASE_RELEASE
+                )
+                and action_type != "kick"
+            )
+
+            # Track dribble_to target for reward computation. During a carry
+            # continuation the policy's per-step (Dx, Dy) is ignored downstream
+            # (dribble_to() uses the latched target), so the noisy decode here is
+            # overwritten with state.target inside the macro branch below.
+            if action_type == "dribble_to" or carry_continuation:
+                self.dribble_to_target[robot_id] = (dribble_goto_x, dribble_goto_y)
+            else:
+                self.dribble_to_target[robot_id] = None
+                self.prev_ball_to_dribble_target_dist[robot_id] = None
+
+            if action_type == "kick":
+                # Geometric committed turn-to-align then fire, via
+                # basic_commands.kick(). A fresh kick request latches a
+                # keeper-away target inside the goal mouth; subsequent policy
+                # steps cannot interrupt the slow capped-turn alignment until
+                # the shot fires, possession is lost, or the macro times out.
+                if pose is None or ball_pos is None:
+                    command = "turn 0"
+                    executed_action_type = "turn"
+                    self._reset_kick_macro(robot_id)
+                    kick_target_y = None
+                else:
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    ball_xy = np.array(
+                        [float(ball_pos[0]), float(ball_pos[1])], dtype=np.float32
+                    )
+                    if not bool(self.kick_macro_active.get(robot_id, False)):
+                        self.kick_macro_active[robot_id] = True
+                        self.kick_macro_align_steps[robot_id] = 0
+                        self.kick_macro_retarget_count[robot_id] = 0
+                        self.kick_macro_target_y[robot_id] = self._keeper_away_kick_target_y(
+                            game_state, ball_xy
+                        )
+                    kick_target_y = self.kick_macro_target_y.get(robot_id)
+                    if kick_target_y is None:
+                        kick_target_y = self._keeper_away_kick_target_y(game_state, ball_xy)
+                        self.kick_macro_target_y[robot_id] = kick_target_y
+                    kick_target_y, kick_retarget_applied, kick_retarget_quality_before = (
+                        self._maybe_retarget_kick_target_y(
+                            robot_id, game_state, float(kick_target_y)
+                        )
+                    )
+                    kick_target_angle = float(
+                        np.arctan2(
+                            float(kick_target_y) - float(ball_xy[1]),
+                            float(FIELD_X[1]) - float(ball_xy[0]),
+                        )
+                    )
+                    kick_target_heading_error = float(
+                        math.atan2(
+                            math.sin(kick_target_angle - float(self_pose[2])),
+                            math.cos(kick_target_angle - float(self_pose[2])),
+                        )
+                    )
+                    command = kick(
+                        self_pose, ball_xy, kick_target_angle,
+                        kick_power=100.0, dribbling=True,
+                    )
+                    fire_ok = can_kick and not kick_blocked_bad_aim
+                    if command.startswith("kick") and fire_ok:
+                        kick_fired = True
+                        # A fired kick releases the ball; reset dribble phase machine.
+                        dribble_st.reset()
+                        self.dribble_session_active[robot_id] = False
+                        self.dribble_anchor[robot_id] = None
+                        self._reset_kick_macro(robot_id)
+                    else:
+                        # Either still aligning (kick() returned a turn), or the
+                        # aim/range gate vetoed the shot this step. Execute as a turn
+                        # so the kick-aim one-shot only ever credits a real,
+                        # well-aimed, in-range kick. A gate-vetoed "kick" holds
+                        # heading (turn 0) rather than firing a bad shot.
+                        if command.startswith("kick"):
+                            command = "turn 0"
+                            self._reset_kick_macro(robot_id)
+                        executed_action_type = "turn"
+                        if bool(self.kick_macro_active.get(robot_id, False)):
+                            self.kick_macro_align_steps[robot_id] = (
+                                self.kick_macro_align_steps.get(robot_id, 0) + 1
+                            )
+                            if (
+                                self.kick_macro_align_steps[robot_id]
+                                > self.kick_macro_max_align_steps
+                            ):
+                                command = "turn 0"
+                                executed_action_type = "turn"
+                                fallback_reason = "kick_macro_align_timeout"
+                                self._reset_kick_macro(robot_id)
+            elif action_type == "dribble_to" or carry_continuation:
+                # A continuation (the policy picked a non-kick, non-dribble action
+                # while a carry was open) is executed AS a dribble step and credited
+                # as such — the macro is driving, not the sampled primitive.
+                if carry_continuation and action_type != "dribble_to":
+                    executed_action_type = "dribble_to"
+                # A fresh dribble_to pick commits the robot to the grab: from here
+                # the macro drives GRAB -> SETTLE -> VERIFY -> CARRY ->
+                # ALIGN_RELEASE -> RELEASE
+                # across steps even if the policy samples other primitives. Cleared
+                # on DONE / kick via DribbleState.reset(). If the robot is not yet in
+                # range, dribble_to() returns "done" -> phase DONE -> the session
+                # ends below and the flag is reset same-step, so an out-of-range pick
+                # never strands the flag.
+                if action_type == "dribble_to":
+                    dribble_committed = not dribble_st.committed
+                    dribble_st.committed = True
+                if pose is None or game_state is None or ball_pos is None:
+                    command = "turn 0"
+                else:
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    ball_xy = np.array([float(ball_pos[0]), float(ball_pos[1])], dtype=np.float32)
+                    target_xy = np.array([dribble_goto_x, dribble_goto_y], dtype=np.float32)
+                    command = dribble_to(
+                        self_pose=self_pose,
+                        ball_pose=ball_xy,
+                        target=target_xy,
+                        game_state=game_state,
+                        state=dribble_st,
+                    )
+                    # Snapshot diagnostics before DONE resets DribbleState below.
+                    reported_dribble_phase = dribble_st.phase
+                    reported_catch_attempts = dribble_st.catch_attempts
+                    reported_verify_steps = dribble_st.verify_steps
+                    reported_align_steps = dribble_st.align_steps
+                    reported_verify_robot_moved = dribble_st.last_verify_robot_moved
+                    reported_verify_ball_moved = dribble_st.last_verify_ball_moved
+                    reported_verify_offset_change = dribble_st.last_verify_offset_change
+                    reported_target_heading_error = dribble_st.last_target_heading_error
+                    reported_dribble_target = dribble_st.target
+                    if command == "done":
+                        command = "turn 0"
+                    # Update session tracking from DribbleState phase transitions.
+                    # A carry is active only after VERIFY proves that catch glue
+                    # transported the ball. GRAB/VERIFY are macro acquisition,
+                    # not possession and must not open reward accounting.
+                    carrying_phases = (DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_ALIGN_RELEASE)
+                    is_carrying = dribble_st.phase in carrying_phases
+                    was_carrying = prev_dribble_phase in carrying_phases
+                    # A carry segment just opened (catch verified this step):
+                    # gates target-quality and achieved-gap accounting on actual
+                    # ball ownership rather than merely issuing `catch 0`.
+                    carry_started = (
+                        prev_dribble_phase != DRIBBLE_PHASE_CARRY
+                        and dribble_st.phase == DRIBBLE_PHASE_CARRY
+                    )
+                    self.dribble_session_active[robot_id] = is_carrying
+                    if dribble_st.segment_start is not None and self.dribble_anchor.get(robot_id) is None:
+                        self.dribble_anchor[robot_id] = dribble_st.segment_start
+                    # A carry remains active through the bounded ALIGN_RELEASE
+                    # shooting-pose correction and closes only on RELEASE/DONE.
+                    # This pays achieved-gap from the final aligned ball position.
+                    carry_closed = (
+                        prev_dribble_phase in carrying_phases
+                        and dribble_st.phase in (DRIBBLE_PHASE_RELEASE, DRIBBLE_PHASE_DONE)
+                    )
+                    if carry_closed:
+                        stop_dribble_fired = True
+                        stop_dribble_at_limit = (
+                            dribble_st.phase == DRIBBLE_PHASE_RELEASE
+                            and dribble_st.release_at_limit
+                        )
+                        self.dribble_anchor[robot_id] = None
+                    if not is_carrying and not was_carrying:
+                        self.dribble_anchor[robot_id] = None
+                    # Keep the reward's target aligned with the latched carry
+                    # target, not the policy's noisy per-step (Dx, Dy).
+                    if dribble_st.target is not None:
+                        self.dribble_to_target[robot_id] = dribble_st.target
+                    # Transport completed or aborted (arrival / stall): reset so
+                    # the next dribble_to selection latches a fresh target.
+                    if dribble_st.phase == DRIBBLE_PHASE_DONE:
                         self._end_dribble_session(robot_id)
             elif action_type == "turn":
                 command = f"turn {turn_theta:.2f}"
@@ -1400,6 +2160,10 @@ class JALTeamEnv(gym.Env):
                     if command == "done":
                         command = "turn 0"
 
+            # Keep the command reported in debug traces identical to what the
+            # simulator/robot receives. Serializer applies the same limiter as
+            # a final safety boundary for commands from every other controller.
+            command = limit_turn_rate(command)
             commands.append(command)
             per_robot_info.append(
                 {
@@ -1411,6 +2175,11 @@ class JALTeamEnv(gym.Env):
                     "raw_action_idx": raw_action_idx,
                     "kick_tie_break_applied": kick_tie_break_applied,
                     "approach_defer_applied": approach_defer_applied,
+                    "ball_claimant_id": claimant_id,
+                    "is_ball_claimant": is_claimant,
+                    "robot_ball_dist": robot_ball_dist,
+                    "fallback_reason": fallback_reason,
+                    "turn_stall_steps": self.turn_stall_steps.get(robot_id, 0),
                     "probs": decoded["probs"],
                     "logits": decoded["logits"],
                     "goto_x": goto_x,
@@ -1418,15 +2187,34 @@ class JALTeamEnv(gym.Env):
                     "turn_theta": turn_theta,
                     "has_ball_now": has_ball_now,
                     "kick_fired": kick_fired,
+                    "kick_macro_active": self.kick_macro_active.get(robot_id, False),
+                    "kick_macro_continuation": kick_macro_continuation,
+                    "kick_macro_align_steps": self.kick_macro_align_steps.get(robot_id, 0),
+                    "kick_target_y": kick_target_y,
+                    "kick_target_angle": kick_target_angle,
+                    "kick_target_heading_error": kick_target_heading_error,
+                    "kick_retarget_applied": kick_retarget_applied,
+                    "kick_retarget_count": self.kick_macro_retarget_count.get(robot_id, 0),
+                    "kick_retarget_quality_before": kick_retarget_quality_before,
                     "kick_blocked_bad_aim": kick_blocked_bad_aim,
                     "kick_aim_quality": kick_aim_quality,
                     "kick_predicted_y_at_goal_line": kick_predicted_y_at_goal_line,
                     "invalid_action_requested": invalid_action_requested,
                     "dribble_session_active": self.dribble_session_active.get(robot_id, False),
                     "dribble_anchor_dist": anchor_dist,
-                    "dribble_exhausted": self.dribble_exhausted.get(robot_id, False),
-                    "awaiting_redribble_gap": self.awaiting_redribble_gap.get(robot_id, False),
-                    "start_dribble_blocked": start_dribble_blocked,
+                    "dribble_phase": reported_dribble_phase,
+                    "dribble_sim_count": getattr(game_state, "count", None),
+                    "dribble_catch_attempts": reported_catch_attempts,
+                    "dribble_verify_steps": reported_verify_steps,
+                    "dribble_align_steps": reported_align_steps,
+                    "dribble_verify_robot_moved": reported_verify_robot_moved,
+                    "dribble_verify_ball_moved": reported_verify_ball_moved,
+                    "dribble_verify_offset_change": reported_verify_offset_change,
+                    "dribble_target": reported_dribble_target,
+                    "dribble_target_heading_error": reported_target_heading_error,
+                    "dribble_penalty_guard_applied": dribble_penalty_guard_applied,
+                    "carry_started": carry_started,
+                    "dribble_committed": dribble_committed,
                     "stop_dribble_fired": stop_dribble_fired,
                     "stop_dribble_at_limit": stop_dribble_at_limit,
                     "command": command,
@@ -1509,6 +2297,8 @@ class JALTeamEnv(gym.Env):
             goalie_y=(float(goalie_pose[1]) if goalie_pose is not None else None),
             is_dribbling=bool(self.dribble_session_active.get(robot_id, False)),
             dribble_anchor_dist=dribble_anchor_dist,
+            dribble_target=self.dribble_to_target.get(robot_id),
+            prev_ball_to_dribble_target_dist=self.prev_ball_to_dribble_target_dist.get(robot_id),
         )
 
     @staticmethod
@@ -1519,52 +2309,20 @@ class JALTeamEnv(gym.Env):
             return "secure_possession"
         return "chase_ball"
 
-    # stop_dribble counts as a deliberate "release near the limit" (eligible
-    # for stop_dribble_release_bonus) when the session covered at least this
-    # fraction of dribble_max_radius.
-    _STOP_DRIBBLE_RELEASE_FRACTION: float = 0.7
-
     def _end_dribble_session(self, robot_id: int) -> None:
-        """Close a dribble session and require re-approach separation."""
+        """Close a dribble session and reset the phase machine."""
 
         self.dribble_session_active[robot_id] = False
         self.dribble_anchor[robot_id] = None
-        self.awaiting_redribble_gap[robot_id] = True
+        self.dribble_states[robot_id].reset()
 
-    def _drive_scripted_goalie(self, game_state) -> None:
-        """Compute and queue the scripted opponent keeper's command this cycle.
+    def _reset_kick_macro(self, robot_id: int) -> None:
+        """Clear the committed kick alignment state for one robot."""
 
-        Called from step() between our team's command send and the sim
-        advance, so the keeper acts in the same cycle as the policy. Any
-        failure degrades to "keeper idles this cycle" rather than killing
-        the episode.
-        """
-
-        if not self.scripted_opponent_goalie or self._scripted_goalie is None:
-            return
-        if game_state is None or self.networker is None:
-            return
-        ball_pos = getattr(game_state, "ball_pos", None)
-        if ball_pos is None or len(ball_pos) < 2:
-            return
-        gk_pose = self._opponent_goalie_pose(game_state)
-        if gk_pose is None:
-            return
-        try:
-            cmd = self._scripted_goalie.action(
-                ball_pos=(float(ball_pos[0]), float(ball_pos[1])),
-                goalie_pose=gk_pose,
-                game_state=game_state,
-            )
-        except Exception:
-            self.logger.exception(
-                "Scripted goalie action failed; keeper idles this cycle"
-            )
-            return
-        if not cmd:
-            return
-        team = self.opponent_goalie_team or self._scripted_goalie.teamname
-        self.networker.execute_ai_output([cmd], team)
+        self.kick_macro_active[robot_id] = False
+        self.kick_macro_target_y[robot_id] = None
+        self.kick_macro_align_steps[robot_id] = 0
+        self.kick_macro_retarget_count[robot_id] = 0
 
     def _opponent_goalie_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) of the opponent goalie, or None.
@@ -1597,21 +2355,165 @@ class JALTeamEnv(gym.Env):
                         best_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
         return best_pose
 
+    def _keeper_away_kick_target_y(
+        self,
+        game_state,
+        ball_pos: Optional[Sequence[float]],
+    ) -> float:
+        """Choose a stable, in-mouth shot target away from the keeper.
+
+        This is intentionally deterministic and does not change the policy
+        interface. The target is latched when a kick macro opens, then the robot
+        aligns to that global shot line over as many capped-turn cycles as needed.
+        """
+
+        goal_half_height = float(getattr(self.reward_config, "goal_half_height", 5.0))
+        safety_margin = float(getattr(self.reward_config, "goal_post_safety_margin", 0.0))
+        safe_edge = max(0.0, goal_half_height - max(0.0, safety_margin))
+        configured_target_y = float(
+            getattr(self.reward_config, "kick_keeper_away_target_y", 0.0)
+        )
+        if configured_target_y > 0.0:
+            target_mag = max(0.0, min(abs(configured_target_y), safe_edge))
+        else:
+            target_mag = max(0.0, min(safe_edge, goal_half_height * 0.8))
+        if target_mag <= 1e-6:
+            return 0.0
+
+        goalie_pose = self._opponent_goalie_pose(game_state)
+        goalie_y = float(goalie_pose[1]) if goalie_pose is not None else 0.0
+        ball_y = float(ball_pos[1]) if ball_pos is not None and len(ball_pos) >= 2 else 0.0
+
+        if abs(goalie_y) > 0.25:
+            target_sign = -1.0 if goalie_y > 0.0 else 1.0
+        elif abs(ball_y) > 0.25:
+            # If the keeper is central, prefer the side opposite the current
+            # ball lane. This avoids defaulting every central-keeper shot to
+            # the same post and gives wide starts a sane cross-mouth target.
+            target_sign = -1.0 if ball_y > 0.0 else 1.0
+        else:
+            target_sign = 1.0
+        return float(target_sign * target_mag)
+
+    def _maybe_retarget_kick_target_y(
+        self,
+        robot_id: int,
+        game_state,
+        current_target_y: float,
+    ) -> Tuple[float, bool, Optional[float]]:
+        """Optionally flip a committed kick target away from the live keeper.
+
+        The initial target is latched for stability, but the keeper can move
+        during the slow real-robot turn. This one-time guard prevents firing at
+        the side the keeper has since occupied. It is disabled unless the stage
+        config sets `kick_keeper_retarget_max_count > 0`.
+        """
+
+        max_count = int(getattr(self.reward_config, "kick_keeper_retarget_max_count", 0))
+        if max_count <= 0:
+            return current_target_y, False, None
+        if self.kick_macro_retarget_count.get(robot_id, 0) >= max_count:
+            return current_target_y, False, None
+
+        goalie_pose = self._opponent_goalie_pose(game_state)
+        if goalie_pose is None:
+            return current_target_y, False, None
+        goalie_y = float(goalie_pose[1])
+        if abs(current_target_y) <= 1e-6:
+            return current_target_y, False, None
+
+        goal_half_height = float(getattr(self.reward_config, "goal_half_height", 5.0))
+        safety_margin = float(getattr(self.reward_config, "goal_post_safety_margin", 0.0))
+        target_mag = abs(float(current_target_y))
+        candidates = [math.copysign(target_mag, current_target_y), -math.copysign(target_mag, current_target_y)]
+        qualities = [
+            post_safe_goalie_gap_quality(c, goalie_y, goal_half_height, safety_margin)
+            for c in candidates
+        ]
+        current_quality = float(qualities[0])
+        best_idx = int(np.argmax(np.asarray(qualities, dtype=np.float32)))
+        best_target = float(candidates[best_idx])
+        best_quality = float(qualities[best_idx])
+
+        min_quality = float(
+            getattr(self.reward_config, "kick_keeper_retarget_min_gap_quality", 0.0)
+        )
+        same_side_y = float(
+            getattr(self.reward_config, "kick_keeper_retarget_same_side_y", 0.0)
+        )
+        min_improvement = float(
+            getattr(self.reward_config, "kick_keeper_retarget_min_improvement", 0.05)
+        )
+        same_side_blocked = (
+            same_side_y > 0.0
+            and abs(goalie_y) >= same_side_y
+            and current_target_y * goalie_y > 0.0
+        )
+        low_quality = min_quality > 0.0 and current_quality < min_quality
+        if (
+            best_target != current_target_y
+            and (same_side_blocked or low_quality)
+            and best_quality >= current_quality + min_improvement
+        ):
+            self.kick_macro_retarget_count[robot_id] = (
+                self.kick_macro_retarget_count.get(robot_id, 0) + 1
+            )
+            self.kick_macro_target_y[robot_id] = best_target
+            return best_target, True, current_quality
+        return current_target_y, False, current_quality
+
+    def _keeper_zone_factor(
+        self,
+        point: Optional[Tuple[float, float]],
+        goalie_pose: Optional[Tuple[float, float, float]],
+    ) -> float:
+        """Suppression multiplier for gap-scaled reward inside the keeper zone.
+
+        positional_gap_quality peaks inside the keeper's catch radius, so every
+        gap-scaled dense term (kick_aim, combo, dribble target/achieved-gap) is
+        maximised exactly where the keeper catches — pulling the policy to
+        over-dribble to point-blank. This returns a factor that ramps from
+        `keeper_zone_floor` at the keeper's position to 1.0 at
+        `keeper_zone_radius` away, applied to `point` (the position whose
+        gap-quality is being rewarded — the shot origin or carry endpoint).
+        Returns 1.0 (no suppression) when disabled or inputs are missing.
+        """
+        radius = float(getattr(self.reward_config, "keeper_zone_radius", 0.0))
+        if radius <= 0.0 or point is None or goalie_pose is None:
+            return 1.0
+        floor = float(getattr(self.reward_config, "keeper_zone_floor", 0.0))
+        d = math.hypot(
+            float(point[0]) - float(goalie_pose[0]),
+            float(point[1]) - float(goalie_pose[1]),
+        )
+        if d >= radius:
+            return 1.0
+        return floor + (1.0 - floor) * (d / radius)
+
     @staticmethod
-    def _project_kick_y_at_goal_line(pose: Sequence[float]) -> Optional[float]:
-        """Project a straight kick from robot pose to the opponent goal line."""
+    def _project_kick_y_at_goal_line(
+        pose: Sequence[float],
+        ball_pos: Optional[Sequence[float]] = None,
+    ) -> Optional[float]:
+        """Project a straight kick from the ball (the trajectory origin)."""
 
         rx, ry, theta_deg = float(pose[0]), float(pose[1]), float(pose[2])
+        origin_x = float(ball_pos[0]) if ball_pos is not None else rx
+        origin_y = float(ball_pos[1]) if ball_pos is not None else ry
         theta_rad = math.radians(theta_deg)
         cos_t = math.cos(theta_rad)
         if cos_t <= 1e-3:
             return None
-        return float(ry + (FIELD_X[1] - rx) * (math.sin(theta_rad) / cos_t))
+        return float(origin_y + (FIELD_X[1] - origin_x) * (math.sin(theta_rad) / cos_t))
 
-    def _kick_aim_quality_from_pose(self, pose: Sequence[float]) -> Tuple[float, Optional[float]]:
+    def _kick_aim_quality_from_pose(
+        self,
+        pose: Sequence[float],
+        ball_pos: Optional[Sequence[float]] = None,
+    ) -> Tuple[float, Optional[float]]:
         """Return aim quality and projected goal-line y for a straight kick."""
 
-        predicted_y = self._project_kick_y_at_goal_line(pose)
+        predicted_y = self._project_kick_y_at_goal_line(pose, ball_pos)
         return (
             aim_quality_from_prediction(
                 predicted_y,
@@ -1716,10 +2618,10 @@ class JALTeamEnv(gym.Env):
     # more than `ball_speed_max` units in one cycle (position advances by the
     # velocity, which the server clips to ball_speed_max). This threshold MUST
     # stay above ball_speed_max (server.conf) or legitimate kicks get flagged as
-    # teleports and episodes die after one step. ball_speed_max is currently 6
-    # (raised from 3 to give a ~5.75 m/s kick exit), so 8.0 leaves headroom for
-    # noise/wind while still catching real server teleports (which jump the ball
-    # tens of units). If you raise ball_speed_max again, raise this too.
+    # teleports and episodes die after one step. ball_speed_max is now 4
+    # (real-robot 4 m/s kick cap; 1 unit/cycle = 1 m/s), so 8.0 leaves ample
+    # headroom for noise/wind while still catching real server teleports (which
+    # jump the ball tens of units). If you raise ball_speed_max again, raise this too.
     # The robot, under our Stage 1 action mask, cannot move at all (only kick is
     # selectable), so its tolerance stays tight.
     _BALL_TELEPORT_THRESHOLD: float = 8.0
@@ -1732,6 +2634,24 @@ class JALTeamEnv(gym.Env):
     _BALL_STOPPED_SPEED: float = 0.05
     _BALL_STOPPED_STEPS: int = 10
 
+    # Frozen-state detection: if the ball position AND every one of our
+    # robots' poses are bit-identical (within float noise) to the previous
+    # step for this many consecutive steps, the sim connection is treating
+    # us to the same stale frame repeatedly (or the ball is genuinely wedged
+    # with the robot unable to affect it). Runs unconditionally, unlike
+    # _BALL_STOPPED_STEPS above which only ends the episode when
+    # approach_ball/goto are both disabled — this is the general backstop
+    # that catches the case those actions enabled but the frame still never
+    # advances, which let one inference episode bank a kick_aim_bonus on
+    # every step of a ~140-step frozen frame.
+    _FROZEN_STATE_EPS: float = 1e-6
+    _FROZEN_STATE_STEPS: int = 15
+    # Heading epsilon (degrees) for the same backstop. Without this, a robot
+    # that's purely turning in place (no translation) has bit-identical x/y
+    # for as long as it keeps turning and gets wrongly killed as "frozen"
+    # even though it's actively rotating and the sim is healthy.
+    _FROZEN_STATE_THETA_EPS_DEG: float = 1e-4
+
     # Touchline dead-zone margin: a ball within this many units of the
     # |y|=FIELD_Y[1] touchline is treated as out-of-bounds. In a real game a
     # ball this close to the line is a kick-in/throw-in (dead, not
@@ -1743,6 +2663,11 @@ class JALTeamEnv(gym.Env):
     # by `ball_in_penalty_off_target`, and applying a margin to the end line
     # would risk pre-empting goals.
     _TOUCHLINE_DEAD_MARGIN: float = 0.5
+
+    # Goalie-catch detection radius. rcssserver's catch area is roughly 1.2 × 1.0
+    # units; we use a generous circular threshold so a catch is reliably flagged
+    # even when the ball drifts slightly after being held.
+    _GOALIE_CATCH_DIST: float = 3.0
 
     def _own_robot_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) for the first controlled robot, or None."""
@@ -1782,45 +2707,34 @@ class JALTeamEnv(gym.Env):
         # Ball entered the right penalty area but missed the goal mouth. Ending
         # the episode here is BOTH a bug workaround (avoids BallStuckRef) AND a
         # learning signal — see _RIGHT_PENALTY_AREA_X comment above.
-        # Stage 2 exemptions: a wide-y ball inside the wedge is NOT dead when
-        # it is (a) a LIVE ON-MOUTH SHOT — a mouth-bound kick from a wide-y
-        # spawn near x=34 crosses x>=35 at |y|>5 mid-flight, so terminating on
-        # position alone makes scoring from there impossible — or (b) in our
-        # robot's possession (dribbling into the box is exactly the behavior
-        # stage 2 teaches). A slow/loose wide ball still terminates as before.
         if bx >= self._RIGHT_PENALTY_AREA_X and abs(by) > self._GOAL_HALF_HEIGHT:
-            live_on_mouth_shot = False
-            prev_bp = (
-                getattr(prev_game_state, "ball_pos", None)
-                if prev_game_state is not None else None
-            )
-            if prev_bp is not None:
-                vx = bx - float(prev_bp[0])
-                vy = by - float(prev_bp[1])
-                if vx > 1e-6:
-                    projected_y = by + (FIELD_X[1] - bx) * (vy / vx)
-                    live_on_mouth_shot = (
-                        abs(projected_y) < self._GOAL_HALF_HEIGHT + 1.0
-                    )
-            in_our_possession = False
-            own_pose = self._own_robot_pose(game_state)
-            if own_pose is not None:
-                in_our_possession = (
-                    math.hypot(bx - own_pose[0], by - own_pose[1])
-                    <= self.kickable_dist
-                )
-            if not live_on_mouth_shot and not in_our_possession:
-                return True, "ball_in_penalty_off_target"
+            return True, "ball_in_penalty_off_target"
 
-        # Stage 2: keeper cleared the ball back upfield — the 1v1 duel is
-        # decided, so end the episode instead of burning the remaining
-        # max_steps on a dead play. Losing the +70 is the learning signal;
-        # no extra penalty.
-        if (
-            self.ball_cleared_x_threshold is not None
-            and bx < self.ball_cleared_x_threshold
-        ):
-            return True, "keeper_cleared"
+        # Early goalie-possession detection: the rcssserver catch animation holds
+        # the ball at the keeper for 1-2 cycles BEFORE free_kick_right fires.
+        # Terminate in that window to prevent tug-of-war kick attempts. Only
+        # fire when the keeper is deep in its goal zone (x > 38) so this check
+        # doesn't trigger when the goalie rushes out to challenge during open play.
+        gk_pose_early = self._opponent_goalie_pose(game_state)
+        if gk_pose_early is not None:
+            gk_x_e, gk_y_e, _ = gk_pose_early
+            if gk_x_e > 38.0:
+                early_catch_dist = float(
+                    getattr(self.reward_config, "goalie_possession_dist", 2.0)
+                )
+                if math.hypot(bx - gk_x_e, by - gk_y_e) < early_catch_dist:
+                    return True, "goalie_catch"
+
+        # Goalie catch: free_kick_right is issued by rcssserver when the right-side
+        # goalie successfully catches. Confirm with ball proximity to the goalie to
+        # distinguish from other free-kick causes (e.g. fouls).
+        playmode = getattr(game_state, "playmode", None)
+        if playmode == "free_kick_right":
+            gk_pose = self._opponent_goalie_pose(game_state)
+            if gk_pose is not None:
+                gk_x, gk_y, _ = gk_pose
+                if math.hypot(bx - gk_x, by - gk_y) < self._GOALIE_CATCH_DIST:
+                    return True, "goalie_catch"
 
         # Dead-ball playmodes: when rcssserver transitions out of play_on
         # (kick_in_*, corner_kick_*, goal_kick_*, foul_*, etc.) the ball is no
@@ -1828,9 +2742,56 @@ class JALTeamEnv(gym.Env):
         # do anything meaningful — keep going just wastes cycles until
         # max_steps. End immediately. The playmode is preserved in the reason
         # so the trainer logs distinguish causes.
-        playmode = getattr(game_state, "playmode", None)
         if playmode is not None and playmode not in ("play_on", "before_kick_off"):
             return True, f"ball_dead_{playmode}"
+
+        # Frozen-state backstop: ball AND all our robots' poses bit-identical
+        # to last step for too long means the frame isn't advancing (stale
+        # sim connection, or a genuinely wedged ball). See _FROZEN_STATE_STEPS.
+        if prev_game_state is not None:
+            prev_ball_pos_fs = getattr(prev_game_state, "ball_pos", None)
+            ball_frozen = (
+                prev_ball_pos_fs is not None
+                and abs(bx - float(prev_ball_pos_fs[0])) < self._FROZEN_STATE_EPS
+                and abs(by - float(prev_ball_pos_fs[1])) < self._FROZEN_STATE_EPS
+            )
+            robots_frozen = False
+            if ball_frozen:
+                team_robots_fs = getattr(game_state, "robot_poses", {}).get(self.team_name, [])
+                prev_team_robots_fs = getattr(prev_game_state, "robot_poses", {}).get(self.team_name, [])
+                prev_pose_by_unum_fs: Dict[int, Tuple[float, float, float]] = {}
+                for entry in prev_team_robots_fs:
+                    for unum, pose in entry.items():
+                        prev_pose_by_unum_fs[int(unum)] = (
+                            float(pose[0]), float(pose[1]), float(pose[2]),
+                        )
+                robots_frozen = True
+                any_robot_checked = False
+                for robot in team_robots_fs:
+                    for unum, pose in robot.items():
+                        if int(unum) not in self.robot_ids:
+                            continue
+                        prev_pose_fs = prev_pose_by_unum_fs.get(int(unum))
+                        if prev_pose_fs is None:
+                            robots_frozen = False
+                            continue
+                        any_robot_checked = True
+                        # Wrap to [-180, 180] so e.g. 179° -> -179° isn't seen as a huge jump.
+                        theta_delta = (float(pose[2]) - prev_pose_fs[2] + 180.0) % 360.0 - 180.0
+                        theta_delta = abs(theta_delta)
+                        if (
+                            abs(float(pose[0]) - prev_pose_fs[0]) >= self._FROZEN_STATE_EPS
+                            or abs(float(pose[1]) - prev_pose_fs[1]) >= self._FROZEN_STATE_EPS
+                            or theta_delta >= self._FROZEN_STATE_THETA_EPS_DEG
+                        ):
+                            robots_frozen = False
+                robots_frozen = robots_frozen and any_robot_checked
+            if ball_frozen and robots_frozen:
+                self._frozen_state_counter += 1
+            else:
+                self._frozen_state_counter = 0
+            if self._frozen_state_counter >= self._FROZEN_STATE_STEPS:
+                return True, "frozen_state_stale_sim"
 
         # Ball stopped far from the robot: if the ball has come to rest (low
         # speed for several consecutive cycles) and the robot can't reach it
@@ -1913,7 +2874,7 @@ class JALTeamEnv(gym.Env):
 
     def _can_robot_move(self) -> bool:
         """Return True if the current action mask allows any locomotion action."""
-        locomotion_actions = {"goto", "approach_ball"}
+        locomotion_actions = {"goto", "approach_ball", "dribble_to"}
         return any(a not in self.disabled_actions for a in locomotion_actions)
 
     def _send_commands(self, commands: List[str]):

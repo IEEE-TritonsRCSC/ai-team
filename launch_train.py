@@ -107,8 +107,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
             "qlearning",
             "attention_mappo",
         ],
-        default="discrete_ppo",
-        help="Trainer type forwarded to train.py (default: discrete_ppo)",
+        default="ppo_jal_curriculum",
+        help="Trainer type forwarded to train.py (default: ppo_jal_curriculum)",
     )
     parser.add_argument(
         "--python", default=sys.executable,

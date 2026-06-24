@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """Orchestrate parallel simulator instances and N inference processes.
 
-Launches one rcssserver instance per model on consecutive port slots, waits
-for them to initialise, then starts one infer.py process per model with
-matching --sim_player_port / --sim_trainer_port arguments. All child
-processes are stopped cleanly when this script exits.
+For ``sim-only``, launches one external rcssserver instance per model on
+consecutive port slots, waits for them to initialise, then starts one
+infer.py process per model with matching ports. For ``sim-embedded``, starts
+one infer.py subprocess per model; each subprocess owns an independent
+in-process embedded simulator. All child processes are stopped cleanly when
+this script exits.
 
 USAGE
 -----
     python launch_infer.py <model1> [<model2> <model3> ...] [options]
 
-One sim + one infer process is launched per model path. N models -> N
-parallel sims on consecutive port pairs (6000/6001, 6010/6011, ...).
+One sim + one infer process is launched per model path. With an external
+server, N models use consecutive port pairs (6000/6001, 6010/6011, ...).
+With the embedded backend, N independent simulator engines run in N infer.py
+subprocesses and do not use network ports.
 
 COMMON OPTIONS
 --------------
     --steps N            inference steps per model (default 3000)
     --base-port PORT     base player port for env 0 (default 6000)
     --port-stride N      gap between consecutive envs (default 10, min 3)
-    --config <path>      training config (default configs/td3_jal_her_config.json)
-    --stage <name>       curriculum stage to mirror (default stage1_9_approach_turn_kick)
-    --no-monitor         skip rcssmonitor windows (headless)
+    --config <path>      training config (default configs/ppo_jal_curriculum_config.json)
+    --stage <name>       curriculum stage to mirror (default stage2_0_baseline)
+    --env MODE           simulator backend (sim-only or sim-embedded)
+    --log-root PATH      parent directory for per-instance logs
+    --no-monitor         skip rcssmonitor windows (headless; external only)
     --debug_infer        forward debug flag to each infer.py
 
 Port layout (matches launch_train.py / base_trainer._sim_endpoint_for_env):
@@ -41,11 +47,11 @@ EXAMPLES
     python launch_infer.py models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip \\
         --steps 7000 --no-monitor
 
-    # Compare two checkpoints in parallel
+    # Compare two checkpoints in parallel using independent embedded sims
     python launch_infer.py \\
         models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip \\
         models/<datetime>_td3_jal_her/<other_checkpoint>.zip \\
-        --steps 7000
+        --env sim-embedded --steps 7000
 
     # Run alongside another sim already on 6000 - use a different base port
     python launch_infer.py models/<datetime>_td3_jal_her/stage1_9_approach_turn_kick_complete.zip \\
@@ -90,21 +96,33 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Inference args forwarded to each infer.py
-    parser.add_argument("--trainer", default="td3_jal_her",
-                        help="Trainer type for infer.py (default: td3_jal_her, expandable HER path)")
-    parser.add_argument("--config", default="configs/td3_jal_her_config.json",
+    parser.add_argument("--trainer", default="ppo_jal",
+                        help="Trainer type for infer.py (default: ppo_jal, expandable JAL path)")
+    parser.add_argument("--config", default="configs/ppo_jal_curriculum_config.json",
                         help="Training config for stage settings (default: "
-                             "configs/td3_jal_her_config.json)")
-    parser.add_argument("--stage", default="stage1_9_approach_turn_kick",
+                             "configs/ppo_jal_curriculum_config.json)")
+    parser.add_argument("--stage", default="stage2_0_baseline",
                         help="Curriculum stage to mirror (default: "
-                             "stage1_9_approach_turn_kick)")
+                             "stage2_0_baseline)")
     parser.add_argument("--steps", type=int, default=3000,
                         help="Steps per infer process (default: 3000)")
     parser.add_argument("--team_config", default="team_config.json")
     parser.add_argument("--team", default="TritonBots")
-    parser.add_argument("--env", default="sim-only",
-                        choices=["sim-only", "sim-mixed", "field-practice",
-                                 "field-tournament"])
+    parser.add_argument(
+        "--log-root",
+        default="infer_logs",
+        help="Parent directory for per-instance inference logs "
+             "(default: infer_logs).",
+    )
+    parser.add_argument(
+        "--env",
+        default="sim-only",
+        choices=["sim-only", "sim-embedded", "sim-mixed",
+                 "field-practice", "field-tournament"],
+        help="Environment mode (default: sim-only). In sim-embedded mode, "
+             "every model runs in a separate infer.py process with its own "
+             "embedded simulator.",
+    )
     parser.add_argument("--debug_infer", action="store_true")
     parser.add_argument("--ppo_stochastic", action="store_true",
                         help="PPO JAL: forward --ppo_stochastic (sample primitive + params).")
@@ -162,9 +180,6 @@ def wait_for_all(procs: list[subprocess.Popen]) -> int:
     exit_code = 0
     reported: set[int] = set()
     while True:
-        still_running = [p for p in procs if p.poll() is None]
-        if not still_running:
-            break
         for proc in procs:
             rc = proc.poll()
             if rc is None or proc.pid in reported:
@@ -174,6 +189,8 @@ def wait_for_all(procs: list[subprocess.Popen]) -> int:
                 exit_code = rc
                 print(f"[launcher] PID {proc.pid} exited with code {rc}.",
                       file=sys.stderr)
+        if all(p.poll() is not None for p in procs):
+            break
         time.sleep(1.0)
     return exit_code
 
@@ -223,12 +240,13 @@ def print_comparison(log_dirs: list[Path]) -> None:
 def main() -> int:
     args = parse_args()
 
-    if args.port_stride < 3:
+    if args.env != "sim-embedded" and args.port_stride < 3:
         print("--port-stride must be >= 3 to avoid sim port conflicts",
               file=sys.stderr)
         return 1
 
     num_envs = len(args.model_paths)
+    embedded = args.env == "sim-embedded"
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     all_procs: list[subprocess.Popen] = []
     sim_procs: list[subprocess.Popen] = []
@@ -237,22 +255,49 @@ def main() -> int:
     log_dirs: list[Path] = []
 
     try:
-        monitor_parts = shlex.split(args.monitor_cmd) if args.monitor else []
+        monitor_parts = (
+            shlex.split(args.monitor_cmd)
+            if args.monitor and not embedded
+            else []
+        )
     except ValueError as exc:
         print(f"Invalid --monitor-cmd: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[launcher] Starting {num_envs} sim(s) + {num_envs} infer process(es) "
-          f"(base-port={args.base_port}, stride={args.port_stride})", flush=True)
+    if embedded:
+        print(
+            f"[launcher] Starting {num_envs} independent embedded sim + infer "
+            "process(es); external ports and monitors are not used.",
+            flush=True,
+        )
+        if args.monitor:
+            print("[launcher] --monitor is ignored for sim-embedded.",
+                  file=sys.stderr)
+    else:
+        print(
+            f"[launcher] Starting {num_envs} sim(s) + {num_envs} infer "
+            f"process(es) (base-port={args.base_port}, "
+            f"stride={args.port_stride})",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
-    # 1. Launch one simulator per env
+    # 1. Prepare every env and launch external simulators when required.
+    # Embedded simulators are constructed inside the infer subprocesses so
+    # each C++ engine and its process-global state remain isolated.
     # ------------------------------------------------------------------
     try:
         for idx, model_path in enumerate(args.model_paths):
             port = player_port(args.base_port, args.port_stride, idx)
-            log_dir = make_env_log_dir(idx, model_path, ts)
+            log_dir = make_env_log_dir(idx, model_path, ts, root=args.log_root)
             log_dirs.append(log_dir)
+
+            if embedded:
+                print(
+                    f"[launcher] env {idx}: embedded simulator will run inside "
+                    f"infer process  log_dir={log_dir}"
+                )
+                continue
 
             try:
                 sim_parts = build_sim_command(args.sim_cmd, args.sim_port_flag, port)
@@ -308,13 +353,17 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 2. Wait for sims to initialise
     # ------------------------------------------------------------------
-    print(f"[launcher] Waiting {args.sim_wait}s for simulators to initialise...")
-    try:
-        time.sleep(args.sim_wait)
-    except KeyboardInterrupt:
-        print("\n[launcher] Interrupted during wait. Stopping...", file=sys.stderr)
-        stop_processes(all_procs)
-        return 130
+    if embedded:
+        print("[launcher] Embedded simulators need no external startup wait.")
+    else:
+        print(f"[launcher] Waiting {args.sim_wait}s for simulators to initialise...")
+        try:
+            time.sleep(args.sim_wait)
+        except KeyboardInterrupt:
+            print("\n[launcher] Interrupted during wait. Stopping...",
+                  file=sys.stderr)
+            stop_processes(all_procs)
+            return 130
 
     # ------------------------------------------------------------------
     # 3. Launch one infer.py per model, each targeting its own sim
@@ -335,10 +384,13 @@ def main() -> int:
                 "--stage", args.stage,
                 "--steps", str(args.steps),
                 "--log_dir", str(log_dir),
-                "--sim_host", "127.0.0.1",
-                "--sim_player_port", str(port),
-                "--sim_trainer_port", str(port + 1),
             ]
+            if not embedded:
+                infer_cmd += [
+                    "--sim_host", "127.0.0.1",
+                    "--sim_player_port", str(port),
+                    "--sim_trainer_port", str(port + 1),
+                ]
             if args.debug_infer:
                 infer_cmd.append("--debug_infer")
             if args.ppo_stochastic:
@@ -357,8 +409,9 @@ def main() -> int:
                 return 1
             infer_procs.append(p)
             all_procs.append(p)
+            backend = "embedded" if embedded else f"ports={port}/{port + 1}"
             print(f"[launcher] env {idx}: infer pid={p.pid}  "
-                  f"model={Path(model_path).name}")
+                  f"model={Path(model_path).name}  backend={backend}")
     except KeyboardInterrupt:
         print("\n[launcher] Interrupted during infer launch. Stopping...",
               file=sys.stderr)
@@ -366,7 +419,7 @@ def main() -> int:
         return 130
 
     print(f"[launcher] All processes running. Tail any "
-          f"infer_logs/.../infer_log.log to watch progress. "
+          f"{args.log_root}/.../infer_log.log to watch progress. "
           f"Ctrl+C to stop everything.")
 
     # ------------------------------------------------------------------

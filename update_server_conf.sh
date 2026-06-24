@@ -40,6 +40,14 @@ replace_server_param "coach_w_referee" "true"
 replace_server_param "player_size" "0.9"
 replace_server_param "ball_size" "0.215"
 replace_server_param "kickable_margin" "0.1"
+# Real-robot physical limits (1 unit/cycle = 1 m/s, 10 cycles/s).
+# Ball speed (kick + pass) capped at 4 m/s; full kick power (100) -> 4 m/s.
+replace_server_param "ball_speed_max" "4"
+replace_server_param "ball_accel_max" "4"
+replace_server_param "kick_power_rate" "0.04"
+# Angular velocity capped at 20 deg/s = 2 deg per 100 ms cycle.
+replace_server_param "maxmoment" "2"
+replace_server_param "minmoment" "-2"
 # Disable the BallStuckRef "drop ball" rule. Default is 100 cycles which
 # fires inside our training episodes (model is at-ball but kicks don't
 # move the ball reliably), teleporting our robot and corrupting transitions.

@@ -84,26 +84,128 @@ class RewardConfig:
     # the goalie-gap kick bonus (final = (1-b)*gap + b*center). Eases transfer
     # from the stage-1 checkpoint; fade to 0.0 (pure gap) as the stage matures.
     goalie_gap_blend_center: float = 0.0
+    # Keep rewarded shots away from the posts. Quality is unchanged inside
+    # H-margin, then decays linearly to zero at the post.
+    goal_post_safety_margin: float = 0.0
 
-    # ---- Stage 2: dribble session rules (enforced by JAL_env, read here) ----
-    # A dribble session is anchored where start_dribble fired; the robot may
-    # not dribble farther than this from the anchor. Beyond it the env forces
-    # a release and start_dribble becomes invalid until re-approach.
+    # ---- Stage 2: dribble_to target quality and progress ----
+    # Dense per-step reward for ball moving toward the dribble_to target.
+    # Positive = ball got closer. Teaches WHERE to target by rewarding
+    # progress toward the chosen coordinate. 0.0 disables.
+    dribble_target_progress_weight: float = 0.0
+    dribble_target_progress_clip: float = 0.5
+    # One-shot bonus (fired in JAL_env on the first step of a new dribble_to
+    # selection) scaled by how much the chosen target improves goalie-gap
+    # quality vs the ball's current position. Teaches WHEN to dribble: the
+    # policy only gets credit when the target genuinely improves the shooting
+    # angle. quality_delta = gap(target) - gap(current), clamped to [0, 1].
+    dribble_target_quality_weight: float = 0.0
+    # Small per-step reward while dribble_to is active AND the target has
+    # positive quality delta. Sustains reward signal across multi-step
+    # transport so the value function doesn't over-discount. 0.0 disables.
+    dribble_active_bonus: float = 0.0
+    # Clamp on the absolute y (field units) of a decoded dribble_to target.
+    # The dribble-target head emits goto_y_raw in [-1, 1] which scales by
+    # field_half_height (30) -> targets span +/-30. But a USEFUL dribble must
+    # land near the goal mouth (|y| < goal_half_height ~ 5) to open the shooting
+    # angle; with the full +/-30 range, gap-improving targets are a tiny ~17%
+    # slice of action space the policy never finds by exploration (§34: 263/264
+    # carries moved the ball to a WORSE angle). Clamping goto_y to +/-this value
+    # concentrates the head's output on reachable, shot-improving targets.
+    # 0.0 disables (no clamp, full +/-field_half_height range).
+    dribble_target_y_clip: float = 0.0
+    # Extra dribble safety near the opponent penalty area. If a decoded
+    # dribble_to target is within `dribble_penalty_area_guard_margin` of the
+    # opponent penalty-area x boundary, clamp its |y| to
+    # `dribble_penalty_area_y_clip`. This prevents the macro from carrying a
+    # wide ball into x>=35 outside the goal mouth, which terminates as
+    # ball_in_penalty_off_target under the Stage-2 keeper duel rules.
+    # Both >0 to enable.
+    dribble_penalty_area_guard_margin: float = 0.0
+    dribble_penalty_area_y_clip: float = 0.0
+    # Goal-RELATIVE dribble-target parameterization (replaces the absolute
+    # field-coordinate decode for dribble_to). The decoded target is
+    # ball + fwd*(ball->goal unit) + lat*(perp), with
+    #   fwd = (goto_x_raw*0.5 + 0.5) * dribble_fwd_max   (always forward, 0..max)
+    #   lat = goto_y_raw * dribble_lat_max               (steer to the open side)
+    # This makes the head's NEUTRAL output (~0,0) a forward carry toward the goal
+    # centre — already gap-improving — so the quality one-shot fires from step 1
+    # and the head gets a gradient (the absolute decode put the neutral target at
+    # midfield (0,0), dx=45, gap~0.07 << current gap ~0.32, so every carry was a
+    # backward dead target and the head never learned: §34/§35 + 6/20 lag runs all
+    # showed 0% useful carries). Both >0 to enable; 0 keeps the legacy absolute
+    # decode. dribble_target_y_clip still applies as a final |y| clamp.
+    dribble_fwd_max: float = 0.0
+    dribble_lat_max: float = 0.0
+
+    # Achieved-gap reward (computed in JAL_env): credit the REALIZED change in
+    # shooting-gap quality of a carry — positional_gap_quality at the ball's
+    # position when the segment CLOSES minus when it OPENED — scaled by this
+    # weight. Unlike dribble_target_quality_weight (which pays the latched
+    # HYPOTHETICAL target's gap at carry-open), this pays only for the angle the
+    # carry actually produced, so an in-place orbit that never moves the ball
+    # nets ~0 and a carry that worsens the angle is penalized.
+    dribble_achieved_gap_weight: float = 0.0
+
+    # Deterministic keeper-away kick target y used by the env's committed kick
+    # macro. 0.0 keeps the legacy auto target at min(goal_half_height -
+    # safety_margin, 0.8*goal_half_height). Positive values are clipped inside
+    # the post-safety edge. Stage 2h uses 3.5 so keeper-away shots retain
+    # enough post margin under the 5° kick-fire tolerance.
+    kick_keeper_away_target_y: float = 0.0
+    # Optional one-time retarget while the committed kick macro is still
+    # aligning. If the keeper moves onto the selected side, or the intended
+    # target-vs-keeper gap quality falls below this threshold, the env may flip
+    # to the better of +/-kick_keeper_away_target_y. Defaults disabled.
+    kick_keeper_retarget_max_count: int = 0
+    kick_keeper_retarget_min_gap_quality: float = 0.0
+    kick_keeper_retarget_same_side_y: float = 0.0
+    kick_keeper_retarget_min_improvement: float = 0.05
+
+    # Terminal penalty for a shot entering the penalty area outside the mouth.
+    ball_in_penalty_off_target_penalty: float = 0.0
+
+    # ---- Deprecated dribble fields (kept for backward compat, no longer
+    # referenced in reward calculation — internal to dribble_to phase machine) ----
     dribble_max_radius: float = 1.0
-    # After stop_dribble / exhaustion, a NEW session requires visible
-    # separation first: robot-ball distance must exceed kickable_dist + this
-    # margin before start_dribble is valid again.
     dribble_redribble_gap_margin: float = 0.2
-    # Per-step reward on the change of |ball_y - goalie_y| while inside a
-    # valid dribble envelope — pays lateral feints away from the keeper and
-    # penalizes dribbling back into its cover. 0.0 disables.
     dribble_lateral_progress_weight: float = 0.0
     dribble_lateral_progress_clip: float = 0.3
-    # One-shot bonus (applied by JAL_env) for releasing the ball with
-    # stop_dribble late in the session (anchor distance >= 70% of the radius),
-    # encouraging a deliberate stop -> re-approach -> kick chain instead of
-    # spamming start_dribble at the 1 m boundary. 0.0 disables.
     stop_dribble_release_bonus: float = 0.0
+
+    # ---- Stage 2: goalie-possession tug-of-war suppression ----
+    # One-shot penalty applied when a kick fires while the ball is within
+    # `goalie_possession_dist` of the keeper. Penalizes the tug-of-war pattern
+    # (robot kicking while the goalie already has possession), complementing the
+    # early-termination check in JAL_env._check_terminal. 0.0 disables.
+    kick_near_goalie_penalty: float = 0.0
+    # Ball-to-goalie distance threshold for the above penalty. Also used by
+    # JAL_env._check_terminal as the early possession-detection radius.
+    goalie_possession_dist: float = 2.0
+
+    # ---- Stage 2: dribble→kick combo bonus ----
+    # One-shot bonus applied when a kick fires within `post_dribble_kick_combo_window`
+    # steps of a dribble release (CARRY→RELEASE transition). Directly rewards the
+    # dribble-to-create-angle → kick sequence as a single unit. 0.0 disables.
+    post_dribble_kick_bonus: float = 0.0
+    # How many steps after a dribble release a kick still qualifies for the combo.
+    post_dribble_kick_combo_window: int = 5
+    # When True, the combo bonus is scaled by the kick's actual aim quality at
+    # fire time. Prevents "dribble then wild kick" from farming the bonus.
+    post_dribble_kick_quality_scale: bool = False
+
+    # ---- Stage 2: keeper catch-zone suppression ----
+    # positional_gap_quality (which scales kick_aim, the combo, dribble target-
+    # quality and achieved-gap) PEAKS inside the keeper's catch radius (~0.92 at
+    # 2 units from goal vs ~0.46 at 10), so every gap-scaled dense reward is
+    # maximised exactly where the keeper catches — the reward gradient points
+    # INTO the keeper and the policy over-dribbles to point-blank (§stage2h:
+    # 49.7% goalie_catch). These knobs multiply that gap-scaled credit by a
+    # factor that ramps from `keeper_zone_floor` (at the keeper's position) to
+    # 1.0 at `keeper_zone_radius` away, flattening/inverting the pull. The −70
+    # goalie_catch terminal is unchanged. radius 0.0 disables (backwards-compat).
+    keeper_zone_radius: float = 0.0
+    keeper_zone_floor: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -121,14 +223,16 @@ class RewardInputs:
     prev_ball_to_goal_dist: Optional[float] = None
     prev_ball_pos: Optional[Tuple[float, float]] = None
     prev_facing_goal_cos: Optional[float] = None
-    # Stage 2: opponent goalie y (None when no goalie is on the field). Used
-    # for goalie-gap aim gating and dribble lateral-progress shaping.
+    # Stage 2: opponent goalie y (None when no goalie is on the field).
     goalie_y: Optional[float] = None
-    # Stage 2: command-level dribble session state, maintained by JAL_env.
-    # is_dribbling is True only while a start_dribble session is active;
-    # dribble_anchor_dist is the robot's distance from the session anchor.
+    # True only after dribble_to verifies catch ownership and enters CARRY.
     is_dribbling: bool = False
     dribble_anchor_dist: Optional[float] = None
+    # The (x, y) target the policy chose for dribble_to this step.
+    # None when the active action is not dribble_to.
+    dribble_target: Optional[Tuple[float, float]] = None
+    # Ball-to-dribble-target distance from the previous step (for delta).
+    prev_ball_to_dribble_target_dist: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -157,11 +261,16 @@ class RewardIntermediates:
     ball_out_of_bounds: bool
     # Stage 2 fields (defaults keep stage-1 callers untouched).
     goalie_y: Optional[float] = None
-    # True while a command-level dribble session is active AND the robot is
-    # still inside the dribble_max_radius envelope from its anchor.
+    # True when the current action is dribble_to (regardless of phase).
+    dribble_to_active: bool = False
+    # Per-step ball-to-dribble-target distance reduction (positive = closer).
+    dribble_target_progress: Optional[float] = None
+    # Gap quality improvement of target over current ball position [0, 1].
+    dribble_target_quality_delta: Optional[float] = None
+    # True only after catch ownership has been verified and the macro is carrying.
+    is_dribbling: bool = False
+    # Deprecated: kept for backward compat, always False / None.
     valid_dribble: bool = False
-    # Per-step change of |ball_y - goalie_y| while in a valid dribble
-    # envelope; positive = ball moving laterally away from the keeper.
     dribble_lateral_progress: Optional[float] = None
 
 
@@ -213,6 +322,126 @@ def goalie_gap_quality(
         return 0.0
     gap = min(abs(predicted_y - float(goalie_y)), float(goal_half_height))
     return float(gap / float(goal_half_height))
+
+
+def post_safe_goalie_gap_quality(
+    predicted_y_at_goal_line: Optional[float],
+    goalie_y: Optional[float],
+    goal_half_height: float,
+    safety_margin: float,
+) -> float:
+    """Goalie-gap quality with a continuous safety taper near each post."""
+    base = goalie_gap_quality(predicted_y_at_goal_line, goalie_y, goal_half_height)
+    if base <= 0.0 or predicted_y_at_goal_line is None or safety_margin <= 0.0:
+        return base
+    safe_edge = max(0.0, float(goal_half_height) - float(safety_margin))
+    abs_y = abs(float(predicted_y_at_goal_line))
+    if abs_y <= safe_edge:
+        return base
+    safety = max(0.0, (float(goal_half_height) - abs_y) / float(safety_margin))
+    return float(base * safety)
+
+
+# Half-width (sim units) of the goal-mouth segment the keeper is treated as
+# covering, centred on its y. The goal mouth is 10 wide (±5); a value of 1.0
+# means the keeper blocks ~20% of the mouth. Used only by positional_gap_quality
+# to model how much of a shooter's goal-angle the keeper occludes.
+GOALIE_BLOCK_HALF_WIDTH = 1.0
+
+# Reference shot distance (sim units from the goal line) used to normalise the
+# open-goal angle in positional_gap_quality. A clear full-mouth shot from this
+# distance maps to quality 1.0; closer/more-central shots saturate at 1, and
+# wider/farther/keeper-blocked shots fall below it. 12 sits inside the typical
+# attacking-third kick distance (ball spawns x~25-34, goal line x=45 -> dx~11-20).
+GOAL_ANGLE_REF_DX = 12.0
+
+
+def positional_gap_quality(
+    point: Tuple[float, float],
+    goalie_y: float,
+    goal_half_height: float,
+    goalie_block_half_width: float = GOALIE_BLOCK_HALF_WIDTH,
+) -> float:
+    """Achievable shot quality from a field position, as the OPEN-GOAL angle.
+
+    Returns the fraction of the goal-angle subtended from `point` that the
+    keeper does NOT block — i.e. "if I shoot from here and aim at the open
+    side, how much of my shooting angle is clear of the keeper?".
+
+    Geometry (attacking the right goal): the goal line is x=FIELD_X[1], the
+    mouth spans y in [-H, H] with H=goal_half_height, and the keeper occupies
+    [ky-w, ky+w] within the mouth (ky=goalie_y clamped into the mouth,
+    w=goalie_block_half_width). The keeper splits the mouth into a low segment
+    [-H, ky-w] and a high segment [ky+w, H]; the shooter exploits whichever
+    subtends the LARGER ABSOLUTE angle from `point`. That open angle is
+    normalised by a fixed reference (a full mouth from GOAL_ANGLE_REF_DX),
+    giving a value in [0, 1] that rises as the shot gets closer, more central,
+    or as the keeper clears the shooter's lane — and falls for wide/sharp
+    angles. (Normalising by the *absolute* reference, not the point's own total
+    goal-angle, is deliberate: a fraction-of-goal measure perversely rewards
+    sharper angles, since a fixed keeper blocks a smaller fraction from the
+    side.)
+
+    Unlike the previous straight-ahead model, this does NOT assume the shot
+    crosses at the point's own y, and there is NO hard cliff at |y|>=H: a ball
+    wide of the posts still has a real angled shot and scores accordingly.
+    Returns 0 only at/behind the goal line, or when the keeper occludes the
+    entire mouth from this angle.
+
+    Caveat: `goalie_y` is the keeper's CURRENT y (it bisects the CURRENT ball
+    angle). Evaluating a dribble *target* against the current keeper y is a
+    one-step counterfactual — it rewards moving to where the keeper is not
+    currently covering, which is the intended dribble instinct.
+    """
+    gx = float(FIELD_X[1])
+    px = float(point[0])
+    py = float(point[1])
+    H = float(goal_half_height)
+    dx = gx - px
+    if dx <= 1e-6 or H <= 0.0:
+        # At/behind the goal line, or degenerate mouth: no meaningful shot.
+        return 0.0
+
+    def _subtended(y0: float, y1: float) -> float:
+        """Angle (rad) subtended from `point` by the mouth interval [y0, y1]."""
+        return abs(math.atan2(y1 - py, dx) - math.atan2(y0 - py, dx))
+
+    ky = float(np.clip(goalie_y, -H, H))
+    w = max(0.0, float(goalie_block_half_width))
+    blk_lo = float(np.clip(ky - w, -H, H))
+    blk_hi = float(np.clip(ky + w, -H, H))
+
+    # Open segments either side of the keeper; shooter takes the larger angle.
+    open_low = _subtended(-H, blk_lo)
+    open_high = _subtended(blk_hi, H)
+    open_ang = max(open_low, open_high)
+
+    # Normalise by a full mouth subtended from the reference shot distance.
+    ref_ang = 2.0 * math.atan2(H, max(GOAL_ANGLE_REF_DX, 1e-6))
+    if ref_ang <= 1e-9:
+        return 0.0
+    return float(min(max(open_ang / ref_ang, 0.0), 1.0))
+
+
+def reachable_gap_delta(
+    ball_pos: Tuple[float, float],
+    target: Tuple[float, float],
+    goalie_y: float,
+    goal_half_height: float,
+    segment_limit: float = 0.85,
+) -> Tuple[float, Tuple[float, float]]:
+    """Signed gap change at the endpoint reachable in one carry segment."""
+    bx, by = float(ball_pos[0]), float(ball_pos[1])
+    dx, dy = float(target[0]) - bx, float(target[1]) - by
+    dist = float(math.hypot(dx, dy))
+    if dist > segment_limit > 0.0:
+        scale = float(segment_limit) / dist
+        endpoint = (bx + dx * scale, by + dy * scale)
+    else:
+        endpoint = (float(target[0]), float(target[1]))
+    current = positional_gap_quality((bx, by), goalie_y, goal_half_height)
+    reachable = positional_gap_quality(endpoint, goalie_y, goal_half_height)
+    return float(reachable - current), endpoint
 
 
 def extract_opponent_positions(
@@ -301,21 +530,31 @@ def calculate_reward_intermediates(
     robot_out_of_bounds = bool(abs(rx) > FIELD_X[1] or abs(ry) > FIELD_Y[1])
     ball_out_of_bounds = bool(abs(by) > FIELD_Y[1] or bx < FIELD_X[0])
 
-    # Stage 2: dribble envelope validity + lateral progress away from keeper.
-    valid_dribble = bool(
-        inputs.is_dribbling
-        and inputs.dribble_anchor_dist is not None
-        and inputs.dribble_anchor_dist < config.dribble_max_radius
-    )
-    dribble_lateral_progress = None
+    # dribble_to target progress and quality delta.
+    dribble_to_active = bool(inputs.dribble_target is not None)
+
+    dribble_target_progress = None
     if (
-        valid_dribble
-        and inputs.goalie_y is not None
-        and inputs.prev_ball_pos is not None
+        dribble_to_active
+        and inputs.prev_ball_to_dribble_target_dist is not None
     ):
-        prev_by = float(inputs.prev_ball_pos[1])
-        gk_y = float(inputs.goalie_y)
-        dribble_lateral_progress = float(abs(by - gk_y) - abs(prev_by - gk_y))
+        ball_to_target_dist = float(math.hypot(
+            bx - inputs.dribble_target[0],
+            by - inputs.dribble_target[1],
+        ))
+        dribble_target_progress = float(
+            inputs.prev_ball_to_dribble_target_dist - ball_to_target_dist
+        )
+
+    dribble_target_quality_delta = None
+    if dribble_to_active and inputs.goalie_y is not None:
+        current_gap = positional_gap_quality(
+            inputs.ball_pos, inputs.goalie_y, config.goal_half_height,
+        )
+        target_gap = positional_gap_quality(
+            inputs.dribble_target, inputs.goalie_y, config.goal_half_height,
+        )
+        dribble_target_quality_delta = float(max(0.0, target_gap - current_gap))
 
     return RewardIntermediates(
         ball_dist=ball_dist,
@@ -339,8 +578,10 @@ def calculate_reward_intermediates(
         robot_out_of_bounds=robot_out_of_bounds,
         ball_out_of_bounds=ball_out_of_bounds,
         goalie_y=inputs.goalie_y,
-        valid_dribble=valid_dribble,
-        dribble_lateral_progress=dribble_lateral_progress,
+        dribble_to_active=dribble_to_active,
+        dribble_target_progress=dribble_target_progress,
+        dribble_target_quality_delta=dribble_target_quality_delta,
+        is_dribbling=bool(inputs.is_dribbling),
     )
 
 
@@ -356,10 +597,11 @@ def _dense_aim_quality(
     """
 
     if config.use_goalie_aim_gate:
-        return goalie_gap_quality(
+        return post_safe_goalie_gap_quality(
             intermediates.predicted_y_at_goal_line,
             intermediates.goalie_y,
             config.goal_half_height,
+            config.goal_post_safety_margin,
         )
     return aim_quality_from_prediction(
         intermediates.predicted_y_at_goal_line,
@@ -433,33 +675,29 @@ def calculate_reward(
 
     if intermediates.in_shoot_state:
         reward += config.shoot_state_bonus
-    if intermediates.in_dribble_state:
-        reward += config.dribble_state_bonus
-    elif intermediates.valid_dribble:
-        # Stage 2: pay the dribble bonus only inside the valid envelope
-        # (anchor distance < dribble_max_radius) and only while the ball is
-        # not moving back toward the keeper's y. Dribbling beyond the
-        # envelope earns nothing — the env additionally marks it invalid.
-        if (
-            intermediates.dribble_lateral_progress is None
-            or intermediates.dribble_lateral_progress > 0.0
-        ):
-            reward += config.dribble_state_bonus
 
+    # dribble_to target progress: reward ball approaching the chosen target.
     if (
-        intermediates.dribble_lateral_progress is not None
-        and config.dribble_lateral_progress_weight > 0.0
+        intermediates.dribble_target_progress is not None
+        and config.dribble_target_progress_weight > 0.0
     ):
-        reward += (
-            float(
-                np.clip(
-                    intermediates.dribble_lateral_progress,
-                    -config.dribble_lateral_progress_clip,
-                    config.dribble_lateral_progress_clip,
-                )
-            )
-            * config.dribble_lateral_progress_weight
-        )
+        progress = float(np.clip(
+            intermediates.dribble_target_progress,
+            -config.dribble_target_progress_clip,
+            config.dribble_target_progress_clip,
+        ))
+        reward += progress * config.dribble_target_progress_weight
+
+    # dribble_to active bonus: small per-step reward while dribble_to is
+    # active AND the target has positive quality delta.
+    if (
+        intermediates.dribble_to_active
+        and intermediates.is_dribbling
+        and config.dribble_active_bonus > 0.0
+        and intermediates.dribble_target_quality_delta is not None
+        and intermediates.dribble_target_quality_delta > 0.0
+    ):
+        reward += config.dribble_active_bonus
 
     if intermediates.goal_scored:
         reward += config.goal_reward

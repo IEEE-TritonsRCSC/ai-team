@@ -11,6 +11,7 @@ import math
 from collections import namedtuple
 
 SIM_TIMESTEP = 0.1    # seconds
+MAX_ANGULAR_VELOCITY = math.radians(20.0)  # physical robot limit, rad/s
 # Matches "(see_global <digits> <content>)" to capture
 # server cycle number and remaining data until " ((b"
 SIM_COUNT_REGEX = r"\(see_global (\d+) (.*?)(?=\s\(\(b)"
@@ -26,6 +27,21 @@ GameState = namedtuple(
 )
 
 TeamInfo = namedtuple("TeamInfo", ["name", "n_players", "goalie_id"])
+
+
+def limit_turn_rate(action: str) -> str:
+    """Clamp a turn command to the physical robot's angular-rate limit."""
+    if not action.startswith("turn "):
+        return action
+
+    parts = action.split()
+    if len(parts) < 2:
+        return action
+
+    requested = float(parts[1])
+    limited = max(-MAX_ANGULAR_VELOCITY, min(MAX_ANGULAR_VELOCITY, requested))
+    parts[1] = repr(limited)
+    return " ".join(parts)
 
 class Deserializer:
     """Deserializes game data from various sources into GameState objects."""
@@ -234,6 +250,7 @@ class Serializer:
             if action is None:
                 continue
 
+            action = limit_turn_rate(action)
             if action.startswith("turn "):    # Convert rad/s to degrees/s for simulator
                 action = self._convert_command_for_simulator(action, 1)
             elif action.startswith("dash "):    # Convert rad to degrees for simulator
@@ -268,9 +285,9 @@ class Serializer:
             if action is None:
                 message += f"{robot_id} None\n"
             else:
+                action = limit_turn_rate(action)
                 message += f"{robot_id} {action}\n"
             robot_id += 1
         
         message += "\0"    # Null terminator for robot communication
         return message.encode()
-

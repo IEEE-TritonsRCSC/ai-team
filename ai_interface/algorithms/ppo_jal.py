@@ -35,15 +35,15 @@ Primitives (Categorical, live order):
     1: approach_ball  — reads nothing (uses ball position)
     2: turn           — reads Dtheta
     3: kick           — reads nothing
-    4: start_dribble  — reads nothing
-    5: stop_dribble   — reads nothing
-    (6, 7 reserved — always disabled until a future primitive is introduced)
+    4: dribble_to     — reads (Dx, Dy) as target coordinate
+    (5–11 reserved — always disabled until a future primitive is introduced)
 
-Continuous params (Gaussian, live order): Dx, Dy, Dtheta. (3, 4 reserved.)
+Continuous params (Gaussian, live order): Dx, Dy, Dtheta. (3–7 reserved.)
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -51,6 +51,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical, Normal
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -67,13 +69,39 @@ PRIMITIVE_NAMES: Tuple[str, ...] = (
     "approach_ball",
     "turn",
     "kick",
-    "start_dribble",
-    "stop_dribble",
+    "dribble_to",
 )
-NUM_PRIMITIVES = len(PRIMITIVE_NAMES)   # 6 live (== len(PRIMITIVE_NAMES))
-NUM_PRIMITIVES_MAX = 8                  # primitive head width (6 live + 2 reserved)
+NUM_PRIMITIVES = len(PRIMITIVE_NAMES)   # 5 live (== len(PRIMITIVE_NAMES))
+NUM_PRIMITIVES_MAX = 12                 # primitive head width (5 live + 7 reserved)
 PARAM_DIM = 3                           # Dx, Dy, Dtheta (live)
-PARAM_DIM_MAX = 5                       # param head width (3 live + 2 reserved)
+PARAM_DIM_MAX = 8                       # param head width (3 live + 5 reserved)
+
+# Which continuous param dims each primitive actually consumes (Dx=0, Dy=1,
+# Dtheta=2). Used to mask the param logprob/entropy to the SELECTED primitive on
+# each step, so e.g. a `kick` or `approach_ball` step gives the dribble-target
+# (Dx, Dy) head ZERO gradient. Previously the mask was stage-wide (every step
+# trained Dx,Dy whenever dribble_to was merely enabled), which diluted/corrupted
+# the dribble-target gradient with unrelated transitions.
+PRIMITIVE_PARAM_DIMS: Dict[str, Tuple[int, ...]] = {
+    "goto": (0, 1),
+    "approach_ball": (),
+    "turn": (2,),
+    "kick": (),
+    "dribble_to": (0, 1),
+}
+
+
+def _build_primitive_param_mask() -> np.ndarray:
+    m = np.zeros((NUM_PRIMITIVES_MAX, PARAM_DIM_MAX), dtype=np.float32)
+    for name, dims in PRIMITIVE_PARAM_DIMS.items():
+        p = PRIMITIVE_NAMES.index(name)
+        for d in dims:
+            m[p, d] = 1.0
+    return m
+
+
+# (NUM_PRIMITIVES_MAX, PARAM_DIM_MAX) — row = primitive index, 1 = dim used.
+PRIMITIVE_PARAM_MASK = _build_primitive_param_mask()
 
 A_MAX = 5                               # max controlled outfield agents
 C_MAX = 7                               # max context entities (our goalie + opp goalie + 5 opp)
@@ -86,8 +114,14 @@ NUM_HEADS = 4                           # attention heads
 
 # LOG_STD bounds (see TRAINING.md §-aim-floor): -3.0 lets the turn-angle std
 # tighten to exp(-3)*pi ≈ 9°, inside the goal window.
+# MAX was 0.5 (std=exp(0.5)=1.65) — but the entropy bonus drove param_log_std
+# straight to that ceiling and the clamp then zeroed its gradient, pinning the
+# continuous params at std=1.65 permanently (≈54% of clamp(-1,1) samples slam to
+# a rail = near-random targets). Lowered to 0.0 (std cap = 1.0); the real cure is
+# decoupling the param entropy (param_ent_coef) and resetting the contaminated
+# value on warm-start (param_log_std_init) so the std can actually be LEARNED.
 LOG_STD_MIN = -3.0
-LOG_STD_MAX = 0.5
+LOG_STD_MAX = 0.0
 
 # Default hyperparameters — overridable via config.
 DEFAULT_HPARAMS: Dict[str, Any] = {
@@ -102,6 +136,16 @@ DEFAULT_HPARAMS: Dict[str, Any] = {
     "learning_rate_final": 1e-4,
     "ent_coef_initial": 0.05,
     "ent_coef_final": 0.005,
+    # Separate entropy coef for the continuous Gaussian params. None = use the
+    # (categorical) ent_coef, i.e. legacy behaviour. Set to 0.0 to stop the
+    # entropy bonus from inflating param_log_std to the clamp ceiling — the
+    # continuous std is then learned from returns while the categorical entropy
+    # still keeps primitive selection from freezing.
+    "param_ent_coef": None,
+    # If not None, param_log_std is reset to this value on warm-start load (and
+    # at init). Use to wipe a checkpoint whose std was pinned at the old ceiling.
+    # log(0.5) ≈ -0.69 → std 0.5, comfortably below LOG_STD_MAX so gradient flows.
+    "param_log_std_init": None,
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
     "value_clip_range": 0.2,
@@ -333,7 +377,7 @@ class RolloutBuffer:
         self.disabled_masks: List[np.ndarray] = []      # (a_max, num_primitives) 1=enabled
         self.agent_active_masks: List[np.ndarray] = []  # (a_max,) 1=active
         self.context_active_masks: List[np.ndarray] = []  # (c_max,) 1=present
-        self.param_active_masks: List[np.ndarray] = []  # (param_dim_max,) 1=active
+        self.param_active_masks: List[np.ndarray] = []  # (a_max, param_dim_max) 1=active, per selected primitive
 
     def __len__(self) -> int:
         return len(self.observations)
@@ -417,6 +461,7 @@ class PPOJALAgent:
             feature_dim=int(self.hparams["feature_dim"]),
             num_heads=int(self.hparams["num_heads"]),
         ).to(self.device)
+        self._apply_param_log_std_init("init")
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.hparams["learning_rate_initial"])
 
         self.buffer = RolloutBuffer()
@@ -437,6 +482,19 @@ class PPOJALAgent:
         m = np.zeros(self.param_dim, dtype=np.float32)
         m[:PARAM_DIM] = 1.0
         return m
+
+    def _apply_param_log_std_init(self, where: str) -> None:
+        """Reset param_log_std to hparams['param_log_std_init'] if set.
+
+        Used to wipe a warm-start checkpoint whose std drifted to the clamp
+        ceiling (zero-gradient pin). No-op when the hparam is None (legacy)."""
+        init = self.hparams.get("param_log_std_init")
+        if init is None:
+            return
+        with torch.no_grad():
+            self.model.param_log_std.data.fill_(float(init))
+        logger.info("param_log_std reset to %.3f (std=%.3f) on %s",
+                    float(init), float(np.exp(float(init))), where)
 
     def _reserved_disabled_mask(self, disabled_actions: Optional[Sequence[str]]) -> np.ndarray:
         """(a_max, num_primitives) with 1=enabled. Named-disabled and reserved
@@ -476,6 +534,7 @@ class PPOJALAgent:
         agent_active_mask: Optional[np.ndarray] = None,
         context_active_mask: Optional[np.ndarray] = None,
         param_active_mask: Optional[np.ndarray] = None,
+        primitive_valid_mask: Optional[np.ndarray] = None,
         deterministic: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Sample a joint action over all a_max agent slots.
@@ -506,7 +565,6 @@ class PPOJALAgent:
             obs_t = obs_t.unsqueeze(0)
         ag_mask_t = torch.as_tensor(agent_active_mask, dtype=torch.float32, device=self.device)
         cx_mask_t = torch.as_tensor(context_active_mask, dtype=torch.float32, device=self.device)
-        pa_mask_t = torch.as_tensor(param_active_mask, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             primitive_logits, param_mean, param_std, value = self.model(obs_t, ag_mask_t, cx_mask_t)
@@ -516,6 +574,16 @@ class PPOJALAgent:
         # Disabled / reserved primitive masking — finite large-negative offset
         # (log(1e-45) ≈ -103.6) rather than -inf, so entropy stays finite.
         disabled_mask = self._reserved_disabled_mask(disabled_actions)
+        if primitive_valid_mask is not None:
+            runtime_mask = np.asarray(primitive_valid_mask, dtype=np.float32)
+            expected = (self.a_max, self.num_primitives)
+            if runtime_mask.shape != expected:
+                raise ValueError(
+                    f"primitive_valid_mask shape {runtime_mask.shape} != {expected}"
+                )
+            disabled_mask = disabled_mask * np.clip(runtime_mask, 0.0, 1.0)
+            if np.any(disabled_mask.sum(axis=1) <= 0.0):
+                raise ValueError("primitive_valid_mask disabled every primitive for a slot")
         mask_t = torch.as_tensor(disabled_mask, dtype=torch.float32, device=self.device)
         masked_logits = primitive_logits + torch.log(mask_t + 1e-45)
 
@@ -531,14 +599,29 @@ class PPOJALAgent:
             param_action = param_mean
         else:
             param_action = param_dist.sample()
-        param_action_clamped = torch.clamp(param_action, -1.0, 1.0)
-        # Only active param dims count toward the logprob (reserved/idle dims
-        # excluded ⇒ zero gradient ⇒ no idle drift, weights preserved).
-        param_logprob = (param_dist.log_prob(param_action) * pa_mask_t).sum(dim=-1)  # (a_max,)
+        # Bounded action with a correct density. Hard clipping maps an interval
+        # of Gaussian samples to each rail while retaining different Gaussian
+        # log-probabilities, violating PPO's action/likelihood correspondence.
+        param_action_squashed = torch.tanh(param_action)
+        # Per-slot param mask: only the SELECTED primitive's dims count toward the
+        # logprob (and therefore its gradient), AND'd with the stage mask so a
+        # stage-disabled dim stays off. A `kick`/`approach_ball` step contributes
+        # zero param logprob ⇒ the dribble-target (Dx,Dy) head gets no gradient
+        # from it. (Was a stage-wide mask applied to every step.)
+        prim_idx_np = primitive_action.cpu().numpy().astype(np.int64)  # (a_max,)
+        per_slot_param_mask = (
+            PRIMITIVE_PARAM_MASK[prim_idx_np] * param_active_mask[None, :]
+        ).astype(np.float32)  # (a_max, param_dim)
+        pa_mask_t = torch.as_tensor(per_slot_param_mask, dtype=torch.float32, device=self.device)
+        squash_log_jac = torch.log(1.0 - param_action_squashed.pow(2) + 1e-6)
+        param_logprob = (
+            (param_dist.log_prob(param_action) - squash_log_jac) * pa_mask_t
+        ).sum(dim=-1)  # (a_max,)
 
         action = {
             "primitive_idx": primitive_action.cpu().numpy().astype(np.int64),
-            "params": param_action_clamped.cpu().numpy().reshape(-1).astype(np.float32),
+            "params": param_action_squashed.cpu().numpy().reshape(-1).astype(np.float32),
+            "runtime_mask_applied": primitive_valid_mask is not None,
         }
         transition = {
             "obs": obs_t.squeeze(0).cpu().numpy(),
@@ -550,7 +633,7 @@ class PPOJALAgent:
             "disabled_mask": disabled_mask,
             "agent_active_mask": agent_active_mask,
             "context_active_mask": context_active_mask,
-            "param_active_mask": param_active_mask,
+            "param_active_mask": per_slot_param_mask,  # (a_max, param_dim) per selected primitive
         }
         return action, transition
 
@@ -598,59 +681,54 @@ class PPOJALAgent:
         returns = advantages + np.asarray(values, dtype=np.float32)
         return advantages, returns
 
-    def update(self, last_obs: Optional[np.ndarray] = None,
-               last_agent_active_mask: Optional[np.ndarray] = None,
-               last_context_active_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """Run a PPO update using buffered transitions."""
-        if len(self.buffer) == 0:
-            return {}
+    def _bootstrap_value(
+        self,
+        last_obs: Optional[np.ndarray],
+        last_agent_mask: Optional[np.ndarray],
+        last_context_mask: Optional[np.ndarray],
+    ) -> float:
+        """Compute bootstrap value for a non-terminal last observation."""
+        if last_obs is None:
+            return 0.0
+        if last_agent_mask is None:
+            last_agent_mask = np.zeros(self.a_max, dtype=np.float32)
+        if last_context_mask is None:
+            last_context_mask = np.zeros(self.c_max, dtype=np.float32)
+        with torch.no_grad():
+            last_t = torch.as_tensor(last_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            la = torch.as_tensor(last_agent_mask, dtype=torch.float32, device=self.device)
+            lc = torch.as_tensor(last_context_mask, dtype=torch.float32, device=self.device)
+            _, _, _, lv = self.model(last_t, la, lc)
+        return float(lv.squeeze().item())
 
-        # Bootstrap value for the last observation if not terminal — use the
-        # most recent stored masks if the trainer didn't supply them.
-        if last_obs is not None:
-            if last_agent_active_mask is None:
-                last_agent_active_mask = self.buffer.agent_active_masks[-1]
-            if last_context_active_mask is None:
-                last_context_active_mask = self.buffer.context_active_masks[-1]
-            with torch.no_grad():
-                last_t = torch.as_tensor(last_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-                la = torch.as_tensor(last_agent_active_mask, dtype=torch.float32, device=self.device)
-                lc = torch.as_tensor(last_context_active_mask, dtype=torch.float32, device=self.device)
-                _, _, _, last_value_t = self.model(last_t, la, lc)
-            last_value = float(last_value_t.squeeze().item())
-        else:
-            last_value = 0.0
-
-        # Pull tensors from buffer.
-        obs = torch.as_tensor(np.stack(self.buffer.observations), dtype=torch.float32, device=self.device)
-        prim_actions = torch.as_tensor(np.stack(self.buffer.primitive_actions), dtype=torch.long, device=self.device)
-        param_actions = torch.as_tensor(np.stack(self.buffer.param_actions), dtype=torch.float32, device=self.device)
-        old_prim_logp = torch.as_tensor(np.stack(self.buffer.primitive_logprobs), dtype=torch.float32, device=self.device)
-        old_param_logp = torch.as_tensor(np.stack(self.buffer.param_logprobs), dtype=torch.float32, device=self.device)
-        old_values = torch.as_tensor(np.asarray(self.buffer.values, dtype=np.float32), device=self.device)
-        disabled_masks = torch.as_tensor(np.stack(self.buffer.disabled_masks), dtype=torch.float32, device=self.device)
-        agent_masks = torch.as_tensor(np.stack(self.buffer.agent_active_masks), dtype=torch.float32, device=self.device)
-        context_masks = torch.as_tensor(np.stack(self.buffer.context_active_masks), dtype=torch.float32, device=self.device)
-        param_masks = torch.as_tensor(np.stack(self.buffer.param_active_masks), dtype=torch.float32, device=self.device)
-
-        advantages_np, returns_np = self._compute_gae(
-            rewards=self.buffer.rewards,
-            values=self.buffer.values,
-            masks=self.buffer.masks,
-            last_value=last_value,
-        )
-        advantages = torch.as_tensor(advantages_np, device=self.device)
-        returns = torch.as_tensor(returns_np, device=self.device)
-
+    def _ppo_update_from_tensors(
+        self,
+        obs: torch.Tensor,
+        prim_actions: torch.Tensor,
+        param_actions: torch.Tensor,
+        old_prim_logp: torch.Tensor,
+        old_param_logp: torch.Tensor,
+        old_values: torch.Tensor,
+        disabled_masks: torch.Tensor,
+        agent_masks: torch.Tensor,
+        context_masks: torch.Tensor,
+        param_masks: torch.Tensor,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Run the PPO minibatch update loop on pre-assembled tensors with pre-computed GAE."""
         # Normalize + clip advantages.
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = torch.clamp(advantages, -float(self.hparams["advantage_clip"]), float(self.hparams["advantage_clip"]))
 
-        # Apply current LR schedule.
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self._current_lr()
         ent_coef = self._current_ent_coef()
+        # Separate entropy coef for the continuous params; None ⇒ legacy (== ent_coef).
+        # 0.0 stops the bonus inflating param_log_std to the clamp ceiling.
+        _pec = self.hparams.get("param_ent_coef")
+        param_ent_coef = ent_coef if _pec is None else float(_pec)
 
         clip_range = float(self.hparams["clip_range"])
         vclip_range = float(self.hparams["value_clip_range"])
@@ -673,20 +751,32 @@ class PPOJALAgent:
 
         def _joint_logp(prim_logits, param_mean_b, param_std_b1, b_prim, b_param,
                         b_disabled, b_agent, b_param_active, want_entropy=False):
-            # prim_logits: (bs, a_max, P); apply disabled mask (finite offset).
             prim_logits = prim_logits + torch.log(b_disabled + 1e-45)
             prim_dist = Categorical(logits=prim_logits)
-            prim_logp = prim_dist.log_prob(b_prim)                      # (bs, a_max)
+            prim_logp = prim_dist.log_prob(b_prim)
             std_b = param_std_b1.unsqueeze(0).expand_as(param_mean_b)
             param_dist = Normal(param_mean_b, std_b)
-            param_logp = (param_dist.log_prob(b_param) * b_param_active.unsqueeze(1)).sum(dim=-1)  # (bs, a_max)
-            logp = ((prim_logp + param_logp) * b_agent).sum(dim=-1)     # mask + sum over agents
+            # b_param_active is per-slot (B, A, param_dim): only the SELECTED
+            # primitive's dims contribute, so non-param primitives add zero.
+            squashed = torch.tanh(b_param)
+            squash_log_jac = torch.log(1.0 - squashed.pow(2) + 1e-6)
+            param_logp = (
+                (param_dist.log_prob(b_param) - squash_log_jac) * b_param_active
+            ).sum(dim=-1)
+            logp = ((prim_logp + param_logp) * b_agent).sum(dim=-1)
             if not want_entropy:
                 return logp
-            prim_ent = prim_dist.entropy()                              # (bs, a_max)
-            param_ent = (param_dist.entropy() * b_param_active.unsqueeze(1)).sum(dim=-1)  # (bs, a_max)
-            entropy = (((prim_ent + param_ent) * b_agent).sum(dim=-1)).mean()
-            return logp, entropy, prim_ent.mean()
+            # Categorical (primitive) and Gaussian (param) entropies kept separate
+            # so they can carry different coefficients in the loss.
+            prim_entropy = ((prim_dist.entropy() * b_agent).sum(dim=-1)).mean()
+            # Monte-Carlo entropy of the tanh-transformed distribution using
+            # the rollout latent sample. param_ent_coef is 0 in Stage 2g, but
+            # retaining the correct statistic keeps future stages coherent.
+            param_ent = (
+                -(param_dist.log_prob(b_param) - squash_log_jac) * b_param_active
+            ).sum(dim=-1)
+            param_entropy = ((param_ent * b_agent).sum(dim=-1)).mean()
+            return logp, prim_entropy, param_entropy
 
         for epoch in range(n_epochs):
             np.random.shuffle(indices)
@@ -709,7 +799,7 @@ class PPOJALAgent:
                 b_param_active = param_masks[idx_t]
 
                 prim_logits, param_mean, param_std, value = self.model(b_obs, b_agent, b_context)
-                logp_new, entropy, prim_entropy_mean = _joint_logp(
+                logp_new, prim_entropy, param_entropy = _joint_logp(
                     prim_logits, param_mean, param_std, b_prim, b_param,
                     b_disabled, b_agent, b_param_active, want_entropy=True,
                 )
@@ -719,14 +809,14 @@ class PPOJALAgent:
                 surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * b_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss with clipping.
                 value = value.squeeze(-1)
                 v_unclipped = (value - b_returns).pow(2)
                 v_clipped_pred = b_old_values + torch.clamp(value - b_old_values, -vclip_range, vclip_range)
                 v_clipped = (v_clipped_pred - b_returns).pow(2)
                 value_loss = torch.max(v_unclipped, v_clipped).mean()
 
-                total_loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+                total_loss = (policy_loss + vf_coef * value_loss
+                              - ent_coef * prim_entropy - param_ent_coef * param_entropy)
 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -735,10 +825,9 @@ class PPOJALAgent:
 
                 last_policy_loss = float(policy_loss.item())
                 last_value_loss = float(value_loss.item())
-                last_entropy = float(entropy.item())
-                last_prim_entropy = float(prim_entropy_mean.item())
+                last_entropy = float((prim_entropy + param_entropy).item())
+                last_prim_entropy = float(prim_entropy.item())
 
-            # Approx KL after this epoch (for early stop + LR adapt).
             with torch.no_grad():
                 prim_logits_a, param_mean_a, param_std_a, _ = self.model(obs, agent_masks, context_masks)
                 logp_new_a = _joint_logp(
@@ -755,7 +844,6 @@ class PPOJALAgent:
                 early_stop = True
                 break
 
-        self.buffer.clear()
         self.last_metrics = {
             "policy_loss": last_policy_loss,
             "value_loss": last_value_loss,
@@ -767,6 +855,117 @@ class PPOJALAgent:
             "early_stop": float(1.0 if early_stop else 0.0),
         }
         return self.last_metrics
+
+    def update_from_rollout_segments(
+        self,
+        segments: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        """PPO update from N independent env rollouts, computing GAE per segment.
+
+        Each segment dict must contain:
+            obs, primitive_actions, param_actions, primitive_logprobs,
+            param_logprobs, values (List[float]), rewards (List[float]),
+            masks (List[float]), disabled_masks, agent_active_masks,
+            context_active_masks, param_active_masks
+        Optional keys:
+            last_obs (np.ndarray or None) — current obs if mid-episode at segment end
+            last_agent_mask, last_context_mask — active masks for last_obs
+        """
+        if not segments:
+            return {}
+
+        all_obs, all_prim, all_param = [], [], []
+        all_old_prim_logp, all_old_param_logp = [], []
+        all_old_values: List[float] = []
+        all_advantages: List[float] = []
+        all_returns: List[float] = []
+        all_disabled, all_agent, all_context, all_param_active = [], [], [], []
+
+        for seg in segments:
+            last_value = self._bootstrap_value(
+                seg.get("last_obs"),
+                seg.get("last_agent_mask"),
+                seg.get("last_context_mask"),
+            )
+            adv_np, ret_np = self._compute_gae(
+                rewards=seg["rewards"],
+                values=seg["values"],
+                masks=seg["masks"],
+                last_value=last_value,
+            )
+            all_advantages.extend(adv_np.tolist())
+            all_returns.extend(ret_np.tolist())
+            all_obs.extend(seg["obs"])
+            all_prim.extend(seg["primitive_actions"])
+            all_param.extend(seg["param_actions"])
+            all_old_prim_logp.extend(seg["primitive_logprobs"])
+            all_old_param_logp.extend(seg["param_logprobs"])
+            all_old_values.extend(seg["values"])
+            all_disabled.extend(seg["disabled_masks"])
+            all_agent.extend(seg["agent_active_masks"])
+            all_context.extend(seg["context_active_masks"])
+            all_param_active.extend(seg["param_active_masks"])
+
+        obs_t = torch.as_tensor(np.stack(all_obs), dtype=torch.float32, device=self.device)
+        prim_t = torch.as_tensor(np.stack(all_prim), dtype=torch.long, device=self.device)
+        param_t = torch.as_tensor(np.stack(all_param), dtype=torch.float32, device=self.device)
+        old_prim_logp_t = torch.as_tensor(np.stack(all_old_prim_logp), dtype=torch.float32, device=self.device)
+        old_param_logp_t = torch.as_tensor(np.stack(all_old_param_logp), dtype=torch.float32, device=self.device)
+        old_val_t = torch.as_tensor(np.asarray(all_old_values, dtype=np.float32), device=self.device)
+        disabled_t = torch.as_tensor(np.stack(all_disabled), dtype=torch.float32, device=self.device)
+        agent_t = torch.as_tensor(np.stack(all_agent), dtype=torch.float32, device=self.device)
+        context_t = torch.as_tensor(np.stack(all_context), dtype=torch.float32, device=self.device)
+        param_active_t = torch.as_tensor(np.stack(all_param_active), dtype=torch.float32, device=self.device)
+        adv_t = torch.as_tensor(np.asarray(all_advantages, dtype=np.float32), device=self.device)
+        ret_t = torch.as_tensor(np.asarray(all_returns, dtype=np.float32), device=self.device)
+
+        return self._ppo_update_from_tensors(
+            obs_t, prim_t, param_t, old_prim_logp_t, old_param_logp_t, old_val_t,
+            disabled_t, agent_t, context_t, param_active_t, adv_t, ret_t,
+        )
+
+    def update(self, last_obs: Optional[np.ndarray] = None,
+               last_agent_active_mask: Optional[np.ndarray] = None,
+               last_context_active_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """Run a PPO update using buffered transitions."""
+        if len(self.buffer) == 0:
+            return {}
+
+        if last_agent_active_mask is None and self.buffer.agent_active_masks:
+            last_agent_active_mask = self.buffer.agent_active_masks[-1]
+        if last_context_active_mask is None and self.buffer.context_active_masks:
+            last_context_active_mask = self.buffer.context_active_masks[-1]
+        last_value = self._bootstrap_value(last_obs, last_agent_active_mask, last_context_active_mask)
+
+        # Pull tensors from buffer.
+        obs = torch.as_tensor(np.stack(self.buffer.observations), dtype=torch.float32, device=self.device)
+        prim_actions = torch.as_tensor(np.stack(self.buffer.primitive_actions), dtype=torch.long, device=self.device)
+        param_actions = torch.as_tensor(np.stack(self.buffer.param_actions), dtype=torch.float32, device=self.device)
+        old_prim_logp = torch.as_tensor(np.stack(self.buffer.primitive_logprobs), dtype=torch.float32, device=self.device)
+        old_param_logp = torch.as_tensor(np.stack(self.buffer.param_logprobs), dtype=torch.float32, device=self.device)
+        old_values = torch.as_tensor(np.asarray(self.buffer.values, dtype=np.float32), device=self.device)
+        disabled_masks = torch.as_tensor(np.stack(self.buffer.disabled_masks), dtype=torch.float32, device=self.device)
+        agent_masks = torch.as_tensor(np.stack(self.buffer.agent_active_masks), dtype=torch.float32, device=self.device)
+        context_masks = torch.as_tensor(np.stack(self.buffer.context_active_masks), dtype=torch.float32, device=self.device)
+        param_masks = torch.as_tensor(np.stack(self.buffer.param_active_masks), dtype=torch.float32, device=self.device)
+
+        advantages_np, returns_np = self._compute_gae(
+            rewards=self.buffer.rewards,
+            values=self.buffer.values,
+            masks=self.buffer.masks,
+            last_value=last_value,
+        )
+        advantages = torch.as_tensor(advantages_np, device=self.device)
+        returns = torch.as_tensor(returns_np, device=self.device)
+
+        metrics = self._ppo_update_from_tensors(
+            obs, prim_actions, param_actions,
+            old_prim_logp, old_param_logp, old_values,
+            disabled_masks, agent_masks, context_masks, param_masks,
+            advantages, returns,
+        )
+        self.buffer.clear()
+        return metrics
 
     # -- persistence ------------------------------------------------------
 
@@ -810,6 +1009,9 @@ class PPOJALAgent:
                     f"do not change MAX widths mid-curriculum."
                 )
         self.model.load_state_dict(ckpt["model_state_dict"])
+        # Wipe a checkpoint whose param_log_std was pinned at the old ceiling, so
+        # the continuous std starts below LOG_STD_MAX with live gradient again.
+        self._apply_param_log_std_init("warm-start")
         try:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         except Exception:

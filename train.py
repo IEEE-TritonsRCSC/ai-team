@@ -482,7 +482,7 @@ Examples:
                         help="Path to JSON configuration file")
     parser.add_argument("--trainer", type=str,
                         choices=["hier_ppo", "discrete_ppo", "mappo", "hsm_marl", "hsm_sb3_ppo", "hsm_sb3_ppo_curriculum", "sb3_ppo", "robot_attention", "td3_jal", "td3_jal_curriculum", "td3_jal_her", "ppo_jal_curriculum", "qlearning", "attention_mappo"],
-                        default="hier_ppo", help="Type of trainer to use")
+                        default="ppo_jal_curriculum", help="Type of trainer to use")
     
     # Environment options
     parser.add_argument("--team_config", type=str, default="team_config.json",
