@@ -352,7 +352,7 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
                 "value_coef": 0.5,
                 "max_grad_norm": 0.5,
                 "ppo_epochs": 4,
-                "rollout_length": 2048,
+                "rollout_length": 512,
                 "minibatch_size": 256,
                 "min_std": 0.1,
                 "agent_embed_dim": 128,
@@ -368,7 +368,7 @@ def create_default_config(trainer_type: str, args: argparse.Namespace) -> Dict[s
                 "role_switch_cooldown": 8,
             },
             "curriculum": {
-                "stage1": {"num_agents": 1, "episodes": 300, "max_steps": 200,
+                "stage1": {"num_agents": 1, "episodes": 300, "max_steps": 100,
                            "opponent_type": "none", "warm_start_from_previous": False,
                            "forced_roles": {"0": "STRIKER"},
                            "reward_weights": {"formation_spread_weight": 0.0}},

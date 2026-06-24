@@ -53,8 +53,8 @@ def main():
         soccer_ai = ParamEstimatorAI(team_infos, mode=args.estimate_params)
     else:
         team_infos = load_team_config(args.team_config)
-        # soccer_ai = SoccerAI(team_infos)
-        soccer_ai = InterceptDemoAI(team_infos)
+        soccer_ai = SoccerAI(team_infos)
+        # soccer_ai = InterceptDemoAI(team_infos)
     networker = Networker(
         team_infos,
         args.env,

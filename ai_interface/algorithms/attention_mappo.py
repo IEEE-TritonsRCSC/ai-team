@@ -17,10 +17,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Normal
+from torch.distributions import Categorical
 
 from ai_interface.algorithms.robot_attention import RobotAttentionBlock
-from ai_interface.hsm.state_machine import Role
+from ai_interface.hsm.state_machine import HSMState, Role
+
+NUM_HSM_ACTIONS = len(HSMState)  # 9 discrete actions
 
 
 @dataclass
@@ -84,7 +86,7 @@ class TeamAttentionEncoder(nn.Module):
 
 
 class AttentionRoleActor(nn.Module):
-    """Per-role actor: embedding -> Normal(action_dim)."""
+    """Per-role actor: embedding -> Categorical logits over HSM states."""
 
     def __init__(self, embed_dim: int, action_dim: int, hidden: Tuple[int, int]):
         super().__init__()
@@ -95,12 +97,11 @@ class AttentionRoleActor(nn.Module):
             nn.Linear(h1, h2),
             nn.ReLU(),
         )
-        self.mean_head = nn.Linear(h2, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.logits_head = nn.Linear(h2, action_dim)
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         x = self.net(z)
-        return self.mean_head(x), self.log_std
+        return self.logits_head(x)
 
 
 class CentralizedPoolingCritic(nn.Module):
@@ -144,14 +145,13 @@ class AttentionMAPPOAgent:
 
     ROLES = [Role.STRIKER, Role.SUPPORT, Role.DEFENDER, Role.GOALIE]
     ROLE_DIM = 4
-    _ACTION_LOW = [-2.0, -2.0, -2.0, 0.0]
-    _ACTION_HIGH = [2.0, 2.0, 2.0, 1.0]
+    HSM_STATES = list(HSMState)
 
     def __init__(
         self,
         num_agents: int,
         obs_dim: int,
-        action_dim: int = 4,
+        action_dim: int = NUM_HSM_ACTIONS,
         config: Optional[AttentionMAPPOConfig] = None,
         device: Optional[torch.device] = None,
     ):
@@ -171,7 +171,6 @@ class AttentionMAPPOAgent:
             embed_dim, cfg.num_attn_heads, cfg.num_attn_layers
         ).to(self.device)
 
-        # Four role actors, weight-shared within each role (2 strikers → same actor)
         self.actors = nn.ModuleDict({
             role.value: AttentionRoleActor(embed_dim, action_dim, cfg.actor_hidden).to(self.device)
             for role in self.ROLES
@@ -179,7 +178,6 @@ class AttentionMAPPOAgent:
 
         self.critic = CentralizedPoolingCritic(embed_dim).to(self.device)
 
-        # Separate optimizers: encoder is shared between actor and critic loss paths
         encoder_params = (
             list(self.agent_encoder.parameters())
             + list(self.team_attention.parameters())
@@ -187,9 +185,6 @@ class AttentionMAPPOAgent:
         self.encoder_optimizer = optim.Adam(encoder_params, lr=cfg.lr_encoder)
         self.actor_optimizer = optim.Adam(self.actors.parameters(), lr=cfg.lr_actor)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=cfg.lr_critic)
-
-        self._action_lo = torch.tensor(self._ACTION_LOW, device=self.device)
-        self._action_hi = torch.tensor(self._ACTION_HIGH, device=self.device)
 
         self.memory: List[Dict] = []
 
@@ -235,10 +230,10 @@ class AttentionMAPPOAgent:
         roles: List[Role],
         deterministic: bool = False,
     ) -> Tuple[np.ndarray, List[torch.Tensor], torch.Tensor]:
-        """Select continuous actions for all agents.
+        """Select discrete HSM-state actions for all agents.
 
         Returns:
-            actions: np.ndarray (N, 4)
+            actions: np.ndarray (N,) of int indices into HSMState
             logprobs: List[Tensor], one scalar per agent
             value: Tensor scalar
         """
@@ -249,20 +244,18 @@ class AttentionMAPPOAgent:
             embeddings = self._encode_team(obs_tensors, roles)       # (N, embed_dim)
             value = self.critic(embeddings.unsqueeze(0)).squeeze()   # scalar
 
-            actions: List[np.ndarray] = []
+            actions: List[int] = []
             logprobs: List[torch.Tensor] = []
 
             for i in range(self.num_agents):
                 role_key = roles[i].value
-                mean, log_std = self.actors[role_key](embeddings[i])
-                std = torch.clamp(log_std.exp(), min=self.config.min_std)
-                dist = Normal(mean, std)
-                action = mean if deterministic else dist.sample()
-                action = torch.clamp(action, self._action_lo, self._action_hi)
-                logprobs.append(dist.log_prob(action).sum().detach())
-                actions.append(action.detach().cpu().numpy())
+                logits = self.actors[role_key](embeddings[i])
+                dist = Categorical(logits=logits)
+                action = logits.argmax(dim=-1) if deterministic else dist.sample()
+                logprobs.append(dist.log_prob(action).detach())
+                actions.append(int(action.item()))
 
-        return np.asarray(actions, dtype=np.float32), logprobs, value.detach()
+        return np.asarray(actions, dtype=np.int64), logprobs, value.detach()
 
     def store_transition(
         self,
@@ -279,7 +272,7 @@ class AttentionMAPPOAgent:
                 torch.as_tensor(o, dtype=torch.float32, device=self.device) for o in observations
             ],
             "roles": list(roles),
-            "actions": torch.as_tensor(actions, dtype=torch.float32, device=self.device),
+            "actions": torch.as_tensor(actions, dtype=torch.long, device=self.device),
             "logprobs": torch.stack(logprobs).to(self.device),  # (N,)
             "value": value.to(self.device),
             "reward": float(reward),
@@ -298,10 +291,16 @@ class AttentionMAPPOAgent:
 
         advantages = self._compute_gae(rewards, masks, values.detach().cpu().tolist())
         adv_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
-        returns = adv_t + values
+        returns = adv_t + values  # true discounted returns (critic target)
 
+        # Normalize advantages for actor (standard PPO)
         if adv_t.numel() > 1:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+        # Normalize returns for critic to prevent the loss scale from exploding
+        # when rewards have large magnitude (e.g., -45 un-normalized vs. ~1 normalized).
+        if returns.numel() > 1:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         old_logprobs = torch.stack([m["logprobs"] for m in self.memory])  # (T, N)
         all_actions = torch.stack([m["actions"] for m in self.memory])    # (T, N, A)
@@ -331,11 +330,10 @@ class AttentionMAPPOAgent:
                     step_lp: List[torch.Tensor] = []
                     step_ent: List[torch.Tensor] = []
                     for i in range(self.num_agents):
-                        mean, log_std = self.actors[m["roles"][i].value](embs[i])
-                        std = torch.clamp(log_std.exp(), min=self.config.min_std)
-                        dist = Normal(mean, std)
-                        step_lp.append(dist.log_prob(all_actions[t, i]).sum())
-                        step_ent.append(dist.entropy().sum())
+                        logits = self.actors[m["roles"][i].value](embs[i])
+                        dist = Categorical(logits=logits)
+                        step_lp.append(dist.log_prob(all_actions[t, i]))
+                        step_ent.append(dist.entropy())
                     mb_new_logprobs.append(torch.stack(step_lp))    # (N,)
                     mb_entropies.append(torch.stack(step_ent).mean())
 
@@ -357,27 +355,34 @@ class AttentionMAPPOAgent:
                 predicted_v = self.critic(team_embs_t).squeeze(-1) # (B,)
                 critic_loss = (mb_ret - predicted_v).pow(2).mean()
 
-                total_loss = (
-                    actor_loss
-                    + self.config.value_coef * critic_loss
-                    - self.config.entropy_coef * entropy
-                )
-
+                # --- Actor pass (encoder + actors) ---
+                # Separate backward so the exploding critic gradient doesn't
+                # dominate encoder updates via the joint loss path.
+                actor_total = actor_loss - self.config.entropy_coef * entropy
                 self.encoder_optimizer.zero_grad()
                 self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                total_loss.backward()
-
-                all_params = (
+                actor_total.backward(retain_graph=True)
+                nn.utils.clip_grad_norm_(
                     list(self.agent_encoder.parameters())
                     + list(self.team_attention.parameters())
-                    + list(self.actors.parameters())
-                    + list(self.critic.parameters())
+                    + list(self.actors.parameters()),
+                    self.config.max_grad_norm,
                 )
-                nn.utils.clip_grad_norm_(all_params, self.config.max_grad_norm)
-
                 self.encoder_optimizer.step()
                 self.actor_optimizer.step()
+
+                # --- Critic pass (encoder + critic) ---
+                critic_total = self.config.value_coef * critic_loss
+                self.encoder_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                critic_total.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.agent_encoder.parameters())
+                    + list(self.team_attention.parameters())
+                    + list(self.critic.parameters()),
+                    self.config.max_grad_norm,
+                )
+                self.encoder_optimizer.step()
                 self.critic_optimizer.step()
 
                 total_actor_loss += float(actor_loss.item())

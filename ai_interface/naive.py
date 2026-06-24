@@ -6,14 +6,16 @@ like kicking and movement in a RoboCup soccer environment.
 """
 
 import math
-import random
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from networking.data_utils import TeamInfo, GameState
 from ai_interface.goalie import goalie_action
+from ai_interface.defender import Defender
+from ai_interface.attacker import SmartAttacker
 from ai_interface.constants.player_constants import PLAYER_SIZE, BALL_SIZE, KICKABLE_MARGIN
+from ai_interface.constants.field_constants import GOAL_R, GOAL_L
 
 class SoccerAI:
     """
@@ -28,9 +30,22 @@ class SoccerAI:
         self.team_info = team_info
         self.goalie_ids = {}
         self.side = {}
+        self.defenders = {}  # {teamname: {unum: Defender}}
+        self.attacker = None  # SmartAttacker for the attacking team's robot 1
         for i, team in enumerate(team_info):
             self.goalie_ids[team.name] = team.goalie_id
-            self.side[team.name] = "left" if i == 0 else "right"
+            side = "left" if i == 0 else "right"
+            self.side[team.name] = side
+            # Robot 1 with no goalie role is the attacker.
+            if team.goalie_id != 1:
+                self.attacker = SmartAttacker(teamname=team.name, unum=1)
+            # Assign a Defender to every non-goalie robot with unum >= 2.
+            team_defenders = {}
+            for unum in range(2, team.n_players + 1):
+                if unum != team.goalie_id:
+                    team_defenders[unum] = Defender(teamname=team.name, unum=unum, side=side)
+            if team_defenders:
+                self.defenders[team.name] = team_defenders
 
     def decide_action(self, game_state: GameState, teamname: str):
         """
@@ -54,7 +69,9 @@ class SoccerAI:
             if unum == goalie_id:
                 action = self.get_goalie_action(ball_pos, robot_pose, self.side[teamname])
             elif unum == 1:
-                action = self.get_robot1_action(i, ball_pos, robot_pose, self.side[teamname])
+                action = self.get_robot1_action(i, ball_pos, robot_pose, self.side[teamname], game_state)
+            elif unum in self.defenders.get(teamname, {}):
+                action = self.defenders[teamname][unum].action(ball_pos, robot_pose, game_state)
             else:
                 action = "dash 20 0"
             actions.append(action)
@@ -99,54 +116,53 @@ class SoccerAI:
         """
         return abs(robot_to_ball_dist - (PLAYER_SIZE + BALL_SIZE)) < KICKABLE_MARGIN / 2
     
-    def get_robot1_action(self, i: int, ball_pos: tuple, robot_pose: tuple, side: str) -> str:
+    def get_robot1_action(self, i: int, ball_pos: tuple, robot_pose: tuple, side: str, game_state=None) -> str:
         """
-        Get action for robot 1.
-        
+        Get action for robot 1 using SmartAttacker.
+
         Args:
+            i: Current game tick (game_state.count)
             ball_pos: Current position of the ball
-            robot_pose: Current position of robot 1
+            robot_pose: Current pose of robot 1 as (x, y, theta_deg)
+            side: 'left' if attacking the right goal, 'right' otherwise
+            game_state: Full game state for opponent pose extraction
         Returns:
             Action command for robot 1
         """
-        skick = (i % 10 == 0)
-        robot_pos = (robot_pose[0], robot_pose[1])
-        robot_to_ball_dist = self.get_dist(ball_pos, robot_pos)
+        goal = GOAL_R if side == "left" else GOAL_L
+        self_pose_rad = (robot_pose[0], robot_pose[1], math.radians(robot_pose[2]))
+        goalie_pose, defender_pose = self._get_opponent_poses(game_state, self.attacker.teamname)
+        return self.attacker.step(
+            tick=i,
+            ball=(ball_pos[0], ball_pos[1]),
+            self_pose=self_pose_rad,
+            attack_goal=goal,
+            goalie_pose=goalie_pose,
+            defender_pose=defender_pose,
+            game_state=game_state,
+        )
 
-        if self.hasBall(robot_to_ball_dist):
-            if side == "left" and robot_pos[0] > 32:    # Near opponent's goal
-                return "kick 100 0"
-            elif side == "right" and robot_pos[0] < -32:    # Near opponent's goal
-                return "kick 100 0"
-            elif skick:    # Kick every 10 cycles to avoid dribbling excessively
-                return "skick 10 0"
-            else:    # Dash towards opponent's goal
-                direction = -math.radians(robot_pose[2])
-                direction += 0 if side == "left" else math.pi
-                direction = (direction + math.pi) % (2 * math.pi) - math.pi
-                if abs(direction) > math.pi / 36:
-                    return f"turn {direction * 10}"
-                return f"dash 80 {direction}"
-        
-        elif side == "left" and ball_pos[0] > 36:
-            return "turn 10"
-        elif side == "right" and ball_pos[0] < -36:
-            return "turn 10"
-        
-        direction = math.atan2(ball_pos[1] - robot_pos[1],
-                               ball_pos[0] - robot_pos[0])
-        direction -= math.radians(robot_pose[2])
-
-        if abs(direction) > math.pi / 36:
-            return f"turn {direction * 10}"
-        elif robot_to_ball_dist < 1.2:    # Close to the ball
-            return "catch 0"
-        else:    # Move towards the ball
-            if random.randint(0, 1) == 0:    # slight randomness to avoid collisions
-                if (side == "left" and random.randint(0, 3) == 0) or (side == "right"):
-                    return f"dash 100 {-direction}"
-            else:
-                return f"dash {'50' if robot_to_ball_dist > 5 else '20'} {direction}"
+    def _get_opponent_poses(self, game_state, teamname):
+        """Extract (goalie_pose_rad, defender_pose_rad) of opponents relative to teamname."""
+        if game_state is None:
+            return None, None
+        goalie_pose = None
+        defender_pose = None
+        for team, robots in game_state.robot_poses.items():
+            if team == teamname:
+                continue
+            opp_goalie_id = self.goalie_ids.get(team)
+            for robot in robots:
+                unum = int(next(iter(robot.keys())))
+                pose = robot[unum]
+                if pose is None or len(pose) < 3:
+                    continue
+                pose_rad = (pose[0], pose[1], math.radians(pose[2]))
+                if unum == opp_goalie_id:
+                    goalie_pose = pose_rad
+                else:
+                    defender_pose = pose_rad
+        return goalie_pose, defender_pose
     
     def get_goalie_action(self, ball_pos: tuple, goalie_pose: tuple, side: str) -> str:
         """

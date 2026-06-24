@@ -265,6 +265,11 @@ class Serializer:
                 action = self._convert_command_for_simulator(action, 2)
                 # Remove the 's' prefix for simulator
                 action = action.replace("skick", "kick")
+            elif action.strip().lower() == "drop":
+                # "drop" releases a caught ball. No parser token exists, so
+                # translate to a minimal kick (power=1) which releases the ball
+                # from catch state with negligible force.
+                action = "kick 1 0"
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages

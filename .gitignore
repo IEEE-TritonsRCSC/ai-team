@@ -6,3 +6,6 @@ train_logs/
 text_logs/
 .DS_Store
 **/*.IdentifierCHANGES.md
+infer_logs/
+models/
+notion_files/

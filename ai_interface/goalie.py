@@ -22,18 +22,14 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ai_interface.constants.field_constants import (
-    GOAL_L_Y_TOP,
-    GOAL_L_Y_BOTTOM,
-    GOAL_R_Y_TOP,
-    GOAL_R_Y_BOTTOM,
-    GOAL_L,
-    GOAL_R,
-    MAX_KEEPER_OUT,
-    BALL_DECAY,
-)
+from ai_interface.constants.field_constants import MAX_KEEPER_OUT, BALL_DECAY
 from ai_interface.utils import basic_commands
-from ai_interface.utils.algo_utils import normalize_angle, estimate_ball_velocity
+from ai_interface.utils.algo_utils import (
+    normalize_angle,
+    estimate_ball_velocity,
+    _compute_goal_params,
+    infer_side_from_position,
+)
 from ai_interface.player import Player
 
 
@@ -61,48 +57,6 @@ KEEPER_SPEED = 0.35
 
 # Distance at which the dribbler can grab the ball.
 CATCH_DIST = 1.2
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    """Clamp a value between bounds."""
-    return max(lo, min(hi, v))
-
-
-def _compute_goal_params(side: str) -> Tuple[Tuple, Tuple, Tuple]:
-    """
-    Get goal parameters based on which side we're defending.
-
-    Args:
-        side: 'left' if defending left goal, 'right' if defending right goal
-
-    Returns:
-        Tuple of (post_top, post_bottom, goal_center)
-    """
-    if side == "left":
-        post_top = GOAL_L_Y_TOP
-        post_bottom = GOAL_L_Y_BOTTOM
-        goal_center = GOAL_L
-    else:
-        post_top = GOAL_R_Y_TOP
-        post_bottom = GOAL_R_Y_BOTTOM
-        goal_center = GOAL_R
-    return post_top, post_bottom, goal_center
-
-
-def infer_side_from_position(goalie_pos: Tuple[float, float]) -> str:
-    """
-    Infer which side we're defending from the goalie's position.
-
-    Args:
-        goalie_pos: (x, y) position of the goalie
-
-    Returns:
-        'left' if defending left goal (x < 0), 'right' if defending right goal (x >= 0)
-    """
-    if goalie_pos[0] < 0:
-        return "left"
-    else:
-        return "right"
 
 
 def compute_bisector_target(ball_pos: Tuple[float, float],
@@ -173,7 +127,7 @@ def compute_bisector_target(ball_pos: Tuple[float, float],
 
     # Step out from the goal line toward the ball, scaled by ball distance
     ball_to_goal_dist = math.hypot(goal_x - bx, goal_center[1] - by)
-    step_out_factor = _clamp((ball_to_goal_dist - CLOSE_ZONE) / (FAR_ZONE - CLOSE_ZONE),
+    step_out_factor = np.clip((ball_to_goal_dist - CLOSE_ZONE) / (FAR_ZONE - CLOSE_ZONE),
                              0.0, 1.0)
     step_out_dist = MAX_STEP_OUT * step_out_factor
 
@@ -183,15 +137,15 @@ def compute_bisector_target(ball_pos: Tuple[float, float],
 
     # Clamp x between the goal line and MAX_STEP_OUT in front of it
     if goal_x < 0:
-        kx = _clamp(step_out_x, goal_x, goal_x + MAX_STEP_OUT)
+        kx = np.clip(step_out_x, goal_x, goal_x + MAX_STEP_OUT)
     else:
-        kx = _clamp(step_out_x, goal_x - MAX_STEP_OUT, goal_x)
+        kx = np.clip(step_out_x, goal_x - MAX_STEP_OUT, goal_x)
 
     # Clamp y near the goal mouth with a small margin
     post_y_top = max(post_top[1], post_bottom[1])
     post_y_bottom = min(post_top[1], post_bottom[1])
     margin = 2.0
-    ky = _clamp(step_out_y, post_y_bottom - margin, post_y_top + margin)
+    ky = np.clip(step_out_y, post_y_bottom - margin, post_y_top + margin)
 
     return (kx, ky)
 
@@ -408,13 +362,13 @@ class Goalie(Player):
             return (goal_x, goal_center[1])
         dx, dy = self._ball_vel[0] / speed, self._ball_vel[1] / speed
         if abs(dx) < 1e-9:
-            return (gx, _clamp(by, min(post_top[1], post_bottom[1]),
+            return (gx, np.clip(by, min(post_top[1], post_bottom[1]),
                                max(post_top[1], post_bottom[1])))
 
         t_goal = (goal_x - bx) / dx
         # Perpendicular foot of the keeper onto the ball ray
         t_foot = (gx - bx) * dx + (gy - by) * dy
-        t_foot = _clamp(t_foot, 0.0, max(t_goal, 0.0))
+        t_foot = np.clip(t_foot, 0.0, max(t_goal, 0.0))
 
         # Points before the foot are both farther from the keeper and reached
         # sooner by the ball, so only [t_foot, t_goal] needs to be searched.
@@ -568,7 +522,7 @@ class Goalie(Player):
             post_y_top = max(post_top[1], post_bottom[1])
             post_y_bottom = min(post_top[1], post_bottom[1])
             target = (goal_x + inward * 1.0,
-                      _clamp(by, post_y_bottom + 1.0, post_y_top - 1.0))
+                      np.clip(by, post_y_bottom + 1.0, post_y_top - 1.0))
         else:
             # Steady-state tracking uses the *perceived* (lagged) ball so a lateral
             # carry trails the keeper and opens a lane; shot defense (BLOCK) uses the
@@ -588,12 +542,12 @@ class Goalie(Player):
 
         tx, ty = self._compute_block_point(ball_pos, goalie_pos, side)
         if goal_x < 0:
-            tx = _clamp(tx, goal_x, goal_x + MAX_STEP_OUT)
+            tx = np.clip(tx, goal_x, goal_x + MAX_STEP_OUT)
         else:
-            tx = _clamp(tx, goal_x - MAX_STEP_OUT, goal_x)
+            tx = np.clip(tx, goal_x - MAX_STEP_OUT, goal_x)
         post_y_top = max(post_top[1], post_bottom[1])
         post_y_bottom = min(post_top[1], post_bottom[1])
-        ty = _clamp(ty, post_y_bottom - 0.5, post_y_top + 0.5)
+        ty = np.clip(ty, post_y_bottom - 0.5, post_y_top + 0.5)
 
         gx, gy = goalie_pos
         facing = math.atan2(ball_pos[1] - gy, ball_pos[0] - gx)

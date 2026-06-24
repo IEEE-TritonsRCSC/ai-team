@@ -88,6 +88,25 @@ class RewardConfig:
     # H-margin, then decays linearly to zero at the post.
     goal_post_safety_margin: float = 0.0
 
+    # ---- Stage 3: defender lane awareness (1 attacker vs 1 defender + GK) ----
+    # When True, shot AND dribble-target quality are additionally multiplied by
+    # how clear the straight lane to goal is of the non-goalie DEFENDER. A shot
+    # whose lane passes within `defender_lane_block_dist` of the defender earns
+    # proportionally less; a lane straight through the defender earns nothing.
+    # This is the core signal that teaches the attacker to dribble to an angle
+    # the defender doesn't cover before shooting. Falls back to a no-op (lane
+    # clear = 1) whenever no defender pose is available, so it is independent of
+    # use_goalie_aim_gate (the two qualities multiply together).
+    use_defender_lane_gate: bool = False
+    # Distance (sim units) from the defender to the shot segment below which the
+    # lane is considered (partially) blocked. Mirrors AttackerConfig.lane_block_dist.
+    defender_lane_block_dist: float = 2.6
+    # One-shot penalty (applied in JAL_env) when a kick fires through a lane the
+    # defender blocks — i.e. lane clearance below `defender_lane_min_quality`.
+    # Parallels kick_into_keeper_penalty for the keeper. 0.0 disables.
+    defender_lane_penalty: float = 0.0
+    defender_lane_min_quality: float = 0.3
+
     # ---- Stage 2: dribble_to target quality and progress ----
     # Dense per-step reward for ball moving toward the dribble_to target.
     # Positive = ball got closer. Teaches WHERE to target by rewarding
@@ -206,6 +225,27 @@ class RewardConfig:
     # goalie_catch terminal is unchanged. radius 0.0 disables (backwards-compat).
     keeper_zone_radius: float = 0.0
     keeper_zone_floor: float = 0.0
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_clearance_dist: float = 5.0
+    clearance_receive_weight: float = 0.0
+    clearance_receive_clip: float = 0.5
+    receive_positioning_bonus: float = 0.0
+    receive_positioning_x_range: Tuple[float, float] = (-5.0, 15.0)
+    own_half_loiter_x: float = -15.0
+    own_half_loiter_penalty: float = 0.0
+    ball_recovery_bonus: float = 0.0
+
+    # ---- Stage 5+: multi-robot coordination (N-robot scalable) ----
+    enable_role_gating: bool = False
+    spread_bonus: float = 0.0
+    spread_min_dist: float = 8.0
+    redundant_chase_penalty: float = 0.0
+    redundant_chase_dist: float = 3.0
+    support_position_bonus: float = 0.0
+    support_position_max_dist: float = 20.0
+    support_position_min_angle_deg: float = 20.0
+    possession_transfer_bonus: float = 0.0
+    team_goal_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -225,7 +265,10 @@ class RewardInputs:
     prev_facing_goal_cos: Optional[float] = None
     # Stage 2: opponent goalie y (None when no goalie is on the field).
     goalie_y: Optional[float] = None
-    # True only after dribble_to verifies catch ownership and enters CARRY.
+    # Stage 3: (x, y) of the non-goalie defender whose lane coverage matters for
+    # the current shot. None when there is no defender (e.g. stages 1-2).
+    defender_pos: Optional[Tuple[float, float]] = None
+    # True while the dribble_to phase machine is in GRAB or CARRY.
     is_dribbling: bool = False
     dribble_anchor_dist: Optional[float] = None
     # The (x, y) target the policy chose for dribble_to this step.
@@ -233,6 +276,18 @@ class RewardInputs:
     dribble_target: Optional[Tuple[float, float]] = None
     # Ball-to-dribble-target distance from the previous step (for delta).
     prev_ball_to_dribble_target_dist: Optional[float] = None
+
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_pos: Optional[Tuple[float, float]] = None
+    own_goalie_has_ball: bool = False
+    prev_clearance_zone_dist: Optional[float] = None
+    prev_has_ball: bool = False
+    prev_opponent_near_ball: bool = False
+
+    # ---- Stage 5+: multi-robot coordination ----
+    ally_positions: Tuple[Tuple[float, float], ...] = ()
+    is_nearest_to_ball: bool = True
+    ball_carrier_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +316,9 @@ class RewardIntermediates:
     ball_out_of_bounds: bool
     # Stage 2 fields (defaults keep stage-1 callers untouched).
     goalie_y: Optional[float] = None
+    # Stage 3: clearance (0..1) of the actual shot lane (ball-velocity projection)
+    # from the defender. 1.0 = clear / no defender; multiplies the dense aim gates.
+    defender_lane_clear: float = 1.0
     # True when the current action is dribble_to (regardless of phase).
     dribble_to_active: bool = False
     # Per-step ball-to-dribble-target distance reduction (positive = closer).
@@ -272,6 +330,20 @@ class RewardIntermediates:
     # Deprecated: kept for backward compat, always False / None.
     valid_dribble: bool = False
     dribble_lateral_progress: Optional[float] = None
+
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_has_ball: bool = False
+    clearance_receive_progress: Optional[float] = None
+    in_receive_position: bool = False
+    in_own_half_loiter: bool = False
+    ball_recovered: bool = False
+
+    # ---- Stage 5+: multi-robot coordination ----
+    is_nearest_to_ball: bool = True
+    nearest_ally_dist: Optional[float] = None
+    is_well_spread: bool = False
+    in_support_position: bool = False
+    is_redundant_chaser: bool = False
 
 
 @dataclass(frozen=True)
@@ -444,6 +516,67 @@ def reachable_gap_delta(
     return float(reachable - current), endpoint
 
 
+def _distance_point_to_segment(
+    point: Tuple[float, float],
+    seg_a: Tuple[float, float],
+    seg_b: Tuple[float, float],
+) -> float:
+    """Shortest distance from `point` to the segment seg_a→seg_b."""
+
+    px, py = float(point[0]), float(point[1])
+    ax, ay = float(seg_a[0]), float(seg_a[1])
+    bx, by = float(seg_b[0]), float(seg_b[1])
+    vx, vy = bx - ax, by - ay
+    seg_len_sq = vx * vx + vy * vy
+    if seg_len_sq <= 1e-9:
+        return float(math.hypot(px - ax, py - ay))
+    t = ((px - ax) * vx + (py - ay) * vy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    cx, cy = ax + t * vx, ay + t * vy
+    return float(math.hypot(px - cx, py - cy))
+
+
+def lane_clear_quality(
+    ball_pos: Tuple[float, float],
+    aim_point: Tuple[float, float],
+    defender_pos: Optional[Tuple[float, float]],
+    block_dist: float,
+) -> float:
+    """Return 0..1 for how clear the ball→aim_point lane is of the defender.
+
+    1.0 when the defender is at least `block_dist` from the shot segment, ramping
+    linearly to 0.0 when the defender sits exactly on the line. No defender (or a
+    non-positive block_dist) means a fully clear lane.
+    """
+
+    if defender_pos is None or block_dist <= 0.0:
+        return 1.0
+    d = _distance_point_to_segment(defender_pos, ball_pos, aim_point)
+    return float(max(0.0, min(1.0, d / float(block_dist))))
+
+
+def positional_shot_quality(
+    point: Tuple[float, float],
+    goalie_y: float,
+    defender_pos: Optional[Tuple[float, float]],
+    goal_half_height: float,
+    lane_block_dist: float,
+) -> float:
+    """Keeper-gap quality of a shot from `point`, discounted by the defender lane.
+
+    Combines `positional_gap_quality` (lateral separation from the keeper) with
+    `lane_clear_quality` for the straight lane from `point` to the goal centre.
+    Used to score dribble_to targets in Stage 3: a good target is one that is
+    BOTH off the keeper's cover AND off the defender's covered lane.
+    """
+
+    base = positional_gap_quality(point, goalie_y, goal_half_height)
+    if base <= 0.0:
+        return 0.0
+    lane = lane_clear_quality(point, (FIELD_X[1], 0.0), defender_pos, lane_block_dist)
+    return float(base * lane)
+
+
 def extract_opponent_positions(
     robot_poses: Mapping[str, Sequence[Mapping[int, Tuple[float, float, float]]]],
     team_name: str,
@@ -548,13 +681,114 @@ def calculate_reward_intermediates(
 
     dribble_target_quality_delta = None
     if dribble_to_active and inputs.goalie_y is not None:
-        current_gap = positional_gap_quality(
-            inputs.ball_pos, inputs.goalie_y, config.goal_half_height,
+        if config.use_defender_lane_gate:
+            # Stage 3: target quality also accounts for whether the dribble spot
+            # opens a lane the defender doesn't cover, not just the keeper gap.
+            current_q = positional_shot_quality(
+                inputs.ball_pos, inputs.goalie_y, inputs.defender_pos,
+                config.goal_half_height, config.defender_lane_block_dist,
+            )
+            target_q = positional_shot_quality(
+                inputs.dribble_target, inputs.goalie_y, inputs.defender_pos,
+                config.goal_half_height, config.defender_lane_block_dist,
+            )
+        else:
+            current_q = positional_gap_quality(
+                inputs.ball_pos, inputs.goalie_y, config.goal_half_height,
+            )
+            target_q = positional_gap_quality(
+                inputs.dribble_target, inputs.goalie_y, config.goal_half_height,
+            )
+        dribble_target_quality_delta = float(max(0.0, target_q - current_q))
+
+    # Stage 3: clearance of the ACTUAL shot lane (ball-velocity projection to the
+    # goal line) from the defender. Multiplies into the dense aim gates so pushing
+    # the ball straight at goal through the defender earns essentially nothing.
+    defender_lane_clear = 1.0
+    if (
+        config.use_defender_lane_gate
+        and inputs.defender_pos is not None
+        and predicted_y_at_goal_line is not None
+    ):
+        defender_lane_clear = lane_clear_quality(
+            (bx, by),
+            (FIELD_X[1], float(predicted_y_at_goal_line)),
+            inputs.defender_pos,
+            config.defender_lane_block_dist,
         )
-        target_gap = positional_gap_quality(
-            inputs.dribble_target, inputs.goalie_y, config.goal_half_height,
-        )
-        dribble_target_quality_delta = float(max(0.0, target_gap - current_gap))
+
+    # ---- Stage 4: own-goalie coordination ----
+    own_goalie_has_ball = False
+    clearance_receive_progress = None
+    if inputs.own_goalie_pos is not None:
+        gx, gy = inputs.own_goalie_pos
+        ball_to_own_goalie = float(math.hypot(bx - gx, by - gy))
+        own_goalie_has_ball = bool(ball_to_own_goalie < config.own_goalie_clearance_dist)
+
+        if own_goalie_has_ball and inputs.prev_clearance_zone_dist is not None:
+            clearance_zone_x = 0.0
+            clearance_zone_y = gy * 0.3
+            clearance_zone_dist = float(math.hypot(rx - clearance_zone_x, ry - clearance_zone_y))
+            clearance_receive_progress = float(inputs.prev_clearance_zone_dist - clearance_zone_dist)
+
+    in_receive_position = bool(
+        own_goalie_has_ball
+        and config.receive_positioning_x_range[0] <= rx <= config.receive_positioning_x_range[1]
+    )
+
+    in_own_half_loiter = bool(rx < config.own_half_loiter_x)
+
+    ball_recovered = bool(
+        inputs.has_ball
+        and not inputs.prev_has_ball
+        and inputs.prev_opponent_near_ball
+    )
+
+    # ---- Stage 5+: multi-robot coordination ----
+    nearest_ally_dist = None
+    if inputs.ally_positions:
+        nearest_ally_dist = float(min(
+            math.hypot(rx - ax, ry - ay) for ax, ay in inputs.ally_positions
+        ))
+
+    is_well_spread = bool(
+        nearest_ally_dist is not None
+        and nearest_ally_dist >= config.spread_min_dist
+    )
+
+    in_support_position = False
+    if (
+        not inputs.is_nearest_to_ball
+        and inputs.ally_positions
+        and ball_dist < config.support_position_max_dist
+    ):
+        to_goal_from_ball_x = FIELD_X[1] - bx
+        to_goal_from_ball_y = -by
+        to_robot_from_ball_x = rx - bx
+        to_robot_from_ball_y = ry - by
+        goal_norm = math.hypot(to_goal_from_ball_x, to_goal_from_ball_y)
+        robot_norm = math.hypot(to_robot_from_ball_x, to_robot_from_ball_y)
+        if goal_norm > 1e-6 and robot_norm > 1e-6:
+            cos_angle = (
+                to_goal_from_ball_x * to_robot_from_ball_x
+                + to_goal_from_ball_y * to_robot_from_ball_y
+            ) / (goal_norm * robot_norm)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            is_forward = bool(rx > bx - 5.0)
+            in_support_position = bool(
+                is_forward and angle_deg >= config.support_position_min_angle_deg
+            )
+
+    is_redundant_chaser = bool(
+        not inputs.is_nearest_to_ball
+        and ball_dist < config.redundant_chase_dist
+    )
+
+    opponent_near_ball = bool(
+        nearest_opponent_ball_dist is not None
+        and nearest_opponent_ball_dist < config.opponent_near_ball_threshold
+    )
 
     return RewardIntermediates(
         ball_dist=ball_dist,
@@ -568,20 +802,30 @@ def calculate_reward_intermediates(
         has_ball=bool(inputs.has_ball),
         near_ball=bool(ball_dist < inputs.kickable_dist * config.near_ball_scale),
         nearest_opponent_ball_dist=nearest_opponent_ball_dist,
-        opponent_near_ball=bool(
-            nearest_opponent_ball_dist is not None
-            and nearest_opponent_ball_dist < config.opponent_near_ball_threshold
-        ),
+        opponent_near_ball=opponent_near_ball,
         in_shoot_state=bool(inputs.state == "shoot_on_goal"),
         in_dribble_state=bool(inputs.state == "dribble_to_goal"),
         goal_scored=goal_scored,
         robot_out_of_bounds=robot_out_of_bounds,
         ball_out_of_bounds=ball_out_of_bounds,
         goalie_y=inputs.goalie_y,
+        defender_lane_clear=defender_lane_clear,
         dribble_to_active=dribble_to_active,
         dribble_target_progress=dribble_target_progress,
         dribble_target_quality_delta=dribble_target_quality_delta,
         is_dribbling=bool(inputs.is_dribbling),
+        # Stage 4
+        own_goalie_has_ball=own_goalie_has_ball,
+        clearance_receive_progress=clearance_receive_progress,
+        in_receive_position=in_receive_position,
+        in_own_half_loiter=in_own_half_loiter,
+        ball_recovered=ball_recovered,
+        # Stage 5+
+        is_nearest_to_ball=inputs.is_nearest_to_ball,
+        nearest_ally_dist=nearest_ally_dist,
+        is_well_spread=is_well_spread,
+        in_support_position=in_support_position,
+        is_redundant_chaser=is_redundant_chaser,
     )
 
 
@@ -597,16 +841,22 @@ def _dense_aim_quality(
     """
 
     if config.use_goalie_aim_gate:
-        return post_safe_goalie_gap_quality(
+        quality = post_safe_goalie_gap_quality(
             intermediates.predicted_y_at_goal_line,
             intermediates.goalie_y,
             config.goal_half_height,
             config.goal_post_safety_margin,
         )
-    return aim_quality_from_prediction(
-        intermediates.predicted_y_at_goal_line,
-        config.goal_half_height,
-    )
+    else:
+        quality = aim_quality_from_prediction(
+            intermediates.predicted_y_at_goal_line,
+            config.goal_half_height,
+        )
+    # Stage 3: a fast/progressing ball aimed through the defender's lane is not a
+    # real chance — discount the dense gates by how clear that lane is.
+    if config.use_defender_lane_gate:
+        quality *= intermediates.defender_lane_clear
+    return quality
 
 
 def calculate_reward(
@@ -620,7 +870,11 @@ def calculate_reward(
 
     reward = 0.0
 
-    if intermediates.approach is not None and not intermediates.has_ball:
+    # Role-gating: when enabled, only the nearest-to-ball robot gets
+    # chase/possession rewards. Non-nearest robots get positioning rewards.
+    is_chaser = not config.enable_role_gating or intermediates.is_nearest_to_ball
+
+    if intermediates.approach is not None and not intermediates.has_ball and is_chaser:
         reward += intermediates.approach * config.approach_weight
 
     if intermediates.goal_progress is not None:
@@ -666,9 +920,9 @@ def calculate_reward(
         if fire_alignment:
             reward += intermediates.facing_goal_cos_delta * config.alignment_weight
 
-    if intermediates.has_ball:
+    if intermediates.has_ball and is_chaser:
         reward += config.has_ball_bonus
-    if intermediates.near_ball:
+    if intermediates.near_ball and is_chaser:
         reward += config.near_ball_bonus
     if intermediates.opponent_near_ball:
         reward += config.opponent_near_ball_penalty
@@ -699,8 +953,41 @@ def calculate_reward(
     ):
         reward += config.dribble_active_bonus
 
+    # ---- Stage 4: own-goalie coordination ----
+    if (
+        intermediates.clearance_receive_progress is not None
+        and config.clearance_receive_weight > 0.0
+        and intermediates.own_goalie_has_ball
+    ):
+        progress = float(np.clip(
+            intermediates.clearance_receive_progress,
+            -config.clearance_receive_clip,
+            config.clearance_receive_clip,
+        ))
+        reward += progress * config.clearance_receive_weight
+
+    if intermediates.in_receive_position and config.receive_positioning_bonus > 0.0:
+        reward += config.receive_positioning_bonus
+
+    if intermediates.in_own_half_loiter and config.own_half_loiter_penalty > 0.0:
+        reward -= config.own_half_loiter_penalty
+
+    if intermediates.ball_recovered and config.ball_recovery_bonus > 0.0:
+        reward += config.ball_recovery_bonus
+
+    # ---- Stage 5+: multi-robot coordination ----
+    if not is_chaser:
+        if config.spread_bonus > 0.0 and intermediates.is_well_spread:
+            reward += config.spread_bonus
+
+        if config.support_position_bonus > 0.0 and intermediates.in_support_position:
+            reward += config.support_position_bonus
+
+    if intermediates.is_redundant_chaser and config.redundant_chase_penalty > 0.0:
+        reward -= config.redundant_chase_penalty
+
     if intermediates.goal_scored:
-        reward += config.goal_reward
+        reward += config.goal_reward * config.team_goal_multiplier
     if intermediates.robot_out_of_bounds:
         reward -= config.robot_out_of_bounds_penalty
     if intermediates.ball_out_of_bounds:
