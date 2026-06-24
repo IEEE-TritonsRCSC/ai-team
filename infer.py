@@ -722,6 +722,17 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
 
     device = _resolve_device()
 
+    # Optional deterministic seeding. The PPO-JAL rollout's only stochastic draws
+    # are the param noise (np.random.normal) and the ball spawn (np.random.uniform),
+    # both on the global NumPy RNG, plus torch for any sampling. Pinning all three
+    # makes an inference run bit-reproducible — used as a characterization gate to
+    # prove env/reward changes don't alter Stage-2 behavior.
+    if getattr(args, "seed", None) is not None:
+        import random as _random
+        np.random.seed(int(args.seed))
+        torch.manual_seed(int(args.seed))
+        _random.seed(int(args.seed))
+
     with open(args.config, "r") as f:
         config = json.load(f)
     stage_config = config["curriculum"][args.stage]
@@ -1259,6 +1270,11 @@ def main():
                              "cannot, breaking the continuous-turning loop (see CHANGES.md #26). "
                              "Default 0.3 (validated: 94.4%% goal, 1.4%% timeout vs 73.6%%/19%% "
                              "at 0.0). Set 0 for pure deterministic mean (debug only).")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="PPO JAL: pin NumPy/torch/random RNGs for a "
+                             "bit-reproducible inference run. Used as a "
+                             "characterization gate (same seed must reproduce "
+                             "the same outcomes after env/reward changes).")
     parser.add_argument("--sim_host", type=str, default="127.0.0.1",
                         help="rcssserver host (default 127.0.0.1). Use to target "
                              "a remote sim or a non-default loopback alias.")
