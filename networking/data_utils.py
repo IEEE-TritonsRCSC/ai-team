@@ -265,11 +265,11 @@ class Serializer:
                 action = self._convert_command_for_simulator(action, 2)
                 # Remove the 's' prefix for simulator
                 action = action.replace("skick", "kick")
-            elif action.strip().lower() == "drop":
-                # "drop" releases a caught ball. No parser token exists, so
-                # translate to a minimal kick (power=1) which releases the ball
-                # from catch state with negligible force.
-                action = "kick 1 0"
+            # NOTE: a bare "drop" is passed through unchanged — the embedded sim
+            # (version_2) implements native `drop` to release a caught ball
+            # cleanly. Do NOT translate it to a kick: kicking on release applies
+            # force to the ball, which breaks dribble-release dynamics and
+            # triggers dead-ball/stale-sim bricks (regresses Stage-2 goal rate).
 
             messages[i] = b"(" + action.encode() + b")\0"
         return messages
