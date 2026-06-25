@@ -514,7 +514,7 @@
       }
     },
     "stage3_defender": {
-      "description": "STAGE 3 \u2014 DRIBBLE PAST A DEFENDER. 1 trained attacker vs 1 scripted goal-side container defender (robot 2) + 1 scripted goalie (robot 1). Builds in-memory on the stage2c gap-shot+dribble policy (run after stage2c; to run standalone set top-level load_model to models/ppo_jal_expandable/stage2c_goalie_balance_complete.pt). The defender holds the direct ball->goal lane and mirrors the ball, so a shot straight at goal earns nothing \u2014 use_defender_lane_gate multiplies the kick bonus AND the dense aim gates by how clear the shot lane is of the defender, and defender_lane_penalty punishes kicking through it. dribble_target_quality is now defender-aware (positional_shot_quality = keeper-gap x lane-clear), so dribble_to is rewarded for moving the ball to a spot that opens an angle past BOTH the keeper and the defender; the post-dribble combo bonus then pays the dribble->shoot sequence. The defender is observed via a second opponent context slot (num_opponents=2). Ball spawns in the attacking third (x=[25,34], y=+/-10). Budget 400k.",
+      "description": "STAGE 3 \u2014 DRIBBLE PAST A DEFENDER. 1 trained attacker vs 1 scripted goal-side container defender (robot 2) + 1 scripted goalie (robot 1). Builds in-memory on the stage2c gap-shot+dribble policy (run after stage2c; to run standalone set top-level load_model to models/ppo_jal_expandable/stage2c_goalie_balance_complete.pt). The defender holds the direct ball->goal lane and mirrors the ball, so a shot straight at goal earns nothing \u2014 use_defender_lane_gate multiplies the kick bonus AND the dense aim gates by how clear the shot lane is of the defender, and defender_lane_penalty punishes kicking through it. dribble_target_quality is now defender-aware (positional_shot_quality = keeper-gap x lane-clear), so dribble_to is rewarded for moving the ball to a spot that opens an angle past BOTH the keeper and the defender; the post-dribble combo bonus then pays the dribble->shoot sequence. The defender is observed via a second opponent context slot (num_opponents=2). Ball spawns in the attacking third (x=[25,34], y=+/-10). Budget 400k. has_ball_bonus bumped 0.05\u21920.15 so possession is net +0.05/step (offsets step_bonus -0.1), preventing the freeze-with-ball local optimum where the policy holds still to avoid the defender_lane_penalty/opponent_near_ball risk.",
       "num_robots": 1,
       "timesteps": 400000,
       "robot_ids": [
@@ -560,7 +560,7 @@
       ],
       "invalid_action_penalty": 0.5,
       "reward_config_overrides": {
-        "has_ball_bonus": 0.05,
+        "has_ball_bonus": 0.15,
         "near_ball_bonus": 0.05,
         "approach_weight": 1.0,
         "step_bonus": -0.1,

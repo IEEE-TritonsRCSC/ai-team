@@ -327,6 +327,7 @@ class DribbleState:
     verify_steps: int = 0
     align_game_count: int | None = None
     align_steps: int = 0
+    grab_steps: int = 0
     release_game_count: int | None = None
     retry_after_release: bool = False
     release_at_limit: bool = False
@@ -350,6 +351,7 @@ class DribbleState:
         self.verify_steps = 0
         self.align_game_count = None
         self.align_steps = 0
+        self.grab_steps = 0
         self.release_game_count = None
         self.retry_after_release = False
         self.release_at_limit = False
@@ -378,7 +380,8 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
                verify_probe_speed: float = 5.0,
                verify_min_displacement: float = 0.005,
                verify_offset_tolerance: float = 0.12,
-               max_align_steps: int = 90) -> str:
+               max_align_steps: int = 90,
+               max_grab_steps: int = 30) -> str:
     """
     Transport the ball to `target` within the excessive-dribbling rule.
 
@@ -509,10 +512,12 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
     # catch rectangle even though it is within the proximity-only possession
     # threshold. Do not assume the command succeeded — VERIFY owns that decision.
     if state.phase == DRIBBLE_PHASE_GRAB:
+        state.grab_steps += 1
+        if state.grab_steps > max_grab_steps:
+            state.phase = DRIBBLE_PHASE_DONE
+            return "done"
         grab_angle_diff = normalize_angle(angle_to_ball - heading)
         if abs(grab_angle_diff) > angle_tolerance:
-            # Commands are angular velocity (rad/s); serializer multiplies by dt.
-            # Divide by dt so the requested per-cycle rotation equals the error.
             return f"turn {grab_angle_diff / dt}"
         state.segment_start = None
         state.verify_robot_start = None
@@ -655,6 +660,7 @@ def dribble_to(self_pose: np.ndarray | Tuple | List,
             state.verify_ball_start = None
             state.verify_game_count = None
             state.verify_steps = 0
+            state.grab_steps = 0
             retry_angle_diff = normalize_angle(angle_to_ball - heading)
             if abs(retry_angle_diff) > angle_tolerance:
                 return f"turn {retry_angle_diff / dt}"
