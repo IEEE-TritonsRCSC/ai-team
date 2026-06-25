@@ -791,25 +791,32 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
 
     disabled_actions = list(stage_config.get("disabled_actions", []))
 
-    # Build the scripted opponent keeper controller from the stage's
-    # aux_team_policies, mirroring PPOJALCurriculumTrainer._setup_opponent_controller.
-    # Without this the keeper just stands on its spawn and never intercepts.
-    opp_controller = None
-    opp_team_name = None
+    # Build scripted opponent controllers from the stage's aux_team_policies,
+    # mirroring PPOJALCurriculumTrainer._setup_opponent_controller.
+    from ai_interface.trainers.policy_control import GoalieCommandProvider, DefenderCommandProvider
+    aux_controllers: list = []
     aux_specs = stage_config.get("aux_team_policies", [])
-    if aux_specs and isinstance(aux_specs[0], dict):
-        spec = aux_specs[0]
-        if str(spec.get("controller_type", "")).lower() == "goalie":
-            from ai_interface.trainers.policy_control import GoalieCommandProvider
-            opp_team_name = str(spec.get("team_name", "")) or opponent_goalie_team
-            opp_controller = GoalieCommandProvider(
-                team_name=opp_team_name,
-                robot_id=int((spec.get("robot_ids", [1]) or [1])[0]),
-                side=str(spec.get("side", "right")),
-            )
+    for spec in aux_specs:
+        if not isinstance(spec, dict):
+            continue
+        controller_type = str(spec.get("controller_type", "")).lower()
+        team_name = str(spec.get("team_name", "")) or opponent_goalie_team
+        robot_ids = list(spec.get("robot_ids", [1]))
+        robot_id = int(robot_ids[0]) if robot_ids else 1
+        side = str(spec.get("side", "right"))
+        if controller_type == "goalie":
+            ctrl = GoalieCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
+            aux_controllers.append(ctrl)
             _SUMMARY_LOG.info(
-                "Scripted opponent goalie active: team=%s robot=%s side=%s",
-                opp_team_name, spec.get("robot_ids", [1]), spec.get("side", "right"),
+                "Aux controller: goalie team=%s robot_id=%d side=%s",
+                team_name, robot_id, side,
+            )
+        elif controller_type == "defender":
+            ctrl = DefenderCommandProvider(team_name=team_name, robot_id=robot_id, side=side)
+            aux_controllers.append(ctrl)
+            _SUMMARY_LOG.info(
+                "Aux controller: defender team=%s robot_id=%d side=%s",
+                team_name, robot_id, side,
             )
 
     log_dir = (
@@ -926,29 +933,15 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                 0.0, float(args.ppo_param_noise_std), size=params.shape
             ).astype(np.float32)
             action["params"] = np.clip(params, -1.0, 1.0)
-        # Drive the scripted opponent keeper each cycle from the last observed
+        # Drive scripted aux controllers each cycle from the last observed
         # game state, then step (matches the trainer's rollout ordering).
-        if (
-            opp_controller is not None
-            and opp_team_name
-            and getattr(env, "_cached_game_state", None) is not None
-        ):
-            try:
-                opp_cmds = opp_controller.predict_commands(env._cached_game_state)
-                env.networker.execute_ai_output(opp_cmds, opp_team_name)
-            except Exception as e:
-                _SUMMARY_LOG.debug("Opponent command send failed: %s", e)
-
-        if (
-            opp_controller is not None
-            and opp_team_name
-            and getattr(env, "_cached_game_state", None) is not None
-        ):
-            try:
-                opp_cmds = opp_controller.predict_commands(env._cached_game_state)
-                networker.execute_ai_output(opp_cmds, opp_team_name)
-            except Exception:
-                pass
+        if getattr(env, "_cached_game_state", None) is not None:
+            for aux_ctrl in aux_controllers:
+                try:
+                    aux_cmds = aux_ctrl.predict_commands(env._cached_game_state)
+                    env.networker.execute_ai_output(aux_cmds, aux_ctrl.team_name)
+                except Exception as e:
+                    _SUMMARY_LOG.debug("Aux controller command send failed: %s", e)
 
         obs, reward, terminated, truncated, info = env.step(action)
         if isinstance(info, dict):
