@@ -39,6 +39,7 @@ from ai_interface.envs.reward import (
     positional_gap_quality,
     lane_clear_quality,
     positional_shot_quality,
+    reachable_gap_delta,
 )
 from ai_interface.envs.ssl_rule_events import SSLRuleConfig, SSLRuleTracker
 from networking.networker import Networker
