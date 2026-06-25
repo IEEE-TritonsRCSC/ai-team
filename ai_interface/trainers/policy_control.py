@@ -250,6 +250,58 @@ class DefenderCommandProvider:
         return self._slot_list(cmd)
 
 
+class MarkerDefenderCommandProvider:
+    """Drive a scripted marker/cover defender (Stage 4+).
+
+    Complements the ball-challenging DefenderCommandProvider by marking
+    receivers and covering pass lanes.
+    """
+
+    def __init__(
+        self,
+        team_name: str,
+        robot_id: int,
+        side: str = "right",
+        ball_defender_robot_id: int = 2,
+    ):
+        from ai_interface.marker_defender import MarkerDefender
+        self.team_name = team_name
+        self.robot_id = int(robot_id)
+        self.num_robots = 1
+        self._defender = MarkerDefender(
+            teamname=team_name,
+            unum=self.robot_id,
+            side=side,
+            ball_defender_robot_id=ball_defender_robot_id,
+        )
+
+    def _slot_list(self, cmd: str) -> list:
+        return [None] * (self.robot_id - 1) + [cmd]
+
+    def predict_commands(self, game_state: GameState) -> list:
+        if game_state is None:
+            return self._slot_list("turn 0")
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is None:
+            return self._slot_list("turn 0")
+        defender_pose = None
+        for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []):
+            if not isinstance(entry, dict):
+                continue
+            pose = entry.get(self.robot_id)
+            if pose is not None and len(pose) >= 3:
+                defender_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                break
+        if defender_pose is None:
+            return self._slot_list("turn 0")
+        cmd = self._defender.action(
+            ball_pos=ball_pos,
+            defender_pose=defender_pose,
+            game_state=game_state,
+        )
+        return self._slot_list(cmd)
+
+
 class ScriptedTeamCommandProvider:
     """Wrap a hard-coded AI implementation behind the TeamCommandProvider protocol."""
 

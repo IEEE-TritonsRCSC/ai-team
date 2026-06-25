@@ -36,6 +36,7 @@ from ai_interface.trainers.policy_control import (
     ScriptedTeamCommandProvider,
     GoalieCommandProvider,
     DefenderCommandProvider,
+    MarkerDefenderCommandProvider,
 )
 from networking.networker import Networker, TeamInfo
 
@@ -438,6 +439,22 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 self.logger.info(
                     "Aux controller: defender team=%s robot_id=%d side=%s",
                     team_name, robot_id, side,
+                )
+                self._aux_controllers.append(ctrl)
+
+            elif controller_type == "marker_defender":
+                robot_id = int(robot_ids[0]) if robot_ids else 3
+                side = str(spec.get("side", "right"))
+                ball_defender_robot_id = int(spec.get("ball_defender_robot_id", 2))
+                ctrl = MarkerDefenderCommandProvider(
+                    team_name=team_name,
+                    robot_id=robot_id,
+                    side=side,
+                    ball_defender_robot_id=ball_defender_robot_id,
+                )
+                self.logger.info(
+                    "Aux controller: marker_defender team=%s robot_id=%d side=%s ball_def=%d",
+                    team_name, robot_id, side, ball_defender_robot_id,
                 )
                 self._aux_controllers.append(ctrl)
 

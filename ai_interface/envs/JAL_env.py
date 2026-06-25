@@ -3029,6 +3029,38 @@ class JALTeamEnv(gym.Env):
             return min(rest, key=lambda p: math.hypot(p[0] - bx, p[1] - by))
         return rest[0]
 
+    def _opponent_defender_poses(self, game_state) -> List[Tuple[float, float, float]]:
+        """Return all non-goalie opponent poses sorted by distance to ball.
+
+        Stage 4+ has multiple defenders; this returns up to num_opponents-1
+        poses (excluding the keeper). Returns empty list for stages 1-2.
+        """
+        if game_state is None:
+            return []
+        opp_poses: List[Tuple[float, float, float]] = []
+        for team_name, entries in getattr(game_state, "robot_poses", {}).items():
+            if team_name == self.team_name:
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for _rid, pose in entry.items():
+                    if pose is None or len(pose) < 3:
+                        continue
+                    opp_poses.append((float(pose[0]), float(pose[1]), float(pose[2])))
+        if len(opp_poses) < 2:
+            return []
+        keeper = min(
+            opp_poses,
+            key=lambda p: math.hypot(p[0] - float(GOAL_R[0]), p[1] - float(GOAL_R[1])),
+        )
+        rest = [p for p in opp_poses if p is not keeper]
+        ball_pos = getattr(game_state, "ball_pos", None)
+        if ball_pos is not None and len(ball_pos) >= 2:
+            bx, by = float(ball_pos[0]), float(ball_pos[1])
+            rest.sort(key=lambda p: math.hypot(p[0] - bx, p[1] - by))
+        return rest
+
     def _own_goalie_pose(self, game_state) -> Optional[Tuple[float, float, float]]:
         """Return (x, y, theta_deg) of our own HC goalie, or None."""
 
