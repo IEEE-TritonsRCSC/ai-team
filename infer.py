@@ -543,8 +543,8 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
     actions_window: Counter = Counter()
     invalid_action_total = 0
     invalid_action_window = 0
-    blocked_bad_aim_total = 0
-    blocked_bad_aim_window = 0
+    blocked_kick_total = 0
+    blocked_kick_window = 0
     action_samples: list[dict] = []
     last_kick_idx = 0  # marker into collector.kicks for window slicing
 
@@ -595,7 +595,10 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
                 if requested:
                     requested_actions_total[requested] += 1
                     requested_actions_window[requested] += 1
-                if robot_info.get("kick_blocked_bad_aim", False):
+                if (
+                    robot_info.get("kick_blocked_bad_aim", False)
+                    or robot_info.get("kick_blocked_bad_reception", False)
+                ):
                     blocked_this_step += 1
                 if len(action_samples) < 20:
                     action_samples.append({
@@ -608,13 +611,15 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
                         "kick_tie_break_applied": bool(robot_info.get("kick_tie_break_applied", False)),
                         "approach_defer_applied": bool(robot_info.get("approach_defer_applied", False)),
                         "kick_blocked_bad_aim": bool(robot_info.get("kick_blocked_bad_aim", False)),
+                        "kick_blocked_bad_reception": bool(robot_info.get("kick_blocked_bad_reception", False)),
+                        "ball_in_reception_cone": bool(robot_info.get("ball_in_reception_cone", False)),
                         "kick_aim_quality": robot_info.get("kick_aim_quality"),
                         "kick_predicted_y_at_goal_line": robot_info.get("kick_predicted_y_at_goal_line"),
                         "logits": robot_info.get("logits"),
                         "turn_theta": robot_info.get("turn_theta"),
                     })
-            blocked_bad_aim_total += blocked_this_step
-            blocked_bad_aim_window += blocked_this_step
+            blocked_kick_total += blocked_this_step
+            blocked_kick_window += blocked_this_step
 
         if terminated or truncated:
             episode_count += 1
@@ -640,17 +645,17 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
                     actions=actions_window,
                 )
                 _SUMMARY_LOG.info(
-                    "[eps %d-%d] requested: %s | invalid_actions=%d | blocked_bad_aim=%d",
+                    "[eps %d-%d] requested: %s | invalid_actions=%d | blocked_kicks=%d",
                     episode_count - WINDOW + 1,
                     episode_count,
                     " ".join(f"{k}={v}" for k, v in sorted(requested_actions_window.items())) or "—",
                     invalid_action_window,
-                    blocked_bad_aim_window,
+                    blocked_kick_window,
                 )
                 actions_window = Counter()
                 requested_actions_window = Counter()
                 invalid_action_window = 0
-                blocked_bad_aim_window = 0
+                blocked_kick_window = 0
 
             total_reward = 0.0
             obs, _ = env.reset()
@@ -670,10 +675,10 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
         actions=actions_total,
     )
     _SUMMARY_LOG.info(
-        "[ALL] requested: %s | invalid_actions=%d | blocked_bad_aim=%d",
+        "[ALL] requested: %s | invalid_actions=%d | blocked_kicks=%d",
         " ".join(f"{k}={v}" for k, v in sorted(requested_actions_total.items())) or "—",
         invalid_action_total,
-        blocked_bad_aim_total,
+        blocked_kick_total,
     )
     last_stats = None
     if len(outcomes) > 100:
@@ -697,7 +702,8 @@ def _run_td3_jal_her(args, networker: Networker, team_name: str):
         "requested_actions": dict(requested_actions_total),
         "executed_actions": dict(actions_total),
         "invalid_action_total": invalid_action_total,
-        "blocked_bad_aim_total": blocked_bad_aim_total,
+        "blocked_kick_total": blocked_kick_total,
+        "blocked_bad_aim_total": blocked_kick_total,
         "td3_eval_noise_std": eval_noise_std,
         "td3_eval_logit_noise_std": eval_logit_noise_std,
         "td3_eval_param_noise_std": eval_param_noise_std,
@@ -722,7 +728,10 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     """
     from ai_interface.algorithms.ppo_jal import PPOJALAgent, PRIMITIVE_NAMES
     from ai_interface.envs.JAL_env import JALTeamEnv
-    from ai_interface.trainers.policy_control import GoalieCommandProvider
+    from ai_interface.trainers.policy_control import (
+        GoalieCommandProvider,
+        DefenderCommandProvider,
+    )
 
     device = _resolve_device()
 
@@ -752,6 +761,17 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     # Networker used to enable the keeper player.
     team_infos = load_team_config(args.team_config)
     opponent_goalie_team = team_infos[1].name if len(team_infos) > 1 else None
+    num_opponents = int(team_infos[1].n_players) if len(team_infos) > 1 else 1
+    opponent_goalie_robot_ids = []
+    for spec in stage_config.get("aux_team_policies", []) or []:
+        if not isinstance(spec, dict):
+            continue
+        if str(spec.get("controller_type", "")).lower() != "goalie":
+            continue
+        spec_team = str(spec.get("team_name", "")) or opponent_goalie_team
+        if spec_team != opponent_goalie_team:
+            continue
+        opponent_goalie_robot_ids.extend(int(rid) for rid in spec.get("robot_ids", []) or [])
 
     # Mirror PPOJALCurriculumTrainer.setup_environment exactly so the obs the
     # policy sees at inference matches training (same spawn / reward / mask).
@@ -787,6 +807,8 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         kick_min_aim_quality=float(stage_config.get("kick_min_aim_quality", 0.0)),
         reward_config_overrides=dict(reward_overrides) if reward_overrides else None,
         opponent_team_name=opponent_goalie_team,
+        num_opponents=num_opponents,
+        opponent_goalie_robot_ids=opponent_goalie_robot_ids,
     )
 
     disabled_actions = list(stage_config.get("disabled_actions", []))
@@ -829,6 +851,72 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         log_dir=log_dir, debug=bool(args.debug_infer)
     )
     _SUMMARY_LOG.info("Inference log dir: %s", log_dir)
+
+    # Build EVERY scripted opponent from the stage's aux_team_policies, not just
+    # the first. Mirrors PPOJALCurriculumTrainer._setup_opponent_controller:
+    # Stage 3+ stages list a goalie AND a defender (and later frozen-PPO teams),
+    # and each must be stepped every cycle. The previous code looked only at
+    # aux_specs[0] and only handled "goalie", so the defender stood frozen on its
+    # spawn — the policy then faced a different game than it trained on (and the
+    # idle carry against a static defender triggered the catch-glue dead-ball
+    # freeze). Each controller exposes .team_name + .predict_commands(game_state).
+    # Built after logging setup so these lines land in the inference log.
+    aux_controllers = []
+    aux_specs = stage_config.get("aux_team_policies", [])
+    for spec in aux_specs:
+        if not isinstance(spec, dict):
+            continue
+        controller_type = str(spec.get("controller_type", "")).lower()
+        spec_team = str(spec.get("team_name", "")) or opponent_goalie_team
+        robot_ids = list(spec.get("robot_ids", [1]) or [1])
+        side = str(spec.get("side", "right"))
+        if controller_type == "goalie":
+            aux_controllers.append(GoalieCommandProvider(
+                team_name=spec_team, robot_id=int(robot_ids[0]), side=side,
+            ))
+            _SUMMARY_LOG.info(
+                "Aux controller: goalie team=%s robot_id=%d side=%s",
+                spec_team, int(robot_ids[0]), side,
+            )
+        elif controller_type == "defender":
+            aux_controllers.append(DefenderCommandProvider(
+                team_name=spec_team, robot_id=int(robot_ids[0]), side=side,
+            ))
+            _SUMMARY_LOG.info(
+                "Aux controller: defender team=%s robot_id=%d side=%s",
+                spec_team, int(robot_ids[0]), side,
+            )
+        elif controller_type == "frozen_ppo":
+            from ai_interface.trainers.policy_control import (
+                FrozenPPOJALPolicySpec,
+                FrozenPPOJALPolicyController,
+            )
+            model_path = str(spec.get("model_path", ""))
+            if not model_path:
+                _SUMMARY_LOG.warning("aux frozen_ppo: missing model_path. Skipping.")
+                continue
+            ppo_spec = FrozenPPOJALPolicySpec(
+                name=str(spec.get("name", "frozen_ppo")),
+                model_path=model_path,
+                team_name=spec_team,
+                robot_ids=robot_ids,
+                a_max=int(spec.get("a_max", config.get("a_max", 5))),
+                c_max=int(spec.get("c_max", config.get("c_max", 7))),
+                global_dim=int(spec.get("global_dim", config.get("global_dim", 6))),
+                per_agent_dim=int(spec.get("per_agent_dim", config.get("per_agent_dim", 10))),
+                d_ctx=int(spec.get("d_ctx", config.get("d_ctx", 7))),
+                deterministic=bool(spec.get("deterministic", True)),
+            )
+            aux_controllers.append(FrozenPPOJALPolicyController(ppo_spec, networker, device=device))
+            _SUMMARY_LOG.info(
+                "Aux controller: frozen_ppo team=%s robots=%s model=%s",
+                spec_team, robot_ids, model_path,
+            )
+        else:
+            _SUMMARY_LOG.warning(
+                "aux_team_policies: unsupported controller_type=%r at inference. Skipping.",
+                controller_type,
+            )
 
     # Build hparams from model_params so the network shape (encoder_hidden) and
     # agent config match the checkpoint, then load weights.
@@ -1077,6 +1165,9 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                     "kick_retarget_applied": bool(robot_info.get("kick_retarget_applied", False)),
                     "kick_retarget_count": robot_info.get("kick_retarget_count"),
                     "kick_retarget_quality_before": robot_info.get("kick_retarget_quality_before"),
+                    "kick_blocked_bad_aim": bool(robot_info.get("kick_blocked_bad_aim", False)),
+                    "kick_blocked_bad_reception": bool(robot_info.get("kick_blocked_bad_reception", False)),
+                    "ball_in_reception_cone": bool(robot_info.get("ball_in_reception_cone", False)),
                     "kick_aim_quality": robot_info.get("kick_aim_quality"),
                     "kick_predicted_y_at_goal_line": robot_info.get("kick_predicted_y_at_goal_line"),
                     "kick_gap_quality": robot_info.get("kick_gap_quality"),

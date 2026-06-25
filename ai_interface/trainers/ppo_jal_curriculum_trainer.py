@@ -242,6 +242,9 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         reward_config_overrides = _stage_or_top("reward_config_overrides", None)
         invalid_action_penalty = _stage_or_top("invalid_action_penalty", 0.2)
         own_goalie_robot_id = _stage_or_top("own_goalie_robot_id", None)
+        opponent_goalie_robot_ids = self._opponent_goalie_robot_ids(
+            stage_config, opponent_team_name
+        )
 
         return JALTeamEnv(
             networker=networker,
@@ -281,7 +284,29 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             opponent_team_name=opponent_team_name,
             num_opponents=int(num_opponents),
             own_goalie_robot_id=int(own_goalie_robot_id) if own_goalie_robot_id is not None else None,
+            opponent_goalie_robot_ids=opponent_goalie_robot_ids,
         )
+
+    @staticmethod
+    def _opponent_goalie_robot_ids(
+        stage_config: Dict[str, Any],
+        opponent_team_name: Optional[str],
+    ) -> List[int]:
+        """Return scripted opponent goalie ids for SSL field-player foul filters."""
+
+        if not opponent_team_name:
+            return []
+        goalie_ids: List[int] = []
+        for spec in stage_config.get("aux_team_policies", []) or []:
+            if not isinstance(spec, dict):
+                continue
+            if str(spec.get("controller_type", "")).lower() != "goalie":
+                continue
+            if str(spec.get("team_name", "")) != str(opponent_team_name):
+                continue
+            for rid in spec.get("robot_ids", []) or []:
+                goalie_ids.append(int(rid))
+        return goalie_ids
 
     def setup_environment(
         self,

@@ -124,8 +124,13 @@ def parse_args() -> argparse.Namespace:
              "embedded simulator.",
     )
     parser.add_argument("--debug_infer", action="store_true")
-    parser.add_argument("--ppo_stochastic", action="store_true",
-                        help="PPO JAL: forward --ppo_stochastic (sample primitive + params).")
+    parser.add_argument("--ppo_stochastic", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="PPO JAL: forward --ppo_stochastic (sample the discrete "
+                             "primitive + params), matching how the policy trained. ON by "
+                             "default — argmax-primitive inference makes PPO-JAL lock onto "
+                             "dribble_to, hold the catch-glued ball and dead-ball-freeze. "
+                             "Use --no-ppo_stochastic to force argmax (debugging only).")
     parser.add_argument("--ppo_param_noise_std", type=float, default=None,
                         help="PPO JAL: override the turn param-noise std forwarded to "
                              "infer.py. If unset, infer.py's default (0.3) applies.")

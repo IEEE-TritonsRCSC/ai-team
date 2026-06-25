@@ -1,0 +1,161 @@
+diff --git a/rcssserver-19.0.0/src/player.cpp b/rcssserver-19.0.0/src/player.cpp
+index aaf6502..5efca90 100644
+--- a/rcssserver-19.0.0/src/player.cpp
++++ b/rcssserver-19.0.0/src/player.cpp
+@@ -1249,8 +1249,6 @@ Player::applyDashEffect()
+         M_angle_body = normalize_angle( angleBodyCommitted()
+                                         + ( 1.0 + drand( -M_randp, M_randp ) ) * omega );
+     }
+-
+-    M_stamina = std::max( 0.0, stamina() - consumed_stamina );
+ }
+ 
+ // void
+@@ -1341,10 +1339,22 @@ Player::kick( double power,
+         return;
+     }
+ 
+-    if ( ! ballKickable() )
++    if ( ! ballKickableInFrontReceptionCone() )
+     {
+         M_state |= KICK_FAULT;
+         M_stadium.failedKickTaken( *this );
++        // A kick attempt always relinquishes a dribble catch-glue, even when the
++        // ball is outside the front reception cone. The accepted-kick path clears
++        // the catcher via Stadium::kickTaken(); without the mirror here a
++        // cone-rejected kick leaves the ball glued while the Python command
++        // tracker treats any `kick` as a release, desyncing the two. That stale
++        // catcher then re-pins the held ball to the carrier on the next episode
++        // reset, tripping the ball_teleport guard and bricking every following
++        // episode (all 1-step). See docs/TRAINING.md teleport-brick analysis.
++        if ( this == M_stadium.ballCatcher() )
++        {
++            M_stadium.clearBallCatcher();
++        }
+         return;
+     }
+ 
+@@ -1519,6 +1529,28 @@ Player::doLongKick()
+     ++M_kick_count;
+ }
+ 
++void
++Player::drop()
++{
++    // Release a held ball. The catch-glue patch re-pins the ball to the
++    // stadium's ball catcher every cycle (Stadium step), for goalie catches
++    // and for the field-player dribble grab alike. Clearing the catcher stops
++    // that re-pinning, so the ball is genuinely released at its current
++    // position and the player loses possession. Body command: mutually
++    // exclusive with kick/dash/catch in a cycle.
++    if ( M_command_done )
++    {
++        return;
++    }
++
++    M_command_done = true;
++
++    if ( this == M_stadium.ballCatcher() )
++    {
++        M_stadium.clearBallCatcher();
++    }
++}
++
+ void
+ Player::goalieCatch( double dir )
+ {
+@@ -1535,11 +1567,11 @@ Player::goalieCatch( double dir )
+     //pfr: we should only be able to catch in PlayOn mode
+     //tom: actually the goalie can catch the ball in any playmode, but
+     //infringements should be awarded.  Maybe later.
+-    if ( ! this->isGoalie()
+-         || M_goalie_catch_ban > 0
++    if ( this->isGoalie() &&
++         ( M_goalie_catch_ban > 0
+          || ( M_stadium.playmode() != PM_PlayOn
+               && ! Referee::isPenaltyShootOut( M_stadium.playmode() ) )
+-         )
++         ))
+     {
+         M_state |= CATCH_FAULT;
+         return;
+@@ -1661,17 +1693,26 @@ Player::goalieCatch( double dir )
+ 
+     if ( success )
+     {
+-        PVector new_pos = M_stadium.ball().pos() - this->pos();
+-        double mag = new_pos.r();
+-        // I would much prefer to cache the message of the catch command
+-        // to the end of the cycle and then do all the movements and
+-        // playmode changes there, but I feel that would be too much of a
+-        // depature from the current behaviour.
+-        mag -= SP.ballSize() + M_player_type->playerSize();
+-        new_pos.normalize( mag );
+-        M_pos += new_pos;
+-        M_angle_body = new_pos.th();
+-        M_vel = PVector();
++        // Preserve the stock goalie catch correction, but do not teleport or
++        // rotate a field player. Field-player catches are used by the ssim
++        // dribble glue; their pose must remain the result of explicit dash/turn
++        // commands so simulation does not provide motion unavailable to a real
++        // robot. Stadium::ballCaught() still establishes ownership and
++        // Stadium::incMovableObjects() keeps the caught ball in front.
++        if ( this->isGoalie() )
++        {
++            PVector new_pos = M_stadium.ball().pos() - this->pos();
++            double mag = new_pos.r();
++            // I would much prefer to cache the message of the catch command
++            // to the end of the cycle and then do all the movements and
++            // playmode changes there, but I feel that would be too much of a
++            // depature from the current behaviour.
++            mag -= SP.ballSize() + M_player_type->playerSize();
++            new_pos.normalize( mag );
++            M_pos += new_pos;
++            M_angle_body = new_pos.th();
++            M_vel = PVector();
++        }
+ 
+         M_stadium.ballCaught( *this );
+     }
+@@ -2736,6 +2777,21 @@ Player::ballKickable() const
+     return pos().distance2( M_stadium.ball().pos() ) <= std::pow( kickableArea(), 2 );
+ }
+ 
++bool
++Player::ballKickableInFrontReceptionCone() const
++{
++    if ( ! ballKickable() )
++    {
++        return false;
++    }
++
++    // Mechanical reception angle for the ball center. The wider CAD angle is
++    // measured at the outside of the ball radius and should not be used here.
++    static constexpr double FRONT_RECEPTION_CENTER_ANGLE_DEG = 100.0;
++    return std::fabs( angleFromBody( M_stadium.ball() ) )
++        <= Deg2Rad( FRONT_RECEPTION_CENTER_ANGLE_DEG * 0.5 );
++}
++
+ double
+ Player::foulDetectProbability() const
+ {
+diff --git a/rcssserver-19.0.0/src/player.h b/rcssserver-19.0.0/src/player.h
+index 0e3d017..95a5350 100644
+--- a/rcssserver-19.0.0/src/player.h
++++ b/rcssserver-19.0.0/src/player.h
+@@ -321,6 +321,7 @@ public:
+ 
+     double kickableArea() const;
+     bool ballKickable() const;
++    bool ballKickableInFrontReceptionCone() const;
+ 
+     double foulDetectProbability() const;
+ 
+@@ -496,6 +497,7 @@ private:
+     void kick( double power, double dir ) override;
+     void long_kick( double power, double dir ) override;
+     void goalieCatch( double dir ) override;
++    void drop() override;
+     void say( std::string message ) override;
+     /*! This function is called in the begin of each cycle
+       and in case a player sends a sense_body command. */

@@ -186,6 +186,27 @@ def shoot(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | 
 
     angle_to_target = np.arctan2(target[1] - self_pose[1], target[0] - self_pose[0])
     return kick(self_pose, ball_pose, angle_to_target, kick_power, dribbling=dribbling)
+
+
+def ball_in_front_reception_cone(
+    self_pose: np.ndarray | Tuple | List,
+    ball_pose: np.ndarray | Tuple | List,
+    *,
+    kickable_tolerance: float = KICKABLE_MARGIN + PLAYER_SIZE + BALL_SIZE,
+    reception_angle_deg: float = FRONT_RECEPTION_CENTER_ANGLE_DEG,
+) -> bool:
+    """Return true when the ball center is kickable in the physical front mouth."""
+
+    self_pose = _as_float_array(self_pose)
+    ball_pose = _as_float_array(ball_pose)
+    delta = ball_pose[:2] - self_pose[:2]
+    if float(np.linalg.norm(delta)) > kickable_tolerance:
+        return False
+    ball_dir = float(np.arctan2(delta[1], delta[0]))
+    rel_angle = normalize_angle(ball_dir - float(self_pose[2]))
+    half_angle = math.radians(float(reception_angle_deg) * 0.5)
+    return abs(rel_angle) <= half_angle
+
     
 def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | List, 
          target_angle: float, kick_power: float = 100.0, dribbling=False, ) -> str:
@@ -198,6 +219,8 @@ def kick(self_pose: np.ndarray | Tuple | List, ball_pose: np.ndarray | Tuple | L
     """
     self_pose = _as_float_array(self_pose)
     ball_pose = _as_float_array(ball_pose)
+    if not ball_in_front_reception_cone(self_pose, ball_pose):
+        return "failed"
     angle_diff = normalize_angle(target_angle - self_pose[2])
     if np.abs(angle_diff) > math.radians(5.0):
         if dribbling:

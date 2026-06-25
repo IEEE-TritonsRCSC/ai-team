@@ -119,6 +119,10 @@ class RewardConfig:
     # policy only gets credit when the target genuinely improves the shooting
     # angle. quality_delta = gap(target) - gap(current), clamped to [0, 1].
     dribble_target_quality_weight: float = 0.0
+    # Per-possession carry limit used for reward lookahead and the dribble_to
+    # macro. The simulator field is 10 units per SSL meter, so 8.5 units keeps
+    # a 1 m dribble safely under the 10-unit excessive-dribbling limit.
+    dribble_segment_limit: float = 0.85
     # Small per-step reward while dribble_to is active AND the target has
     # positive quality delta. Sustains reward signal across multi-step
     # transport so the value function doesn't over-discount. 0.0 disables.
@@ -212,6 +216,17 @@ class RewardConfig:
     # When True, the combo bonus is scaled by the kick's actual aim quality at
     # fire time. Prevents "dribble then wild kick" from farming the bonus.
     post_dribble_kick_quality_scale: bool = False
+    # Stage 3 release-timing pressure. Once a verified carry is open, give the
+    # policy a short grace window to finish the segment and shoot; after that,
+    # subtract carry_urgency_penalty_per_step up to carry_urgency_penalty_max.
+    # This specifically targets long post-carry stalls without changing lane
+    # discovery reward.
+    carry_urgency_grace_steps: int = 0
+    carry_urgency_penalty_per_step: float = 0.0
+    carry_urgency_penalty_max: float = 0.0
+    # Repeated opponent defense-area touches are treated as a serious training
+    # failure after this many attacker-caused touches in one episode. 0 disables.
+    defense_area_touch_terminal_count: int = 0
 
     # ---- Stage 2: keeper catch-zone suppression ----
     # positional_gap_quality (which scales kick_aim, the combo, dribble target-
@@ -555,17 +570,59 @@ def lane_clear_quality(
     return float(max(0.0, min(1.0, d / float(block_dist))))
 
 
+def safe_goal_target_ys(
+    goal_half_height: float,
+    safety_margin: float = 0.0,
+    target_y: float = 0.0,
+) -> Tuple[float, ...]:
+    """Return safe in-mouth target y candidates used for defender-lane scoring."""
+
+    safe_edge = max(0.0, float(goal_half_height) - max(0.0, float(safety_margin)))
+    target_mag = abs(float(target_y))
+    if target_mag <= 1e-6:
+        target_mag = min(safe_edge, float(goal_half_height) * 0.8)
+    else:
+        target_mag = min(target_mag, safe_edge)
+
+    candidates = [0.0]
+    if target_mag > 1e-6:
+        candidates.extend([-target_mag, target_mag])
+    unique = []
+    for y in candidates:
+        if not any(math.isclose(y, existing, abs_tol=1e-9) for existing in unique):
+            unique.append(float(y))
+    return tuple(unique)
+
+
+def best_defender_lane_quality(
+    point: Tuple[float, float],
+    defender_pos: Optional[Tuple[float, float]],
+    block_dist: float,
+    goal_half_height: float,
+    safety_margin: float = 0.0,
+    target_y: float = 0.0,
+) -> float:
+    """Best lane clearance from point to any safe in-mouth shot target."""
+
+    return float(max(
+        lane_clear_quality(point, (FIELD_X[1], y), defender_pos, block_dist)
+        for y in safe_goal_target_ys(goal_half_height, safety_margin, target_y)
+    ))
+
+
 def positional_shot_quality(
     point: Tuple[float, float],
     goalie_y: float,
     defender_pos: Optional[Tuple[float, float]],
     goal_half_height: float,
     lane_block_dist: float,
+    goal_post_safety_margin: float = 0.0,
+    target_y: float = 0.0,
 ) -> float:
-    """Keeper-gap quality of a shot from `point`, discounted by the defender lane.
+    """Keeper-gap quality of a shot from `point`, discounted by defender lanes.
 
     Combines `positional_gap_quality` (lateral separation from the keeper) with
-    `lane_clear_quality` for the straight lane from `point` to the goal centre.
+    the best clear lane from `point` to safe in-mouth target candidates.
     Used to score dribble_to targets in Stage 3: a good target is one that is
     BOTH off the keeper's cover AND off the defender's covered lane.
     """
@@ -573,7 +630,14 @@ def positional_shot_quality(
     base = positional_gap_quality(point, goalie_y, goal_half_height)
     if base <= 0.0:
         return 0.0
-    lane = lane_clear_quality(point, (FIELD_X[1], 0.0), defender_pos, lane_block_dist)
+    lane = best_defender_lane_quality(
+        point,
+        defender_pos,
+        lane_block_dist,
+        goal_half_height,
+        goal_post_safety_margin,
+        target_y,
+    )
     return float(base * lane)
 
 
@@ -687,10 +751,12 @@ def calculate_reward_intermediates(
             current_q = positional_shot_quality(
                 inputs.ball_pos, inputs.goalie_y, inputs.defender_pos,
                 config.goal_half_height, config.defender_lane_block_dist,
+                config.goal_post_safety_margin, config.kick_keeper_away_target_y,
             )
             target_q = positional_shot_quality(
                 inputs.dribble_target, inputs.goalie_y, inputs.defender_pos,
                 config.goal_half_height, config.defender_lane_block_dist,
+                config.goal_post_safety_margin, config.kick_keeper_away_target_y,
             )
         else:
             current_q = positional_gap_quality(
