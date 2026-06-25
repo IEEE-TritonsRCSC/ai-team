@@ -1027,6 +1027,14 @@ class JALTeamEnv(gym.Env):
         )
         if dribble_quality_weight > 0.0 and current_game_state is not None:
             gs_ball_pos = getattr(current_game_state, "ball_pos", None)
+            dq_defender_xy = (
+                self._opponent_defender_pose(current_game_state)
+                if use_defender_gate else None
+            )
+            dq_defender_pt = (
+                (float(dq_defender_xy[0]), float(dq_defender_xy[1]))
+                if dq_defender_xy is not None else None
+            )
             for info_i in action_info.get("per_robot", []):
                 if not info_i.get("dribble_committed"):
                     continue
@@ -1040,20 +1048,34 @@ class JALTeamEnv(gym.Env):
                     )
                     continue
                 gk_y_val = float(gk_pose[1])
-                current_gap = positional_gap_quality(
-                    (float(gs_ball_pos[0]), float(gs_ball_pos[1])),
-                    gk_y_val, goal_half_height,
-                )
-                raw_delta, reachable_target = reachable_gap_delta(
+                if dq_defender_pt is not None:
+                    current_gap = positional_shot_quality(
+                        (float(gs_ball_pos[0]), float(gs_ball_pos[1])),
+                        gk_y_val, dq_defender_pt,
+                        goal_half_height, defender_lane_block_dist,
+                    )
+                else:
+                    current_gap = positional_gap_quality(
+                        (float(gs_ball_pos[0]), float(gs_ball_pos[1])),
+                        gk_y_val, goal_half_height,
+                    )
+                _keeper_delta, reachable_target = reachable_gap_delta(
                     (float(gs_ball_pos[0]), float(gs_ball_pos[1])),
                     target,
                     gk_y_val,
                     goal_half_height,
                     segment_limit=0.85,
                 )
-                target_gap = positional_gap_quality(
-                    reachable_target, gk_y_val, goal_half_height,
-                )
+                if dq_defender_pt is not None:
+                    target_gap = positional_shot_quality(
+                        reachable_target, gk_y_val, dq_defender_pt,
+                        goal_half_height, defender_lane_block_dist,
+                    )
+                else:
+                    target_gap = positional_gap_quality(
+                        reachable_target, gk_y_val, goal_half_height,
+                    )
+                raw_delta = target_gap - current_gap
                 kz_tq = self._keeper_zone_factor(reachable_target, gk_pose)
                 self.logger.info(
                     "Dribble target committed: rid=%s current_gap=%.3f "
@@ -1084,14 +1106,29 @@ class JALTeamEnv(gym.Env):
         if achieved_gap_weight > 0.0 and current_game_state is not None:
             ag_ball_pos = getattr(current_game_state, "ball_pos", None)
             ag_gk_pose = self._opponent_goalie_pose(current_game_state)
+            ag_defender_xy = (
+                self._opponent_defender_pose(current_game_state)
+                if use_defender_gate else None
+            )
+            ag_defender_pt = (
+                (float(ag_defender_xy[0]), float(ag_defender_xy[1]))
+                if ag_defender_xy is not None else None
+            )
             for info_i in action_info.get("per_robot", []):
                 rid = info_i.get("robot_id")
                 if rid is None or ag_ball_pos is None or ag_gk_pose is None:
                     continue
-                ball_gap_now = positional_gap_quality(
-                    (float(ag_ball_pos[0]), float(ag_ball_pos[1])),
-                    float(ag_gk_pose[1]), goal_half_height,
-                )
+                if ag_defender_pt is not None:
+                    ball_gap_now = positional_shot_quality(
+                        (float(ag_ball_pos[0]), float(ag_ball_pos[1])),
+                        float(ag_gk_pose[1]), ag_defender_pt,
+                        goal_half_height, defender_lane_block_dist,
+                    )
+                else:
+                    ball_gap_now = positional_gap_quality(
+                        (float(ag_ball_pos[0]), float(ag_ball_pos[1])),
+                        float(ag_gk_pose[1]), goal_half_height,
+                    )
                 if info_i.get("carry_started"):
                     self.dribble_carry_start_gap[rid] = ball_gap_now
                     self.logger.info(
