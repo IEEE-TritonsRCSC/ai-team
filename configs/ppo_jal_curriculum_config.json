@@ -791,11 +791,19 @@
                 "post_dribble_kick_combo_window": 8,
                 "post_dribble_kick_quality_scale": true,
                 "kick_near_goalie_penalty": 1.0,
-                "opponent_near_ball_penalty": -0.5,
+                "opponent_near_ball_penalty": -0.3,
                 "use_defender_lane_gate": true,
                 "defender_lane_block_dist": 2.6,
                 "defender_lane_penalty": 0.5,
-                "defender_lane_min_quality": 0.3
+                "defender_lane_min_quality": 0.3,
+                "spread_bonus": 0.04,
+                "spread_min_dist": 6.0,
+                "redundant_chase_penalty": 0.08,
+                "redundant_chase_dist": 3.5,
+                "support_position_bonus": 0.05,
+                "support_position_max_dist": 25.0,
+                "support_position_min_angle_deg": 25.0,
+                "possession_transfer_bonus": 5.0
             }
         },
         "stage5_3v3": {

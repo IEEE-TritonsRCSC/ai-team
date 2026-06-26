@@ -43,6 +43,10 @@ class SSLRuleConfig:
     defense_area_touch_penalty: float = -8.0
     defense_area_touch_terminal_count: int = 0
     opponent_goalie_ids: Tuple[int, ...] = ()
+    teammate_crash_penalty: float = -6.0
+    teammate_crash_cooldown_steps: int = 25
+    teammate_proximity_penalty: float = -0.15
+    teammate_proximity_dist: float = 1.8
 
 
 @dataclass(frozen=True)
@@ -373,6 +377,51 @@ class SSLRuleTracker:
         for pair, cooldown in list(self.state.crash_cooldowns.items()):
             self.state.crash_cooldowns[pair] = max(0, cooldown - 1)
         self.state.active_contacts = current_contacts
+
+        # Teammate crash / proximity detection (Stage 4+: multi-robot)
+        for i, rid_a in enumerate(attacker_ids):
+            pose_a_now = own_now.get(rid_a)
+            pose_a_prev = own_prev.get(rid_a)
+            if pose_a_now is None or pose_a_prev is None:
+                continue
+            xy_a_now = _xy(pose_a_now)
+            xy_a_prev = _xy(pose_a_prev)
+            for rid_b in attacker_ids[i + 1:]:
+                pose_b_now = own_now.get(rid_b)
+                pose_b_prev = own_prev.get(rid_b)
+                if pose_b_now is None or pose_b_prev is None:
+                    continue
+                xy_b_now = _xy(pose_b_now)
+                xy_b_prev = _xy(pose_b_prev)
+                teammate_dist = _dist(xy_a_now, xy_b_now)
+                tm_pair = (min(rid_a, rid_b), max(rid_a, rid_b))
+
+                if teammate_dist <= self.config.robot_contact_dist:
+                    cooldown = self.state.crash_cooldowns.get(tm_pair, 0)
+                    if cooldown <= 0:
+                        normal = _unit(_sub(xy_a_now, xy_b_now))
+                        rel_v = _sub(
+                            _sub(xy_a_now, xy_a_prev),
+                            _sub(xy_b_now, xy_b_prev),
+                        )
+                        projected = abs(_dot(rel_v, normal))
+                        if projected > self.config.crash_speed_threshold:
+                            events.append(SSLRuleEvent(
+                                "teammate_crash",
+                                penalty=self.config.teammate_crash_penalty,
+                                details={"robots": tm_pair, "projected_speed": projected},
+                            ))
+                            self.state.crash_cooldowns[tm_pair] = self.config.teammate_crash_cooldown_steps
+
+                if (
+                    self.config.teammate_proximity_penalty < 0.0
+                    and teammate_dist <= self.config.teammate_proximity_dist
+                ):
+                    events.append(SSLRuleEvent(
+                        "teammate_proximity",
+                        penalty=self.config.teammate_proximity_penalty,
+                        details={"robots": tm_pair, "dist": teammate_dist},
+                    ))
 
         dribble = update_excessive_dribble(
             self.state, attacker_ball_contact, ball_pos, self.config,

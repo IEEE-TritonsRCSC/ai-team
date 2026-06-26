@@ -886,6 +886,17 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                 "Aux controller: defender team=%s robot_id=%d side=%s",
                 spec_team, int(robot_ids[0]), side,
             )
+        elif controller_type == "marker_defender":
+            from ai_interface.trainers.policy_control import MarkerDefenderCommandProvider
+            ball_defender_robot_id = int(spec.get("ball_defender_robot_id", 2))
+            aux_controllers.append(MarkerDefenderCommandProvider(
+                team_name=spec_team, robot_id=int(robot_ids[0]), side=side,
+                ball_defender_robot_id=ball_defender_robot_id,
+            ))
+            _SUMMARY_LOG.info(
+                "Aux controller: marker_defender team=%s robot_id=%d side=%s ball_def=%d",
+                spec_team, int(robot_ids[0]), side, ball_defender_robot_id,
+            )
         elif controller_type == "frozen_ppo":
             from ai_interface.trainers.policy_control import (
                 FrozenPPOJALPolicySpec,
