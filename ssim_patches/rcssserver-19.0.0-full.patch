@@ -1,0 +1,672 @@
+--- a/rcssserver-19.0.0/src/player.cpp
++++ b/rcssserver-19.0.0/src/player.cpp
+@@ -1249,8 +1249,6 @@
+         M_angle_body = normalize_angle( angleBodyCommitted()
+                                         + ( 1.0 + drand( -M_randp, M_randp ) ) * omega );
+     }
+-
+-    M_stamina = std::max( 0.0, stamina() - consumed_stamina );
+ }
+ 
+ // void
+@@ -1341,10 +1339,22 @@
+         return;
+     }
+ 
+-    if ( ! ballKickable() )
++    if ( ! ballKickableInFrontReceptionCone() )
+     {
+         M_state |= KICK_FAULT;
+         M_stadium.failedKickTaken( *this );
++        // A kick attempt always relinquishes a dribble catch-glue, even when the
++        // ball is outside the front reception cone. The accepted-kick path clears
++        // the catcher via Stadium::kickTaken(); without the mirror here a
++        // cone-rejected kick leaves the ball glued while the Python command
++        // tracker treats any `kick` as a release, desyncing the two. That stale
++        // catcher then re-pins the held ball to the carrier on the next episode
++        // reset, tripping the ball_teleport guard and bricking every following
++        // episode (all 1-step). See docs/TRAINING.md teleport-brick analysis.
++        if ( this == M_stadium.ballCatcher() )
++        {
++            M_stadium.clearBallCatcher();
++        }
+         return;
+     }
+ 
+@@ -1520,6 +1530,28 @@
+ }
+ 
+ void
++Player::drop()
++{
++    // Release a held ball. The catch-glue patch re-pins the ball to the
++    // stadium's ball catcher every cycle (Stadium step), for goalie catches
++    // and for the field-player dribble grab alike. Clearing the catcher stops
++    // that re-pinning, so the ball is genuinely released at its current
++    // position and the player loses possession. Body command: mutually
++    // exclusive with kick/dash/catch in a cycle.
++    if ( M_command_done )
++    {
++        return;
++    }
++
++    M_command_done = true;
++
++    if ( this == M_stadium.ballCatcher() )
++    {
++        M_stadium.clearBallCatcher();
++    }
++}
++
++void
+ Player::goalieCatch( double dir )
+ {
+     if ( M_command_done )
+@@ -1535,11 +1567,11 @@
+     //pfr: we should only be able to catch in PlayOn mode
+     //tom: actually the goalie can catch the ball in any playmode, but
+     //infringements should be awarded.  Maybe later.
+-    if ( ! this->isGoalie()
+-         || M_goalie_catch_ban > 0
++    if ( this->isGoalie() &&
++         ( M_goalie_catch_ban > 0
+          || ( M_stadium.playmode() != PM_PlayOn
+               && ! Referee::isPenaltyShootOut( M_stadium.playmode() ) )
+-         )
++         ))
+     {
+         M_state |= CATCH_FAULT;
+         return;
+@@ -1661,17 +1693,26 @@
+ 
+     if ( success )
+     {
+-        PVector new_pos = M_stadium.ball().pos() - this->pos();
+-        double mag = new_pos.r();
+-        // I would much prefer to cache the message of the catch command
+-        // to the end of the cycle and then do all the movements and
+-        // playmode changes there, but I feel that would be too much of a
+-        // depature from the current behaviour.
+-        mag -= SP.ballSize() + M_player_type->playerSize();
+-        new_pos.normalize( mag );
+-        M_pos += new_pos;
+-        M_angle_body = new_pos.th();
+-        M_vel = PVector();
++        // Preserve the stock goalie catch correction, but do not teleport or
++        // rotate a field player. Field-player catches are used by the ssim
++        // dribble glue; their pose must remain the result of explicit dash/turn
++        // commands so simulation does not provide motion unavailable to a real
++        // robot. Stadium::ballCaught() still establishes ownership and
++        // Stadium::incMovableObjects() keeps the caught ball in front.
++        if ( this->isGoalie() )
++        {
++            PVector new_pos = M_stadium.ball().pos() - this->pos();
++            double mag = new_pos.r();
++            // I would much prefer to cache the message of the catch command
++            // to the end of the cycle and then do all the movements and
++            // playmode changes there, but I feel that would be too much of a
++            // depature from the current behaviour.
++            mag -= SP.ballSize() + M_player_type->playerSize();
++            new_pos.normalize( mag );
++            M_pos += new_pos;
++            M_angle_body = new_pos.th();
++            M_vel = PVector();
++        }
+ 
+         M_stadium.ballCaught( *this );
+     }
+@@ -2736,6 +2777,21 @@
+     return pos().distance2( M_stadium.ball().pos() ) <= std::pow( kickableArea(), 2 );
+ }
+ 
++bool
++Player::ballKickableInFrontReceptionCone() const
++{
++    if ( ! ballKickable() )
++    {
++        return false;
++    }
++
++    // Mechanical reception angle for the ball center. The wider CAD angle is
++    // measured at the outside of the ball radius and should not be used here.
++    static constexpr double FRONT_RECEPTION_CENTER_ANGLE_DEG = 100.0;
++    return std::fabs( angleFromBody( M_stadium.ball() ) )
++        <= Deg2Rad( FRONT_RECEPTION_CENTER_ANGLE_DEG * 0.5 );
++}
++
+ double
+ Player::foulDetectProbability() const
+ {
+--- a/rcssserver-19.0.0/src/player.h
++++ b/rcssserver-19.0.0/src/player.h
+@@ -321,6 +321,7 @@
+ 
+     double kickableArea() const;
+     bool ballKickable() const;
++    bool ballKickableInFrontReceptionCone() const;
+ 
+     double foulDetectProbability() const;
+ 
+@@ -496,6 +497,7 @@
+     void kick( double power, double dir ) override;
+     void long_kick( double power, double dir ) override;
+     void goalieCatch( double dir ) override;
++    void drop() override;
+     void say( std::string message ) override;
+     /*! This function is called in the begin of each cycle
+       and in case a player sends a sense_body command. */
+--- a/rcssserver-19.0.0/src/stadium.cpp
++++ b/rcssserver-19.0.0/src/stadium.cpp
+@@ -74,6 +74,8 @@
+       M_time( 0 ),
+       M_stoppage_time( 0 ),
+       M_ball_catcher( static_cast< const Player * >( 0 ) ),
++      M_last_catcher( static_cast< Player * >( 0 ) ),
++      M_ball_caught_loc( nullptr ),
+       M_kick_off_side( LEFT ),
+       M_last_playon_start( 0 ),
+       M_game_over_wait( 0 ),
+@@ -865,14 +867,6 @@
+     //
+     // update stamina etc
+     //
+-    for ( PlayerCont::reference p : M_players )
+-    {
+-        if ( ! p->isEnabled() ) continue;
+-
+-        p->updateStamina();
+-        p->updateCapacity();
+-    }
+-
+     if ( stoppageTime() == 0
+          && time() > 0
+          && ServerParam::instance().nrNormalHalfs() > 0
+@@ -912,6 +906,8 @@
+ void
+ Stadium::incMovableObjects()
+ {
++    const PVector ball_start = M_ball->pos();
++
+     std::shuffle( M_movable_objects.begin(), M_movable_objects.end(),
+                   DefaultRNG::instance() );
+     for ( MPObjectCont::reference o : M_movable_objects )
+@@ -922,17 +918,56 @@
+         }
+     }
+ 
++    snapBallToSweptPlayerCollision( ball_start, M_ball->pos() );
++
+     collisions();
+ 
+     // move_caughat_ball() [2000.07.21: I.Noda]
+     if ( M_ball_catcher )
+     {
+-        // keeps the caught ball infront of the player
+-        PVector rpos = PVector::fromPolar( M_ball_catcher->size()
+-                                           + ServerParam::instance().ballSize(),
+-                                           M_ball_catcher->angleBodyCommitted() );
+-        M_ball->moveTo( M_ball_catcher->pos() + rpos );
++        if ( ! M_ball_catcher->isEnabled() )
++        {
++            // ssim catch-glue: catcher disconnected/disabled mid-carry; stop
++            // pinning the ball to its stale off-field position.
++            clearBallCatcher();
++        }
++        else
++        {
++            // keeps the caught ball infront of the player
++            PVector rpos = PVector::fromPolar( M_ball_catcher->size()
++                                               + ServerParam::instance().ballSize(),
++                                               M_ball_catcher->angleBodyCommitted() );
++            const PVector target = M_ball_catcher->pos() + rpos;
++
++            // ssim catch-glue dispossession: pinning the carried ball to the
++            // carrier's front must not teleport it through an actively
++            // contesting opponent. Passive overlap alone is not enough to strip
++            // the carry; the defender must be close and facing or moving toward
++            // the carried ball.
++            bool stolen = false;
++            for ( PlayerCont::reference p : M_players )
++            {
++                if ( isActiveCarryContest( p, target ) )
++                {
++                    stolen = true;
++                    break;
++                }
++            }
++
++            if ( stolen )
++            {
++                clearBallCatcher();
++            }
++            else
++            {
++                M_ball->moveTo( target );
++            }
++        }
+     }
++
++    // ssim catch-glue: the carry foul that fired when a caught ball was moved
++    // too far from the catch location is removed here so a field-player dribble
++    // grab can carry the ball (released explicitly via the `drop` command).
+ }
+ 
+ 
+@@ -1720,7 +1755,128 @@
+     }
+ 
+ }
++
++bool
++Stadium::snapBallToSweptPlayerCollision( const PVector & ball_start,
++                                         const PVector & ball_end )
++{
++    if ( M_ball_catcher )
++    {
++        return false;
++    }
++
++    const PVector path = ball_end - ball_start;
++    const double path_len2 = path.r2();
++    if ( path_len2 < EPS )
++    {
++        return false;
++    }
+ 
++    Player * hit_player = static_cast< Player * >( 0 );
++    double hit_t = 2.0;
++    PVector hit_pos;
++
++    for ( PlayerCont::reference p : M_players )
++    {
++        if ( ! p->isEnabled()
++             || p == M_ball_catcher )
++        {
++            continue;
++        }
++
++        const double radius = M_ball->size() + p->size();
++        const double radius2 = radius * radius;
++        const PVector rel_start = ball_start - p->pos();
++
++        // If the ball already started inside the body radius, the normal
++        // endpoint collision path owns this case. The swept test is only for
++        // loose fast balls that tunnel from outside to past the player.
++        if ( rel_start.r2() < radius2 )
++        {
++            continue;
++        }
++
++        const double a = path_len2;
++        const double b = 2.0 * ( rel_start.x * path.x
++                                 + rel_start.y * path.y );
++        const double c = rel_start.r2() - radius2;
++        const double disc = b * b - 4.0 * a * c;
++        if ( disc < 0.0 )
++        {
++            continue;
++        }
++
++        const double t = ( -b - std::sqrt( disc ) ) / ( 2.0 * a );
++        if ( t <= EPS
++             || t > 1.0
++             || t >= hit_t )
++        {
++            continue;
++        }
++
++        hit_t = t;
++        hit_player = p;
++        hit_pos.assign( ball_start.x + path.x * t,
++                        ball_start.y + path.y * t );
++    }
++
++    if ( ! hit_player )
++    {
++        return false;
++    }
++
++    // Place the ball just inside the crossed collision shell so the existing
++    // discrete collision resolver detects it and applies the native damped
++    // ball-player bounce. This avoids a second, custom bounce model.
++    PVector inward = hit_player->pos() - hit_pos;
++    if ( inward.r2() < EPS )
++    {
++        inward = path;
++    }
++    inward.normalize( std::min( 1.0e-4, std::sqrt( path_len2 ) ) );
++    M_ball->moveTo( hit_pos + inward );
++    return true;
++}
++
++bool
++Stadium::isActiveCarryContest( const Player * player,
++                               const PVector & carried_ball_pos ) const
++{
++    if ( ! player
++         || ! M_ball_catcher
++         || ! player->isEnabled()
++         || player == M_ball_catcher
++         || player->side() == M_ball_catcher->side() )
++    {
++        return false;
++    }
++
++    const double contest_radius = ServerParam::instance().ballSize()
++        + player->size();
++    if ( carried_ball_pos.distance2( player->pos() )
++         >= contest_radius * contest_radius )
++    {
++        return false;
++    }
++
++    const PVector to_ball = carried_ball_pos - player->pos();
++    if ( to_ball.r2() < EPS )
++    {
++        return true;
++    }
++
++    const double face_error = std::fabs(
++        normalize_angle( to_ball.th() - player->angleBodyCommitted() ) );
++    if ( face_error <= Deg2Rad( 75.0 ) )
++    {
++        return true;
++    }
++
++    const PVector player_vel = player->vel();
++    return ( player_vel.r2() > 0.0025
++             && ( player_vel.x * to_ball.x + player_vel.y * to_ball.y ) > 0.0 );
++}
++
+ void
+ Stadium::calcBallCollisionPos( Player * p )
+ {
+@@ -1943,9 +2099,10 @@
+               {
+                   ref->ballCaught( catcher );
+               } );
+-
++    
+     if ( playmode() == PM_FreeKick_Left
+-         || playmode() == PM_FreeKick_Right )
++         || playmode() == PM_FreeKick_Right 
++         || catcher.isGoalie() == false)
+     {
+         M_ball_catcher = &catcher;
+     }
+--- a/rcssserver-19.0.0/src/stadium.h
++++ b/rcssserver-19.0.0/src/stadium.h
+@@ -120,6 +120,8 @@
+ 
+ 
+     const Player * M_ball_catcher; /* goalie who has caught ball */
++    Player * M_last_catcher; /* last player who caught ball */
++    PVector * M_ball_caught_loc; /* location where the ball was caught */
+ 
+     Side M_kick_off_side;
+ 
+@@ -267,8 +269,28 @@
+     void clearBallCatcher()
+       {
+           M_ball_catcher = static_cast< Player * >( 0 );
++      }
++
++    void setLastCatcher( Player * player )
++      {
++          if ( M_last_catcher == player ) return;
++          M_last_catcher = player;
++          PVector ball_pos = M_ball->pos();
++          M_ball_caught_loc = new PVector( ball_pos.x, ball_pos.y );
++      }
++
++    void clearLastCatcher()
++      {
++          M_last_catcher = static_cast< Player * >( 0 );
++          delete M_ball_caught_loc;
++          M_ball_caught_loc = nullptr;
+       }
+ 
++    PVector * ballCaughtLocation() const
++      {
++          return M_ball_caught_loc;
++      }
++
+     Side kickOffSide() const
+       {
+           return M_kick_off_side;
+@@ -431,6 +453,10 @@
+ 
+ private:
+ 
++    bool snapBallToSweptPlayerCollision( const PVector & ball_start,
++                                         const PVector & ball_end );
++    bool isActiveCarryContest( const Player * player,
++                               const PVector & carried_ball_pos ) const;
+     void calcBallCollisionPos( Player * p );
+     void calcCollisionPos( MPObject * a,
+                            MPObject * b );
+--- a/rcssserver-19.0.0/src/referee.cpp
++++ b/rcssserver-19.0.0/src/referee.cpp
+@@ -2477,7 +2477,7 @@
+ void
+ CatchRef::ballCaught( const Player & catcher )
+ {
+-    if ( isPenaltyShootOut( M_stadium.playmode() ) )
++    if ( catcher.isGoalie() == false  || isPenaltyShootOut( M_stadium.playmode() ) )
+     {
+         return;
+     }
+@@ -2533,7 +2533,7 @@
+ void
+ CatchRef::ballPunched( const Player & catcher )
+ {
+-    if ( isPenaltyShootOut( M_stadium.playmode() ) )
++    if ( catcher.isGoalie() == false || isPenaltyShootOut( M_stadium.playmode() ) )
+     {
+         return;
+     }
+@@ -2666,6 +2666,7 @@
+ 
+ 
+     if ( M_stadium.ballCatcher()
++         && M_stadium.ballCatcher()->isGoalie()
+          && pm != PM_AfterGoal_Left
+          && pm != PM_AfterGoal_Right
+          && pm != PM_TimeOver
+--- a/rcssserver-19.0.0/src/referee.h
++++ b/rcssserver-19.0.0/src/referee.h
+@@ -784,10 +784,11 @@
+     void analyse() override;
+ 
+     void playModeChange( PlayMode pm ) override;
++
++    void callFoul( const Player & tackler );
+ 
+ private:
+ 
+-    void callFoul( const Player & tackler );
+     void callYellowCard( const Player & tackler );
+     void callRedCard( const Player & tackler );
+ 
+--- a/rcssserver-19.0.0/src/serverparam.cpp
++++ b/rcssserver-19.0.0/src/serverparam.cpp
+@@ -129,18 +129,18 @@
+ const int ServerParam::HALF_TIME = 300;
+ const int ServerParam::DROP_TIME = 100;
+ 
+-const double ServerParam::PITCH_LENGTH = 105.0;
+-const double ServerParam::PITCH_WIDTH = 68.0;
+-const double ServerParam::PITCH_MARGIN = 5.0;
+-const double ServerParam::CENTER_CIRCLE_R = 9.15;
+-const double ServerParam::PENALTY_AREA_LENGTH = 16.5;
+-const double ServerParam::PENALTY_AREA_WIDTH = 40.32;
+-const double ServerParam::GOAL_AREA_LENGTH = 5.5;
+-const double ServerParam::GOAL_AREA_WIDTH = 18.32;
+-const double ServerParam::GOAL_WIDTH = 14.02;
+-const double ServerParam::GOAL_DEPTH = 2.44;
++const double ServerParam::PITCH_LENGTH = 90.0;
++const double ServerParam::PITCH_WIDTH = 60.0;
++const double ServerParam::PITCH_MARGIN = 3.0;
++const double ServerParam::CENTER_CIRCLE_R = 5.0;
++const double ServerParam::PENALTY_AREA_LENGTH = 10.0;
++const double ServerParam::PENALTY_AREA_WIDTH = 20.0;
++const double ServerParam::GOAL_AREA_LENGTH = 3.6;
++const double ServerParam::GOAL_AREA_WIDTH = 12.5;
++const double ServerParam::GOAL_WIDTH = 10.0;
++const double ServerParam::GOAL_DEPTH = 1.8;
+ const double ServerParam::PENALTY_SPOT_DIST = 11.0;
+-const double ServerParam::CORNER_ARC_R = 1.0;
++const double ServerParam::CORNER_ARC_R = 0.0;
+ const double ServerParam::KICK_OFF_CLEAR_DISTANCE = CENTER_CIRCLE_R;
+ 
+ const double ServerParam::CORNER_KICK_MARGIN = 1.0;
+@@ -148,18 +148,18 @@
+ const double ServerParam::KEEPAWAY_LENGTH = 20.0;
+ const double ServerParam::KEEPAWAY_WIDTH = 20.0;
+ 
+-const double ServerParam::BALL_SIZE = 0.085;
++const double ServerParam::BALL_SIZE = 0.215;
+ const double ServerParam::BALL_DECAY = 0.94;
+-const double ServerParam::BALL_RAND = 0.05;
++const double ServerParam::BALL_RAND = 0.01;
+ const double ServerParam::BALL_WEIGHT = 0.2;
+ const double ServerParam::BALL_T_VEL = 0.001;
+-const double ServerParam::BALL_SPEED_MAX = 3.0; // [12.0.0] 2.7 -> 3.0;
+-const double ServerParam::BALL_ACCEL_MAX = 2.7;
++const double ServerParam::BALL_SPEED_MAX = 4.0; // real-robot cap: 4 m/s (1 unit/cycle = 1 m/s); covers kick + pass
++const double ServerParam::BALL_ACCEL_MAX = 4.0; // a single kick impulse cannot exceed the 4 m/s cap
+ 
+-const double ServerParam::PLAYER_SIZE = 0.3;
++const double ServerParam::PLAYER_SIZE = 0.9;
+ const double ServerParam::PLAYER_WIDGET_SIZE = 1.0;
+ const double ServerParam::PLAYER_DECAY = 0.4;
+-const double ServerParam::PLAYER_RAND = 0.1;
++const double ServerParam::PLAYER_RAND = 0.05;
+ const double ServerParam::PLAYER_WEIGHT = 60.0;
+ const double ServerParam::PLAYER_SPEED_MAX = 1.05; // [13.0.0] 1.2 -> 1.05
+ // th 6.3.00
+@@ -178,7 +178,7 @@
+ const double ServerParam::EFFORT_INC_THR = 0.6;
+ const double ServerParam::EFFORT_INC = 0.01;
+ 
+-const double ServerParam::KICK_RAND = 0.1; // [12.0.0] 0.0 -> 0.1
++const double ServerParam::KICK_RAND = 0.01; // [12.0.0] 0.0 -> 0.1
+ const double ServerParam::PRAND_FACTOR_L = 1.0;
+ const double ServerParam::PRAND_FACTOR_R = 1.0;
+ const double ServerParam::KICK_RAND_FACTOR_L = 1.0;
+@@ -196,7 +196,7 @@
+ const double ServerParam::AUDIO_CUT_OFF_DIST = 50.0;
+ 
+ const double ServerParam::DASHPOWERRATE = 0.006;
+-const double ServerParam::KICKPOWERRATE = 0.027;
++const double ServerParam::KICKPOWERRATE = 0.04; // power 100 -> 4.0 accel = real-robot max kick of 4 m/s
+ const double ServerParam::MAXPOWER = 100.0;
+ const double ServerParam::MINPOWER = -100.0;
+ 
+@@ -207,8 +207,8 @@
+ const double ServerParam::LAND_QSTEP = 0.01;
+ const double ServerParam::DIR_QSTEP = 0.1;
+ 
+-const double ServerParam::MAXMOMENT = 180;
+-const double ServerParam::MINMOMENT = -180;
++const double ServerParam::MAXMOMENT = 2.0;  // real-robot angular-velocity cap: 2 deg/cycle * 10 cycles/s = 20 deg/s
++const double ServerParam::MINMOMENT = -2.0;
+ 
+ const double ServerParam::MAX_NECK_MOMENT = 180;
+ const double ServerParam::MIN_NECK_MOMENT = -180;
+@@ -245,11 +245,11 @@
+ const int ServerParam::GAME_LOGGING = true;
+ const int ServerParam::GAME_LOG_VERSION = DEFAULT_REC_VERSION;
+ #ifdef RCSS_WIN
+-const std::string ServerParam::TEXT_LOG_DIR = ".\\";
+-const std::string ServerParam::GAME_LOG_DIR = ".\\";
++const std::string ServerParam::TEXT_LOG_DIR = ".\\text_logs\\";
++const std::string ServerParam::GAME_LOG_DIR = ".\\game_logs\\";
+ #else
+-const std::string ServerParam::TEXT_LOG_DIR = "./";
+-const std::string ServerParam::GAME_LOG_DIR = "./";
++const std::string ServerParam::TEXT_LOG_DIR = "./text_logs/";
++const std::string ServerParam::GAME_LOG_DIR = "./game_logs/";
+ #endif
+ const std::string ServerParam::TEXT_LOG_FIXED_NAME = "rcssserver";
+ const std::string ServerParam::GAME_LOG_FIXED_NAME = "rcssserver";
+@@ -352,8 +352,8 @@
+ const double ServerParam::MAX_DASH_ANGLE = +180.0;
+ const double ServerParam::MIN_DASH_ANGLE = -180.0;
+ const double ServerParam::DASH_ANGLE_STEP = 1.0; // [15.6.0] 45.0 -> 1.0 [14.0.0] 90.0 -> 45.0
+-const double ServerParam::SIDE_DASH_RATE = 0.4; // [14.0.0] 0.25 -> 0.4
+-const double ServerParam::BACK_DASH_RATE = 0.7; // [14.0.0] 0.5 -> 0.6 [17.0.0] 0.6 -> 0.7
++const double ServerParam::SIDE_DASH_RATE = 1.0; // [14.0.0] 0.25 -> 0.4
++const double ServerParam::BACK_DASH_RATE = 1.0; // [14.0.0] 0.5 -> 0.6 [17.0.0] 0.6 -> 0.7
+ const double ServerParam::MAX_DASH_POWER = +100.0;
+ const double ServerParam::MIN_DASH_POWER = 0.0;
+ 
+@@ -1307,7 +1307,7 @@
+     M_catch_ban_cycle = GOALIE_CATCH_BAN_CYCLE;
+     M_slow_down_factor = 1;
+ 
+-    M_use_offside = true;
++    M_use_offside = false;
+     M_forbid_kick_off_offside = true;
+     M_offside_kick_margin = OFFSIDE_KICK_MARGIN;
+ 
+@@ -1335,7 +1335,7 @@
+     M_verbose = false;
+ 
+     M_coach_mode = false;
+-    M_coach_with_referee_mode = false;
++    M_coach_with_referee_mode = true;
+     M_old_coach_hear = false;
+ 
+     M_synch_mode = false;
+--- a/rcssserver-19.0.0/src/pcombuilder.h
++++ b/rcssserver-19.0.0/src/pcombuilder.h
+@@ -86,6 +86,7 @@
+     virtual void kick( double power, double dir ) = 0;
+     virtual void long_kick( double power, double dir ) = 0;
+     virtual void goalieCatch( double dir ) = 0;
++    virtual void drop() = 0;
+     virtual void say( std::string message ) = 0;
+     virtual void sense_body() = 0;
+     virtual void score() = 0;
+--- a/rcssserver-19.0.0/src/player_command_parser.ypp
++++ b/rcssserver-19.0.0/src/player_command_parser.ypp
+@@ -76,6 +76,7 @@
+ %token RCSS_PCOM_KICK "kick"
+ %token RCSS_PCOM_LONG_KICK "long_kick"
+ %token RCSS_PCOM_CATCH "catch"
++%token RCSS_PCOM_DROP "drop"
+ %token RCSS_PCOM_SAY "say"
+ %token RCSS_PCOM_UNQ_SAY "unquoted say"
+ %token RCSS_PCOM_SENSE_BODY "sense_body"
+@@ -138,6 +139,7 @@
+           | kick_com
+           | long_kick_com
+           | catch_com
++          | drop_com
+           | say_com
+           | sense_body_com
+           | score_com
+@@ -218,6 +220,12 @@
+             {
+               BUILDER.goalieCatch( $< m_double >3 );
+             }
++;
++
++drop_com : RCSS_PCOM_LP RCSS_PCOM_DROP RCSS_PCOM_RP
++           {
++             BUILDER.drop();
++           }
+ ;
+ 
+ say_com : RCSS_PCOM_UNQ_SAY
+--- a/rcssserver-19.0.0/src/player_command_tok.lpp
++++ b/rcssserver-19.0.0/src/player_command_tok.lpp
+@@ -58,6 +58,7 @@
+ kick { return RCSS_PCOM_KICK; }
+ long_kick { return RCSS_PCOM_LONG_KICK; }
+ catch { return RCSS_PCOM_CATCH; }
++drop { return RCSS_PCOM_DROP; }
+ say { return RCSS_PCOM_SAY; }
+ sense_body { return RCSS_PCOM_SENSE_BODY; }
+ score { return RCSS_PCOM_SCORE; }
