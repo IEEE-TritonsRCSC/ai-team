@@ -600,7 +600,7 @@
         "stage3_defender_v2_finetune": {
             "description": "ACTIVE — Stage 3 v2 cone-adaptation fine-tune against the upgraded hardcoded defender. Warm-starts from the existing Stage 3 checkpoint and uses Stage 2H real-physics reward settings plus defender-aware shot quality, SSL foul detectors, a corrected 8.5-unit dribble segment limit, physical front-reception kick gating, post-carry shot urgency, repeated defense-area-touch termination, and no standalone turn primitive.",
             "num_robots": 1,
-            "timesteps": 150000,
+            "timesteps": 0,
             "robot_ids": [
                 1
             ],

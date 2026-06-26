@@ -45,8 +45,8 @@ class SSLRuleConfig:
     opponent_goalie_ids: Tuple[int, ...] = ()
     teammate_crash_penalty: float = -6.0
     teammate_crash_cooldown_steps: int = 25
-    teammate_proximity_penalty: float = -0.15
-    teammate_proximity_dist: float = 1.8
+    teammate_proximity_penalty: float = -0.08
+    teammate_proximity_dist: float = 1.2
 
 
 @dataclass(frozen=True)
