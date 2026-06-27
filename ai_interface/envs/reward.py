@@ -259,6 +259,14 @@ class RewardConfig:
     support_position_bonus: float = 0.0
     support_position_max_dist: float = 20.0
     support_position_min_angle_deg: float = 20.0
+    # Direct, symmetric anti-collision penalty: subtract this from EVERY robot
+    # whose nearest teammate is within `teammate_collision_dist` (sim units),
+    # regardless of role. Unlike redundant_chase_penalty (which keys on distance
+    # to the BALL and only fires on the non-nearest robot) this keys on the
+    # inter-robot distance itself, so it directly discourages two robots
+    # converging on the same spot / bumping while navigating. Both >0 to enable.
+    teammate_collision_penalty: float = 0.0
+    teammate_collision_dist: float = 0.0
     possession_transfer_bonus: float = 0.0
     team_goal_multiplier: float = 1.0
 
@@ -1051,6 +1059,18 @@ def calculate_reward(
 
     if intermediates.is_redundant_chaser and config.redundant_chase_penalty > 0.0:
         reward -= config.redundant_chase_penalty
+
+    # Direct anti-bump penalty: applies to BOTH robots (not role-gated) whenever
+    # the nearest teammate is closer than teammate_collision_dist. Targets the
+    # physical robot-on-robot collision that role/ball-distance shaping alone
+    # doesn't prevent.
+    if (
+        config.teammate_collision_penalty > 0.0
+        and config.teammate_collision_dist > 0.0
+        and intermediates.nearest_ally_dist is not None
+        and intermediates.nearest_ally_dist < config.teammate_collision_dist
+    ):
+        reward -= config.teammate_collision_penalty
 
     if intermediates.goal_scored:
         reward += config.goal_reward * config.team_goal_multiplier
