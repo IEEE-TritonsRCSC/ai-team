@@ -2599,3 +2599,1708 @@ For the next fine-tune, target release timing and penalty-area discipline rather
 - audit `disabled_actions` because `turn` still appears in action distribution logs;
 - reduce the long-carry local optimum by adding a small penalty when a carry remains open for too many steps without a shot or meaningful lane improvement;
 - keep defender-lane geometry unchanged for now, because the shot success rate after firing is already reasonable.
+
+---
+
+## 38. Training runs: 20260625 Mac-mini ×3 — PPO `stage4_2v2` / first 2-attacker scale-up (FAILED — ~0% goals; sim-freeze brick + unsolved 2v3)
+
+**Runs (all on Mac mini, embedded sim):**
+- `20260625_162023_992706` — stage4 from line 27953
+- `20260625_200856_640414` — stage4 from line 27549
+- `20260625_213858_046720` — stage4 from line 26963 (**the only run that completed all 400k and saved the checkpoints**)
+
+Each session first re-ran `stage3_defender_v2_finetune` (150k) then rolled into `stage4_2v2` (400k). Numbers below are the **stage4 segment only** (parsed directly, since `parse_training_log.py` keys on the `ACTIVE` tag which is still on stage3 and therefore mislabels/blends the two stages).
+
+**Load model:** top-level `final_models/stage3_complete.pt` (single-attacker Stage 3). Backbone reused count-agnostically for `num_robots 1→2` ("Reusing existing agent … flushing rollout buffer"), so attacker #2 inherits the trained attacker's weights, not random init.
+**Save namespace:** `models/ppo_jal_expandable/` (last four checkpoints, steps 370k–400k, copied into `models/ppo_jal_expandable_wide/`).
+
+**Aim:** First scale-up from 1 → 2 RL attackers. **2 RL attackers** (ids 1, 2 on TritonBots) vs **3 scripted opponents** on TeamB — `goalie` (id 1), `defender` (id 2), `marker_defender` (id 3, marking id 2). `team_config_stage4.json`, all primitives enabled (`disabled_actions: []`), random ball + spawn θ, 400k budget. Reward adds multi-robot coordination shaping on top of Stage 3: `spread_bonus 0.04`, `redundant_chase_penalty 0.08`, `support_position_bonus 0.05`, `possession_transfer_bonus 5.0`, `defender_lane_gate`, `opponent_near_ball_penalty -0.3`; `goal_reward 70`.
+
+### Results (stage4 segment only)
+
+| Run | Stage4 eps | Goals | Dominant outcome | Mean reward (early→late) |
+|---|---:|---:|---|---|
+| 162023 | 3265 | 1 (**0.0%**) | `frozen_state_stale_sim` 2855 (**87%**) | −86 → −10 |
+| 200856 | 1973 | 1 (**0.1%**) | `frozen_state_stale_sim` 1434 (**73%**) | −71 → −12 |
+| 213858 (completed) | 1114 | 0 (**0.0%**) | `max_steps` 913 (**82%**) | −92 → −57 |
+
+**Outcome breakdown, completed run 213858:** `max_steps` 913 (82%), `frozen_state_stale_sim` 170 (15%), `ball_in_penalty_off_target` 26 (2.3%), `defender_push_foul` 4, `goalie_catch` 1. **Only 26 off-target + 1 catch in 1114 episodes** — the attackers barely got a shot away.
+
+**Goal-rate trend (213858, quartiles):** 0.0% / 0.0% / 0.0% / 0.0% — flat zero throughout. Mean reward climbed −92 → −57 (something is being learned), but never positive and never a goal.
+
+### What went wrong
+
+Two distinct failure modes, neither solved:
+
+1. **Embedded-sim freeze brick, aggravated at 2 robots (runs 162023 & 200856).** `frozen_state_stale_sim` ([JAL_env.py:3458](../ai_interface/envs/JAL_env.py#L3458)) fires when the ball **and all controlled robots** stay frozen (Δpos/Δθ < eps) for `_FROZEN_STATE_STEPS` consecutive cycles — i.e. the embedded engine has stalled. It hit **73–87% of episodes**, so two of the three runs trained mostly against a dead simulator and are essentially garbage data. This is the dead-ball/stale-sim brick family resurfacing hard once a second controlled robot is in the loop.
+
+2. **2v3 never solved (clean run 213858).** With far fewer freezes (15%), **82% of episodes time out (`max_steps`)** at deeply negative reward. The 2-attacker policy holds/shuffles the ball but cannot break a 3-defender block: ~0 shots, 0 goals across all 1114 episodes. Warm-starting attacker #2 from the single-attacker weights gave competent individual ball skill but **no coordination emerged** to beat the extra defenders in 400k steps.
+
+### Fix for next run
+
+- **Fix the freeze brick before any more 2-robot training** — it's the cheaper, more decisive problem (corrupted 2 of 3 runs outright). Investigate why `frozen_state_stale_sim` spikes specifically at `num_robots=2`: likely the embedded engine stalls when a controlled robot's command queue desyncs (cf. the catch-glue / cone-rejected-kick brick variants), now reachable via a second attacker. Either harden the engine-rebuild trigger to also fire on a frozen-state terminal, or root-cause the stall in `socket_utils.py` command queueing for multi-robot.
+- **Consider a 1 → 2 intermediate before 2 → full team** (the documented-safe ladder): warm-start a 2-attacker stage against a *single* scripted defender + goalie (drop the `marker_defender`) so coordination has a gentler gradient than 2v3 from step 0. The plan (`sprightly-singing-kite.md`) flagged exactly this fallback if the jump destabilizes — it did.
+- **Re-examine the timeout local optimum:** 82% `max_steps` with near-zero shots suggests the multi-robot shaping (`spread`/`support`/`possession_transfer`) may be rewarding passive positioning over shot creation. Verify the attackers actually attempt to penetrate rather than circulate; if not, add shot-urgency pressure as in Stage 3 (`carry_urgency_*`) and/or reduce the support-position bonus.
+- Net: the `stage4_2v2_steps*.pt` checkpoints encode a 2-attacker policy at **~0% scoring** against this opponent set — **do not promote them**; treat Stage 4 as not-yet-started once the freeze brick is fixed.
+
+---
+
+## 39. Training run: 20260626_185308_653190 — PPO `stage4i_2atk_1def` / documented-safe 2v1 intermediate (STOPPED at 53% — Fix A validated; kick=0% root cause = unlearnable role split / crowding, NOT aim)
+
+**Stopped early** at step 158,924 / 300,000 (~53%, 444 episodes) — halfway gate verdict was decisive, so the remaining 141k steps were not worth burning.
+
+**Load model:** top-level `final_models/stage3_complete.pt` (single-attacker Stage 3); weight-shared encoder reused count-agnostically so both attacker slots start competent.
+
+**Aim:** The documented-safe 1→2 rung after §38 failed. **2 RL attackers** (TritonBots ids 1,2, both warm-started) vs **ONE scripted defender + goalie** (`team_config_2atk_1def.json`, no `marker_defender`). New machinery: `pass_to_teammate` primitive (6th, through-ball `lead` param), dribble obstacle avoidance, `goto` avoidance, and a coordination + effective-passing reward (hardened pass-event transfer + `pass_quality`, role-gated spread/support). Target: emergent 2v1 overload — carrier shoots an open lane, passes to the open supporter when the defender closes.
+
+### Results
+
+| Metric | Value |
+|---|---|
+| Steps / planned | 158,924 / 300,000 (stopped) |
+| Total episodes | 444 |
+| Goals | **0 / 444 = 0.0%** |
+| Goal rate (200-ep buckets) | 0.0% / 0.0% / 0.0% — flat zero |
+| Aim quality (kicks, first→last 200) | 0.09 → 0.09 (no improvement) |
+| Mean reward (200-ep buckets) | −138 → −126 |
+
+**Episode outcomes:** `max_steps` 335 (75.5%), `defender_push_foul` 56 (12.6%), `attacker_push_foul` 23 (5.2%), `ball_teleport` 13 (2.9%), `ball_in_penalty_off_target` 12 (2.7%), `ball_out_of_bounds` 3, `defender_in_defense_area` 1, `ball_dead_goal_kick_l` 1.
+
+**Action distribution (last 200 eps):** approach_ball 55%, dribble_to 33%, goto 4%, turn 4%, pass_to_teammate 1%, **kick 0%**.
+
+### Code changes (non-config)
+
+This run is the first to exercise all of: the `pass_to_teammate` primitive (`ppo_jal.py` index 5 + `JAL_env.py` decode/receiver-selection/pass-event tracking), `dribble_to(obstacle_avoidance=True)` CARRY detour (`basic_commands.py`), the tracked pass-event possession-transfer + `pass_quality` reward (`reward.py`/`JAL_env.py`), **Fix A** (`force_rebuild` on brick terminals threaded `reset → networker → commander → embedded backend`), and **Fix B** (the §38-followup reward retune). Full detail in `docs/CHANGES.md` (2026-06-26 entry).
+
+### What went wrong
+
+**Fix A worked; Fix B did not.**
+
+1. **Fix A (brick recovery) — VALIDATED.** 22 brick terminals (`ball_teleport`/`frozen_state_stale_sim`) occurred over the run; the `force_rebuild` backstop fired **11 times** and the sim recovered cleanly every time — no 1-step death spiral, the run advanced steadily to 159k. The multi-robot sim-freeze that corrupted 2 of 3 §38 runs is **solved at the symptom level**.
+
+2. **Fix B (kick collapse) — INSUFFICIENT. Same failure as §38: kick=0%, 0 goals, flat across all 444 episodes.** Fix B *is* biting — mean reward is deeply negative (−126 to −138), exactly carry_urgency + step penalties punishing the dribble-forever camp, so we successfully made dribbling unprofitable. **But the policy still won't kick** — it eats the penalty by approaching/dribbling (55%+33%=88% of actions) rather than switching to kick. Aim quality is pinned at **0.09** (the rare kicks are badly aimed), and 18% of episodes end on **push fouls** (bodies colliding near the ball — both robots converging on it despite role gating).
+
+**Root cause (CORRECTED — it is the role/coordination split, NOT a missing kick macro).** An earlier draft of this section blamed the [turn-cap-breaks-aiming] pattern and recommended building a `face_then_kick` macro. **That macro already exists** — when the policy selects `kick`, [JAL_env.py:2329-2380](ai_interface/envs/JAL_env.py#L2329) latches a keeper-away target and calls `kick(..., dribbling=True)`, which returns a *geometric, cap-robust* `turn angle_diff/dt` until within 5° then fires ([basic_commands.py:231](ai_interface/utils/basic_commands.py#L231)). Stage 3 scored ~39% with this exact macro. So aim execution is not the blocker.
+
+The real blocker is **2-attacker crowding from an unlearnable role split.** The reward gates every carrier/supporter reward on `is_chaser = is_nearest_to_ball` ([reward.py:950](ai_interface/envs/reward.py#L950)/[:1054](ai_interface/envs/reward.py#L1054)), but the **per-robot observation contains no role signal** — the live slot is only `x,y,θ,vx,vy,is_dribbling,start_dribble_xy`; dims 8+ are reserved/zero ([JAL_env.py:1698-1707](ai_interface/envs/JAL_env.py#L1698)). The policy is a **weight-shared encoder + shared heads + permutation-equivariant attention** ([ppo_jal.py:22](ai_interface/algorithms/ppo_jal.py#L22)), and both slots warm-start from the *same* selfish single-attacker Stage 3 policy. So the reward asks one robot to be the supporter, but the policy has no input telling it *which* robot it is — and `is_nearest_to_ball` flips cycle-to-cycle as both converge, so even the reward target oscillates. Result: both robots run the identical "go to ball" reflex → 88% approach+dribble, 18% push-foul collisions, and `kick` is never the EV-best action for *either* (both are fighting for the ball, neither ever gets clean, settled possession to shoot from). kick=0% is a **downstream symptom of the crowd**, not an aim failure.
+
+### Fix for next run
+
+- **Give the policy the role variable it is being graded on, and stabilize it.** (1) Fill reserved per-robot obs dim 8 with the robot's role / `is_nearest_to_ball` flag (the env already computes `nearest_rid` at [JAL_env.py:3320](ai_interface/envs/JAL_env.py#L3320)); optionally dim 9 = teammate-relative geometry. (2) Make the chaser assignment **sticky** (commit at episode start or with a hysteresis margin) and feed the *same* committed role to both the obs feature and the reward gate. Then the shared weights can learn one conditional policy (chaser → ball, supporter → spread), and the supporter reward stops chasing a flipping label. Stays centralized JAL — no MAPPO.
+- **Do NOT add another reward pass first.** Fix B's shaping (`carry_urgency`, `spread`, `support`) was never learnable because its gating variable was invisible and oscillating — fix the observation/role first, then re-evaluate the shaping.
+- **Keep Fix A as-is** — brick recovery is validated; carry it forward unchanged.
+- **Do not promote** any checkpoint from this run (0% scoring). Re-run `stage4i_2atk_1def` from the same warm-start once the role feature + sticky assignment land.
+
+---
+
+## 40. Training run: 20260628_025218_390537 — PPO `stage4j_support_pass_v1` / supporter-target + pass-gated 2v1 intermediate (FAILED — no passing, late regression to 8% goals)
+
+**Completed** at 299,728 / 300,000 steps, then saved `models/ppo_jal_expandable/stage4j_support_pass_v1_complete.pt`.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Stage 4j should turn the task into a real 2-attacker pattern: one claimant keeps full ball actions, the non-claimant is `goto`-only and learns receive/support coordinates, and `pass_to_teammate` is unmasked only when the supporter has a legal, ready target with a clear lane and useful continuation shot.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 863 |
+| Overall goals | 87 / 863 = **10.1%** |
+| Last 100 goal rate | **8.0%** |
+| Last 50 goal rate | **6.0%** |
+| Last 100 avg reward | **-122.6** |
+| Last 100 avg length | **327.7** |
+
+**Episode outcomes:** `max_steps` 596 (69.1%), `goal_scored` 87 (10.1%), `ball_in_penalty_off_target` 78 (9.0%), `goalie_catch` 78 (9.0%), `ball_out_of_bounds` 11 (1.3%), `defender_push_foul` 7 (0.8%), `robot_out_of_bounds` 4, `defender_in_defense_area` 1, `attacker_push_foul` 1.
+
+**Goal-rate trend:** eps 1-200 = 3.5%, 201-400 = 10.5%, 401-600 = 16.0%, 601-800 = 11.0%, 801-863 = 7.9%. The run improved into the middle, then regressed late.
+
+**Action distribution, final windows:**
+
+- Last 100, carrier `rid=1`: `approach_ball` 21.2%, `dribble_to` 62.6%, `goto` 3.8%, `kick` 0.8%, `turn` 10.5%.
+- Last 100, supporter `rid=2`: `goto` 97.1%, with some claimant-switch noise (`approach_ball` 8.9%, `dribble_to` 16.3% on episodes where it likely became claimant or the action logger sampled transient role changes).
+- Final summary bucket: aggregate actions still show `pass_to_teammate=0%`.
+
+**Kick quality:** 1,638 kick events. First 200 kicks had avg `aim_quality=0.326`, bad aim 18.0%; last 200 improved slightly to avg `aim_quality=0.385`, bad aim 12.5%. This is not enough: final goals dropped despite slightly better aim.
+
+**SSL events:** 42 total: `attacker_touched_ball_in_defense_area` 32, `defender_push_foul` 7, `defender_in_defense_area` 2, `attacker_push_foul` 1. Collision rules are not the dominant failure.
+
+### Code changes (non-config)
+
+This run used the Stage 4j supporter/pass code path added after §39:
+
+- `ai_interface/envs/stage4_support.py`: explicit support target classification (`RECEIVE_READY`, `RECEIVE_TARGET`, `GENERAL_SUPPORT`) with legality, lane-clear, and continuation-quality checks.
+- `ai_interface/envs/JAL_env.py`: role-aware primitive mask, non-claimant `goto` execution, support-target construction, ready-target pass gate, supporter-selected pass target routing, pass outcome penalties, dribble-gap banking, and open-shot urgency state.
+- `ai_interface/envs/reward.py`: support target progress/readiness rewards, bad-target penalty, pass reward/penalty fields, dribble achieved-gap finish window, and open-shot urgency fields.
+- `configs/ppo_jal_curriculum_config.json`: new active `stage4j_support_pass_v1` config with the stage3-v3 warm-start and Stage 4j pass/support reward settings.
+
+### What went wrong
+
+The supporter mask solved crowding mechanically, but did **not** create a two-attacker policy. The supporter mostly executed `goto`, yet the carrier never learned to use it:
+
+- There were **no real pass events** in the timestamped logs: no `Pass`, no `possession_transfer`, no pass failure records, and `pass_to_teammate=0%` in summaries.
+- The carrier stayed in a Stage-3-like local optimum: last-100 `dribble_to` was **62.6%**, while `kick` was only **0.8%**.
+- Most episodes still timed out: last-100 `max_steps` was **62%** and overall `max_steps` was **69.1%**.
+- The late curve regressed: goals peaked at **16%** for episodes 401-600, then fell to **7.9%** in the final bucket.
+- The pass/support diagnostics were not logged (`support_target`, `RECEIVE_READY`, `RECEIVE_TARGET` all absent), so the run cannot tell us whether the supporter rarely proposed valid targets, the pass mask was too strict, or the carrier never sampled pass after readiness.
+- The log showed the older carry-urgency penalty firing (`grace=25`, `0.03/step`, cap `2.25`) even though Stage 4j also configured the newer open-shot urgency fields. The intended stronger "shoot/pass when open" pressure was therefore not clearly controlling behavior.
+
+The root cause is likely an overly hard sparse coordination gate: a pass can only be selected after the supporter target is already ready, physically close, legal, lane-clear >= 0.70, shot-quality >= 0.35, and the carrier has front-cone possession. Since the carrier's mask is based on the previous support target state, and the ready state is not frequent enough, the policy never explores the pass payoff. The result is a single-carrier dribble policy with a passive `goto` teammate.
+
+### Fix for next run
+
+Do not promote `stage4j_support_pass_v1_complete.pt`.
+
+First add logging/instrumentation so the next run is diagnosable:
+
+- log per-episode counts for support target modes and rejection reasons;
+- log pass-mask availability count for claimant slots;
+- log when `pass_to_teammate` is masked and why (`no_ready_target`, `bad_cone`, `lane_low`, `quality_low`, `too_close`);
+- log ready-target distance/lane/quality histograms.
+
+Then make the next curriculum easier and less sparse:
+
+- split Stage 4j into a receive-position pretraining rung where the supporter is rewarded for `RECEIVE_TARGET` and `RECEIVE_READY` even before pass execution is required;
+- temporarily relax pass readiness: allow pass on `RECEIVE_TARGET` with a larger receive radius or lower lane threshold, then anneal back to lane >= 0.70 and radius 2.5;
+- make pass availability itself a small dense reward for the carrier/supporter pair so the policy can discover the preconditions before needing a full possession-transfer event;
+- reduce single-carrier dribble farming further by lowering `post_dribble_kick_bonus` from 8.0 toward the Stage 3 v3 value and/or increasing the active open-shot/carry urgency once `Q3` is high;
+- verify the open-shot urgency implementation path, because the configured `open_shot_urgency_*` values did not visibly replace the old `carry_urgency_*` behavior in this run.
+
+Math note: the pass success reward was still sound on paper. A quality-0.5 pass should pay `(12 + 16 * 0.5) / 2 = +10` team reward after averaging over two attackers, while an intercepted pass gives `-16 / 2 = -8`. The issue was not reward EV after a successful pass; it was that the policy almost never reached the valid-pass action surface.
+
+---
+
+## 41. Training run: 20260628_171015_717398 — PPO `stage4p_receive_finish_macro_v1` / receive-finish command macro (FAILED — flat 24% goals, the finish macro fired twice in 826 episodes because passes don't resolve)
+
+**Completed** at 199,974 / 200,000 steps, then saved `models/ppo_jal_expandable/stage4p_receive_finish_macro_v1_complete.pt`.
+
+**Load model:** `models/ppo_jal_expandable/stage4o_forced_pass_finish_v1_steps160000.pt`.
+
+**Aim:** Replace the mask-only post-pass finish scaffold with a per-receiver **command-level macro** that acquires → settles → (optionally stages under the SSL dribble cap) → aims through the kick cone → fires, and only then consumes the banked pass-finish reward (payout scaled by fire-time shot quality). Keep the learned pass timing / support positioning from Stage 4o.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 826 |
+| Overall goals | 199 / 826 = **24.1%** |
+| Last 100 goal rate | **25.0%** |
+| Last-26 summary reward μ | **-85.6** |
+| Avg episode length (last 10) | 187.9 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 232 (28.1%), `max_steps` 208 (25.2%), `goal_scored` 199 (24.1%), `goalie_catch` 110 (13.3%), `attacker_excessive_dribble` 37 (4.5%), `ball_out_of_bounds` 27 (3.3%), `defender_push_foul` 8, `defender_in_defense_area` 2, `attacker_push_foul` 2, `frozen_state_stale_sim` 1.
+
+**Goal-rate trend (200-ep buckets):** 21.5% → 20.5% → 26.0% → **30.0%** → 11.5%. Rose into the third/fourth quarter, then **collapsed to 11.5%** in the final episodes.
+
+**Aim quality:** First 200 kicks avg `aim_quality=0.403`, bad aim 9.5%; last 200 **regressed** to 0.338, bad aim **16.5%**.
+
+**Action distribution (carrier rid=1 / supporter rid=2):** carrier stayed dribble-centric throughout — `dribble_to` 56% (ep1) → 71% (ep200) → 83% (ep400) → 64–70% (ep600–800), with `kick` 0–2% and `pass_to_teammate` 0–2%. Supporter `rid=2` was `goto=100%` the entire run.
+
+### Code changes (non-config)
+
+This run exercised the Stage 4p receive-finish macro added after §40 (see CHANGES.md 2026-06-28 Stage 4p):
+
+- `ai_interface/envs/JAL_env.py`: per-robot `post_pass_finish_macro` state + `_start_/_execute_/_expire_post_pass_finish_macro`, `_post_pass_finish_staging_target`, `_post_pass_finish_shot_quality`; macro runs before normal decode so the receiver can finish even when not the sticky claimant; debug counters `receive_finish_macro(started/acquire/settle/kick_align/fired/expired/bad_cone/avg_shot_q)`.
+- `ai_interface/envs/reward.py`: macro knobs (`post_pass_finish_macro_enabled`, `_window_steps`, `_min_shot_quality`, `_staging_max_carry`, `_scale_reward_by_shot_quality`) + `support_pass_select_best_receiver`.
+- `configs/ppo_jal_curriculum_config.json`: active `stage4p_receive_finish_macro_v1`, warm-start from stage4o 160k, `pass_finish_window_steps=80`, `pass_macro_max_align_steps=60`.
+
+### What went wrong
+
+The macro this stage was built for **almost never executed**, and scoring was flat versus the Stage-4i/4j baseline (~24% vs ~25% — all solo-dribble goals, not coordinated passing).
+
+- **Passes do not resolve.** Across the whole run: `Pass FIRED=61`, `Pass RESOLVED=9` (~15% completion). Per-episode the pass macro is *requested* heavily (`requested=27–46`) but `fired=0` — the align macro burns all its steps (`align_steps≈27–46`, `timeouts=0` only because it ran out the episode) and never launches a legal pass.
+- **The receive-finish macro started 9 times in 826 episodes and fired exactly 2 times** (`fired=1` twice). It stalls in `acquire`/`settle`/`kick_align` and dies without firing.
+- **Finish banks are empty.** Resolved passes bank ≈0 (`bank=+0.00` ×7, +0.04, +0.09) because pass target quality is low (`passer_lane_q≈0.21–0.29`). Run totals: `banked=9, consumed=2, expired=5`. With nothing banked, there is no finish reward to drive the macro — the entire 4p mechanism is starved.
+- **Pass geometry is still deep/wide.** Fired pass aims cluster at the clamp edge `x=31.50` and frequently `|y|=10.0` (the `support_target_y_clip` limit), with misses around `miss=2.60` and `recv_dist_to_aim=1.72` — the same deep/wide target problem §40 (4n) tried to fix is still active.
+- **Late instability:** goals fell from a 30% peak to 11.5%, aim quality regressed (bad-aim 9.5%→16.5%), and last-bucket reward μ=-85.6. The forced-pass mask makes the carrier *want* to pass into a window that almost never becomes a legal, completable pass, producing many wasted align frames and off-target penalty-area losses (28.1% of episodes).
+
+Root cause: **the bottleneck is upstream of the finish macro.** Stage 4p invested in turning *resolved* passes into shots, but passes rarely resolve. The pass-launch/align gate (`pass_macro` legality in `JAL_env.py`) lets the carrier latch a pass request and spin for tens of steps without ever reaching a legal, accurate launch, and the targets it does launch are deep/wide low-quality. The finish macro is correct (it fired twice, proving the plumbing), but it has almost nothing to consume.
+
+### Fix for next run
+
+Do not promote `stage4p_receive_finish_macro_v1_complete.pt`.
+
+The next rung (Stage 4q) must fix **pass resolution**, not the finish layer:
+
+- Raise `fired/resolved` rate: tighten the pass-launch gate so a latched pass either fires quickly when legal or is abandoned (don't let it spin `40+` align steps draining the episode); cap `pass_macro_max_align_steps` well below 60 and fall back to a shot/recover instead of burning the clock.
+- Fix pass-target geometry: pull targets in from the `x=31.50` / `|y|=10.0` clamp edges. Tighten `support_target_max_x` and `support_target_y_clip` and/or require a higher minimum `passer_lane_q` (current launched passes at ~0.21–0.29 are too low to complete) so the supporter receive wedge sits in genuinely reachable, lane-clear space.
+- Only after `Pass RESOLVED` per episode is consistently non-trivial does the receive-finish macro have banks to consume — keep 4p's macro code, it is validated.
+- Watchpoint: if a Stage 4q smoke run still shows `fired≈0` while `requested` is high, the fix is still in the launch/align legality gate, not in reward.
+
+Math note: the macro reward path is sound — a quality-0.5 pass banks `(14 + 12*0.5)/2 = +10.0`, paid only on a macro kick and scaled by fire-time shot quality. The failure is entirely that passes don't complete, so the bank is empty and the +10 chain never pays.
+
+---
+
+## 42. Training run: 20260628_210222_891381 — PPO `stage4r_intercept_gate_v1` / receiver-claim handoff + longer pass align budget (FAILED — no sustained passing improvement, goal rate regressed late)
+
+**Completed** at 199,997 / 200,000 steps.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Test the two structural fixes after the Stage 4r diagnostics:
+
+- hand the sticky ball claim to the intended receiver immediately after a pass fires, so the receiver is not locked to supporter-only `goto` while the ball arrives;
+- raise `pass_macro_max_align_steps` from 24 to 90 so selected passes have enough time to align and fire.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 843 |
+| Overall goals | 218 / 843 = **25.9%** |
+| Last 100 goal rate | **21.0%** |
+| Avg reward last 10 | **+4.76** |
+| Avg episode length last 10 | 150.4 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 283 (33.6%), `max_steps` 218 (25.9%), `goal_scored` 218 (25.9%), `goalie_catch` 47 (5.6%), `attacker_excessive_dribble` 46 (5.5%), `ball_out_of_bounds` 15 (1.8%), `defender_push_foul` 9 (1.1%), `frozen_state_stale_sim` 3, `defender_in_defense_area` 2, `attacker_push_foul` 1, `ball_dead_goal_kick_l` 1.
+
+**Goal-rate trend (200-ep buckets):** 16.5% -> 25.5% -> **32.0%** -> 29.0% -> 27.9%; despite the mid-run rise, the last-100 goal rate fell to **21.0%**.
+
+**Aim quality:** first 200 kicks avg `aim_quality=0.344`, bad aim 8.5%; last 200 avg `aim_quality=0.387`, bad aim 4.0%. Shooting aim improved, but this did not translate into a stronger final policy.
+
+**Pass pipeline totals from diagnostics:** `requested=301`, `fired=14`, `resolved=3`, `expired_timeout=2`, `expired_interception=1`. `pass_macro started=32`, `align_steps=472`, `timeouts=0`. `receive_finish_macro started=0`, `fired=0`, `consumed=0`.
+
+**Support/pass diagnostics:** `pass_available_steps=0` in the logged episode summaries. Support modes were mostly `GENERAL_SUPPORT=185,628`, with only `RECEIVE_READY=7,595` and `RECEIVE_TARGET=6,774`. Rejections/mask reasons were dominated by `pass_interceptable`, `not_kickable`, `bad_reception_cone`, `too_close_for_ssl_pass`, `pass_lane_blocked`, and `lane_low`.
+
+### What changed
+
+The longer align budget worked only in the narrow sense: pass macro timeouts disappeared (`timeouts=0`). That means the old 24-step timeout was not the only blocker.
+
+The receiver-claim handoff had almost no opportunity to help. It only activates after a pass fires, and only 14 passes fired in 843 episodes. Only 3 resolved, and none started the receive-finish macro, so the run never produced enough post-pass situations to train or validate coordinated finishing.
+
+The policy remained essentially a one-carrier strategy:
+
+- carrier still alternated mostly between `approach_ball` and `dribble_to`;
+- supporter stayed `goto`-only as designed, but rarely created a launchable pass state;
+- no sampled action distribution showed meaningful `pass_to_teammate` usage.
+
+### What went wrong
+
+This run moved the bottleneck from explicit align timeouts to **pass launchability and target legality**:
+
+- Pass requests were high enough (`301`) to show exploration, but request -> fire was only **4.7%**.
+- Fire -> resolve was only **21.4%** (`3/14`), so total request -> resolved was about **1.0%**.
+- `pass_available_steps=0` means the carrier almost never saw a clean, currently launchable pass surface in the logged summaries.
+- Many receive targets were rejected as interceptable or lane-blocked by the defender, and many carrier pass masks were rejected because the carrier was not kickable or the ball was outside the reception cone.
+- `ball_in_penalty_off_target` became the largest failure mode at **33.6%**, so the policy still drives into the opponent penalty area or bad end states instead of converting possession.
+
+### Fix for next run
+
+Do not promote this checkpoint as a coordination policy.
+
+The next fix should not be more align budget. It should make passing a committed physical primitive once a valid target is latched:
+
+- when `pass_to_teammate` is selected with a valid target, run a carrier pass macro that can reacquire/settle the ball, align, and fire instead of repeatedly requiring the policy to resample a perfectly valid pass frame;
+- keep the latched receiver target stable through the macro unless it becomes illegal/interceptable;
+- separately log why each request did not start a macro, why started macros did not fire, and why fired passes did not resolve;
+- reduce or redirect the huge `ball_in_penalty_off_target` failure path, because it is now a larger end-state problem than collision fouls.
+
+Math note: the structural handoff remains logically correct, but it is downstream of `Pass FIRED`. With request -> fire at only 4.7%, it cannot affect most episodes. The 90-step align budget removed macro timeouts, so the remaining failure is state validity/launch execution, not insufficient alignment time.
+
+---
+
+## 43. Training run: 20260628_225743_267521 — PPO `stage4s_goalie_only_pass_pretrain` / goalie-only pass mechanics pretrain (PARTIAL SUCCESS — pass mechanics learned, scoring collapsed)
+
+**Completed** at 149,669 / 150,000 steps.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Remove the field defender and train 2 RL attackers vs the scripted goalie only, so the policy can learn the pass chain before defender pressure returns: supporter `goto` receive targets, carrier pass selection, pass macro fire, receiver claim handoff, receive-finish macro, and shot.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 644 |
+| Overall goals | 63 / 644 = **9.8%** |
+| Last 100 goal rate | **4.0%** |
+| Avg reward last 10 | +6.63 |
+| Avg episode length last 10 | 202.9 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 391 (60.7%), `max_steps` 142 (22.0%), `goal_scored` 63 (9.8%), `attacker_excessive_dribble` 20 (3.1%), `goalie_catch` 14 (2.2%), `ball_out_of_bounds` 14 (2.2%).
+
+**Goal-rate trend:** 14.5% -> 11.0% -> 4.5% -> 6.8%; last-100 was only 4.0%.
+
+**Aim quality:** unchanged at avg `aim_quality=0.319`, bad aim 16.0% in both first and last 200 kicks.
+
+### What Worked
+
+The goalie-only rung **did learn real pass mechanics**. Compared with Stage 4r under the defender (`301 requested / 14 fired / 3 resolved`), this run produced:
+
+- `pass_requested=14,817`
+- `pass_fired=275`
+- `pass_resolved=141`
+- `pass_timeout=25`
+- `pass_interception=0`
+- fired in `267 / 644 = 41.5%` of episodes
+- resolved/fired = `141 / 275 = 51.3%`
+- `pass_available_steps=69,252`
+- support target modes: `RECEIVE_READY=75,268`, `RECEIVE_TARGET=39,035`, `GENERAL_SUPPORT=35,366`
+
+That clears the mechanical pretrain bar for pass launch and receive resolution: the defender really was the sparse-pass bottleneck.
+
+The receiver-claim handoff also worked: every resolved pass started the receive-finish macro (`finish_started=141`), which proves the receiver is no longer stuck as a pure `goto` supporter after a successful pass.
+
+### What Went Wrong
+
+The run did **not** learn useful attacking conversion.
+
+- `finish_started=141`, but `finish_fired=1`, `finish_consumed=1`, `finish_expired=124`.
+- Finish macro time was mostly spent in `settle=6,436`, `bad_cone=6,262`, `acquire=2,605`, and `kick_align=1,286`.
+- Almost all finish macros expired by deadline.
+- Resolved pass reward was only around `+6` and finish bank was tiny: mean bank `+0.025`, max `+0.09`.
+- Pass targets still clustered at the deep/wide clamp: resolved pass `|aim_y|` mean `8.66`, median `10.0`; target x was often `31.50`.
+- `ball_in_penalty_off_target` exploded to 60.7%, so the learned behavior is often pass/carry into the opponent penalty or wide dead zones rather than pass -> controlled shot.
+
+The action distribution confirms the policy shifted toward passing but away from finishing:
+
+- ep 400 carrier: `pass_to_teammate=11%`
+- ep 600 carrier: `pass_to_teammate=14%`
+- supporter remained mostly `goto`, but post-pass macro appeared after resolved passes.
+
+So the good news is that pass selection and pass resolution finally exist. The bad news is that the receiver-finish macro cannot turn those possessions into kicks, and the reward currently lets pass resolution be the end of the useful behavior.
+
+### Fix For Next Run
+
+Do not promote this as a final Stage 4 policy, but keep it as evidence that goalie-only pretraining is useful.
+
+Next run should focus on **post-pass finishing**, not more pass availability:
+
+- Move receive targets away from the deep/wide clamp (`x=31.50`, `|y|=10`) and toward central shotable points, or reduce `support_target_max_x` / `support_target_y_clip`.
+- Make post-pass finish macro more decisive: after a resolved pass, if the receiver is kickable but repeatedly outside the reception cone, use a deterministic geometric settle/face step that forces the ball into the front cone instead of burning 60+ bad-cone frames.
+- Pay meaningful finish bank only on a real kick/goal, not on pass resolution alone. Current resolved-pass reward `~+6` is enough to teach passing even when it leads to no shot.
+- Penalize pass-resolved-then-no-shot expiry more directly; `124 / 141` finish macros expired.
+- Add a hard guard against post-pass carries into opponent penalty/off-target zones, because `ball_in_penalty_off_target` is now the dominant failure.
+
+Math note: the pass mechanics acceptance passed (`41.5%` episodes fired, `51.3%` fired passes resolved), but the finish chain failed (`1 / 141 = 0.7%` resolved passes produced a macro kick). The next EV target should make pass reward conditional on a post-pass kick/goal, otherwise the policy can optimize for pass completion while lowering goal rate.
+
+---
+
+## 44. Training run: 20260629_000316_240570 — PPO `stage4s_goalie_only_pass_pretrain` / post-pass finish fixes (PARTIAL RECOVERY — goals improved, coordinated finish still failed)
+
+**Completed** at 149,924 / 150,000 steps.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Re-run the goalie-only Stage 4s pass mechanics pretrain after fixing the receiver finish
+macro's bad-cone behavior, tightening receive targets, reducing standalone pass reward, and making
+post-pass finish reward dominant.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 691 |
+| Overall goals | 190 / 691 = **27.5%** |
+| Last 100 goal rate | **42.0%** |
+| Avg reward last 10 | **+40.4** |
+| Avg episode length last 10 | 179.5 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 279 (40.4%), `goal_scored` 190 (27.5%),
+`max_steps` 114 (16.5%), `goalie_catch` 62 (9.0%), `attacker_excessive_dribble` 30 (4.3%),
+`ball_out_of_bounds` 16 (2.3%).
+
+**Goal-rate trend:** 28.0% -> 23.5% -> 24.5% -> **41.8%** in the final 91 episodes. The late
+goal-rate recovery is real, but it is mostly solo/direct finishing, not pass-to-shot coordination.
+
+**Aim quality:** first 200 kicks avg `aim_quality=0.372`, bad aim 4.0%; last 200 kicks avg
+`aim_quality=0.365`, bad aim 5.5%. Aim stayed stable and reasonably clean.
+
+**Pass pipeline totals:**
+
+- `requested=15,001`
+- `fired=227` (`1.5%` request -> fire)
+- `resolved=99` (`43.6%` fire -> resolve, `0.7%` request -> resolve)
+- `timeout=39`
+- `interception=2`
+- `receive_finish_macro started=99`
+- `finish_banked=99`
+- `finish_consumed=1`
+- `receive_finish_macro fired=1`
+- `receive_finish_macro expired=93`
+
+**Final 100 episodes pass pipeline:**
+
+- `requested=1,533`
+- `fired=27` (`1.8%` request -> fire)
+- `resolved=22` (`81.5%` fire -> resolve)
+- `receive_finish_macro started=22`
+- `receive_finish_macro fired=0`
+- `finish_consumed=0`
+- `receive_finish_macro expired=20`
+
+**Support/pass geometry diagnostics across the run:**
+
+- support modes: `RECEIVE_READY=71,417`, `RECEIVE_TARGET=39,177`,
+  `GENERAL_SUPPORT=39,330`
+- target reasons: `ok=110,594`, `too_close_for_ssl_pass=32,866`,
+  `blocks_carrier_shot_lane=6,464`
+- pass mask reasons: `not_kickable=30,456`, `too_close=23,390`,
+  `bad_reception_cone=22,624`, `receiver_far=6,425`,
+  `blocks_carrier_shot_lane=2,385`, `direct_shot_better=2,167`
+
+### Code changes (non-config)
+
+This run exercised the Stage 4s fixes logged in CHANGES.md on 2026-06-28 Late PM:
+
+- `ai_interface/envs/JAL_env.py`: post-pass macro now has a latched non-degenerate
+  `settle_target`; bad-cone recovery uses a real short dribble target instead of
+  `dribble_to(ball_xy)`; finish target selection prefers in-mouth goalie-gap targets with a
+  shortest-turn tie-break; non-receiver attackers clear out during an active post-pass finish macro.
+- `ai_interface/utils/basic_commands.py`: `goto()` normalises the body-relative dash angle.
+- `configs/ppo_jal_curriculum_config.json`: Stage 4s receive targets were pulled inward
+  (`support_forward=8..16`, `support_target_max_x=29`, `support_target_y_clip=6`), standalone pass
+  reward was reduced (`possession_transfer_bonus=0.5`, `pass_quality_weight=1.5`), and finish reward
+  was raised (`pass_finish_bonus=24`, `pass_finish_quality_weight=20`).
+
+### What worked
+
+The late goal rate recovered from the previous Stage 4s collapse:
+
+- previous Stage 4s: overall 9.8%, last-100 4.0%;
+- this run: overall 27.5%, last-100 42.0%.
+
+The target tightening also improved fired-pass quality once a pass actually launched. In the last
+100 episodes, fired passes resolved at `22 / 27 = 81.5%`, much better than the previous run's
+`141 / 275 = 51.3%`. This means the receive target geometry is less broken than before.
+
+### What went wrong
+
+The model still has **not learned effective coordinated passing**.
+
+The main failure moved earlier in the chain:
+
+- request -> fire is only `227 / 15,001 = 1.5%`;
+- last-100 request -> fire is only `27 / 1,533 = 1.8%`;
+- `pass_available_steps=0` in episode summaries even though many support targets are `ok`;
+- mask reasons are dominated by the carrier not being in a physical launch state:
+  `not_kickable`, `bad_reception_cone`, `too_close`, and `receiver_far`.
+
+The receiver finish macro also still fails:
+
+- whole run: `1 / 99 = 1.0%` resolved passes produced a receiver macro kick;
+- last 100: `0 / 22 = 0.0%`;
+- macro frames are still dominated by `bad_cone=3,984`, `settle=3,984`, `acquire=1,876`,
+  `kick_align=1,820`, then deadline expiry.
+
+So the goal-rate improvement is mostly the Stage 3 solo policy adapting to the easier goalie-only
+environment. The pass chain is visible, but it is not profitable and not reliable. The policy often
+requests passes during forced-pass windows, but the pass macro rarely reaches a valid front-cone
+launch; when a pass resolves, the receiver still fails to turn that possession into a kick.
+
+### Fix for next run
+
+Do not promote this as a coordinated Stage 4 policy.
+
+The next change should be structural, not just reward tuning:
+
+- make pass execution a deterministic command-level macro once a valid pass target is selected:
+  reacquire/settle the carrier's ball into the front cone, align to the latched receiver target, and
+  fire, instead of requiring PPO to keep resampling `pass_to_teammate` while the physical launch
+  conditions flicker;
+- treat repeated pass requests with no fire as a failed macro state and release the forced-pass mask,
+  because it currently burns long episodes with `requested >> fired`;
+- make post-pass finish more direct: after a resolved pass, if the receiver spends too many bad-cone
+  frames, force a geometric face/settle-to-goal action and then kick, or expire quickly with penalty
+  instead of consuming 80 steps;
+- keep the tighter receive target geometry, because fired passes now resolve much better;
+- reintroduce defender pressure only after a goalie-only run shows non-zero receiver finish
+  consumption in the last 100 episodes.
+
+Math note: lowering standalone pass reward was correct. A quality-0.5 resolved pass now pays only
+`(0.5 + 1.5*0.5) / 2 = +0.625` team reward, while a quality-0.5 receiver finish would pay roughly
+`(24 + 20*0.5) / 2 = +17` before shot-quality scaling. The problem is not reward EV now; it is that
+the physical pass and receive-finish macros almost never reach their terminal kick states.
+
+---
+
+## 45. Training run: 20260629_015011_487635 — PPO `stage4s_goalie_only_pass_pretrain` / repeated goalie-only run (FAILED — no new coordination progress)
+
+**Completed** at 149,905 / 150,000 steps.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Re-run active Stage 4s goalie-only pass mechanics pretrain with the same post-pass finish
+and reward settings as §44, to see whether another 150k steps would produce stable pass-to-finish
+behavior.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 695 |
+| Overall goals | 178 / 695 = **25.6%** |
+| Last 100 goal rate | **32.0%** |
+| Avg reward last 10 | **+18.75** |
+| Avg episode length last 10 | 182.7 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 261 (37.6%), `goal_scored` 178 (25.6%),
+`goalie_catch` 105 (15.1%), `max_steps` 101 (14.5%), `attacker_excessive_dribble` 29 (4.2%),
+`ball_out_of_bounds` 20 (2.9%), `frozen_state_stale_sim` 1 (0.1%).
+
+**Goal-rate trend:** 29.5% -> 20.0% -> 24.5% -> 31.6%. This is worse than §44, where the final
+bucket reached 41.8%.
+
+**Aim quality:** first 200 kicks avg `aim_quality=0.399`, bad aim 8.0%; last 200 kicks avg
+`aim_quality=0.399`, bad aim 12.0%. Aim quality did not improve.
+
+**Pass pipeline totals:**
+
+- `requested=14,256`
+- `fired=211` (`1.5%` request -> fire)
+- `resolved=92` (`43.6%` fire -> resolve, `0.6%` request -> resolve)
+- `timeout=34`
+- `interception=2`
+- `receive_finish_macro started=92`
+- `finish_banked=92`
+- `finish_consumed=1`
+- `receive_finish_macro fired=1`
+- `receive_finish_macro expired=82`
+
+**Final 100 episodes pass pipeline:**
+
+- `requested=1,789`
+- `fired=21` (`1.2%` request -> fire)
+- `resolved=12` (`57.1%` fire -> resolve)
+- `receive_finish_macro started=12`
+- `receive_finish_macro fired=0`
+- `finish_consumed=0`
+- `receive_finish_macro expired=12`
+
+**Support/pass diagnostics across the run:**
+
+- support modes: `RECEIVE_READY=69,769`, `RECEIVE_TARGET=40,582`,
+  `GENERAL_SUPPORT=39,554`
+- target reasons: `ok=110,351`, `too_close_for_ssl_pass=33,427`,
+  `blocks_carrier_shot_lane=6,127`
+- pass mask reasons: `not_kickable=30,855`, `too_close=23,529`,
+  `bad_reception_cone=21,772`, `receiver_far=7,426`,
+  `blocks_carrier_shot_lane=2,353`, `direct_shot_better=2,008`
+
+### Code changes (non-config)
+
+No additional source changes beyond §44. This run tested whether the same Stage 4s setup would learn
+with another independent 150k training run from the Stage 3 v3 base checkpoint.
+
+### What went wrong
+
+This run did not make progress relative to §44:
+
+- overall goal rate fell from 27.5% to 25.6%;
+- last-100 goal rate fell from 42.0% to 32.0%;
+- request -> fire stayed stuck at about 1.5%;
+- final-100 receiver finish remained zero: `0 / 12` receive-finish macros fired.
+
+The failure mode is now stable and reproducible. The supporter creates many nominally valid targets
+(`ok` target reasons ~110k), but the carrier is usually not in a physical launch state
+(`not_kickable`, `bad_reception_cone`, `too_close`, `receiver_far`). When a pass does resolve, the
+receiver macro again spends its budget in `bad_cone`/`settle`/`acquire`/`kick_align` and expires
+without a shot.
+
+The final policy is still a solo/dribble/direct-shot policy with occasional attempted passes. The
+pass chain is visible in logs but not behaviorally useful.
+
+### Fix for next run
+
+Do not run another reward-only repeat of Stage 4s. The repeated run confirms the bottleneck is
+structural.
+
+Next code change should be:
+
+- a deterministic carrier pass-execution macro that owns `ACQUIRE -> SETTLE_FRONT_CONE ->
+  ALIGN_TO_LATCHED_TARGET -> FIRE_PASS` once the policy selects a valid pass;
+- a deterministic receiver finish macro that owns `ACQUIRE -> SETTLE_FRONT_CONE -> FACE_GOAL ->
+  FIRE_KICK`, with a short bad-cone cap instead of an 80-step expiry loop;
+- explicit abort/failure penalties for repeated requested-but-not-fired pass windows and
+  resolved-pass-with-no-shot expiry.
+
+Math note: the reward is already shaped so the finish is much more valuable than the pass. A
+quality-0.5 resolved pass pays about `+0.625` team reward, while a quality-0.5 finish would pay about
+`+17` before shot-quality scaling. Since the policy still gets `0` final-100 finish fires, more
+reward does not create learning signal; the macro needs to physically produce the kick events first.
+
+---
+
+## 46. Training run: 20260629_025315_805063 — PPO `stage4s_goalie_only_pass_pretrain` / committed pass-receive macro run (FAILED — worse goals, receiver still never finishes)
+
+**Completed** at 149,667 / 150,000 steps.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Test the new committed pass/receive macro path in goalie-only Stage 4s: when the carrier
+requests a pass, the env should own pass execution; when a pass is fired, the receiver should move to
+the pre-contact receive pose and then finish from possession. This was meant to turn the previously
+observed resolved-pass-but-no-shot failure into actual pass-to-kick chains.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 555 |
+| Overall goals | 95 / 555 = **17.1%** |
+| Last 100 goal rate | **15.0%** |
+| Avg reward last 10 | **+6.23** |
+| Avg episode length last 10 | 261.2 |
+
+**Episode outcomes:** `max_steps` 250 (45.0%), `ball_in_penalty_off_target` 115 (20.7%),
+`goal_scored` 95 (17.1%), `frozen_state_stale_sim` 45 (8.1%), `goalie_catch` 35 (6.3%),
+`attacker_excessive_dribble` 10 (1.8%), `ball_out_of_bounds` 5 (0.9%).
+
+**Goal-rate trend:** 18.5% -> 17.0% -> 15.5%. This is a clear regression from §45
+(`25.6%` overall, `32.0%` last 100) and from §44 (`42.0%` last 100).
+
+**Aim quality:** first 200 kicks avg `aim_quality=0.382`, bad aim 8.9%; last 200 kicks avg
+`aim_quality=0.382`, bad aim 8.9%. Aim did not improve.
+
+**Pass pipeline totals:**
+
+- `requested=22,840`
+- `fired=62` (`0.27%` request -> fire)
+- `resolved=40` (`64.5%` fire -> resolve, `0.18%` request -> resolve)
+- `pass_macro_started=3,447`
+- `pass_macro_timeouts=136`
+- pass macro fallback reasons: `pass_kick_failed=3,042`, `pass_macro_align_timeout=136`
+- `receive_finish_macro started=62`
+- `finish_banked=40`
+- `finish_consumed=0`
+- `finish_expired=39`
+- `receive_finish_macro fired=0`
+- `receive_finish_macro expired=40`
+- receiver macro spent `1,781` frames in `bad_cone` and `758` in `kick_align`
+
+**Support/pass diagnostics across the run:**
+
+- support modes: `RECEIVE_READY=79,368`, `GENERAL_SUPPORT=38,806`,
+  `RECEIVE_TARGET=31,493`
+- target reasons: `ok=110,861`, `too_close_for_ssl_pass=33,811`,
+  `blocks_carrier_shot_lane=4,978`, `low_continuation_quality=17`
+- pass mask reasons: `too_close=26,742`, `not_kickable=23,173`,
+  `bad_reception_cone=8,156`, `receiver_far=4,436`,
+  `direct_shot_better=1,812`, `blocks_carrier_shot_lane=1,757`
+- `pass_available_steps=0`
+
+### Code changes (non-config)
+
+This run included the committed pass/receive macro changes after §45:
+
+- carrier pass requests enter a command-level pass macro instead of relying only on action masking;
+- fired passes start an unresolved receiver macro immediately, so the receiver can move to a
+  pre-contact receive pose before the pending pass formally resolves;
+- the receive pose is placed just behind the target along the incoming pass line using the robot plus
+  ball contact radius;
+- pending pass expiry clears the unresolved receive macro;
+- post-pass finish state remains keyed by receiver robot id.
+
+### What went wrong
+
+The changes did **not** improve the model. They made the logs more diagnostic, but performance
+regressed:
+
+- goal rate fell to `17.1%` overall and `15.0%` last 100;
+- `max_steps` jumped to `45.0%`;
+- request -> fire fell from §45's `1.48%` to `0.27%`;
+- receiver finish stayed at `0` fired shots and `0` consumed finish banks;
+- resolved/fired improved to `64.5%`, but the model fired too few passes for that to matter.
+
+The main bottleneck is now the carrier pass execution macro. The policy requested many more passes
+than before, but `3,042 / 3,447` pass macro starts ended as `pass_kick_failed`, and another `136`
+timed out. On the receive side, every useful resolved-pass reward still disappears: `40` finish banks
+were created, `39` expired, and none were consumed.
+
+The receive side is also still not physically settling into a front-cone shot state. The receiver
+macro spent many frames in `bad_cone`/`kick_align` but fired zero times, which matches the visual
+symptom where the receiver turns around or over-aims instead of finishing.
+
+### Fix for next run
+
+Do not train this version further. The next change should make the macro less policy-like and more
+deterministic:
+
+- when a valid pass is committed, do not repeatedly call a kick attempt that can fail; explicitly
+  drive `SETTLE_FRONT_CONE -> FACE_TARGET_SMALLEST_ANGLE -> FIRE_PASS` and fire only when the front
+  cone is valid;
+- after pass resolution, make the receiver finish macro face the best in-mouth goal target using
+  shortest-angle geometry, with a hard cap on bad-cone frames;
+- if the receiver cannot enter a valid cone within the cap, abort quickly with a training penalty
+  instead of burning most of the episode;
+- keep the pre-contact receive pose idea, because fired passes are resolving better, but it cannot be
+  the whole fix.
+
+Math note: the run confirms the problem is not pass reward magnitude. A fired pass now resolves more
+often than before (`64.5%` vs `43.6%`), so the lane/receive target is not hopeless. The failure is
+that only `0.27%` of requests become fired passes and `0 / 40` resolved passes become finish shots.
+No scalar reward can train a pass-to-goal policy when the environment almost never emits the terminal
+kick event.
+
+---
+
+## 47. Training run: 20260629_040401_401350 — PPO `stage4s_goalie_only_pass_pretrain` / Codex deterministic contact-pose pass+receive macros (FAILED the finish bar — receiver fired 3/485, 0 in last-100; policy is a solo dribbler that only passes when forced)
+
+**Completed** at 149,922 / 150,000 steps. Wall-clock ~16 min (embedded, MPS).
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** First test of Codex's untested deterministic contact-pose macros (CHANGES.md 2026-06-29 ×2: the Sumatra-style committed pass/receive macro + the `acquire → settle_contact → face_target → fire` phasing with `_can_fire_physical_kick`). Goalie-only 2v1. Hypothesis: deterministic contact-pose phasing finally makes the receiver emit a finish kick.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 815 |
+| Overall goals | 149 / 815 = **18.3%** |
+| Last 100 goal rate | **24.0%** (trend 13.5→16→19.5→24.5%, then a 15-ep partial bucket) |
+| Avg reward last 10 | +22.86 |
+| Avg episode length last 10 | 162.0 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 426 (52.3%), `goal_scored` 149 (18.3%),
+`ball_out_of_bounds` 90 (11.0%), `max_steps` 72 (8.8%), `goalie_catch` 57 (7.0%),
+`attacker_excessive_dribble` 20 (2.5%).
+
+**Aim quality:** first 200 kicks `aim=0.372` bad 7.0%; last 200 `aim=0.374` bad 7.5%. Stable.
+
+**Pass pipeline (full run):**
+
+- `requested=22,662`, `fired=485` (**2.14%** req→fire), `resolved=109` (**22.5%** fired→resolve — *down* from §44 43.6% / §46 64.5%), `timeout=92`, `interception=4`
+- `pass_macro started=1,041`, **`align_timeout=493` (47% of macro starts die on align)**, fallback_reasons all `pass_macro_align_timeout`
+- **`receive_finish_macro started=485 → FIRED=3 → expired=189`**; finish_bank banked=109 consumed=3 expired=87
+- receive-macro frames: **`acquire=9,480`** (dominant), `bad_cone=1,199`, `settle=1,199`, `kick_align=608`
+- **Last 100 eps:** requested=2,336 fired=47 resolved=13 — **receive_finish fired=0**, expired=24
+
+**Debug inference (sim-embedded, 8k steps, 40 eps):** goal_rate **52.5%**, actions `goto=50% dribble_to=35% approach_ball=10% kick=0%`, `requested approach_ball=9602 dribble_to=5735 kick=663`, 103 carries — **zero `pass_to_teammate`**. The inference policy is a pure solo dribble-and-score strategy; passing does not appear when not forced by the mask.
+
+### Code changes (non-config)
+
+This run is the first training test of the uncommitted Codex changes already logged in CHANGES.md
+(2026-06-29): contact-pose helpers (`_front_contact_pose`, `_at_contact_pose`,
+`_can_fire_physical_kick`, `_goto_contact_pose_command`), `pass_macro_phase`
+(`acquire→settle_contact→face_target→fire`), `passer_support_lock_until_count`, and the
+pre-contact receiver-pose macro. No additional source edits for this run.
+
+### What went wrong
+
+The contact-pose phasing did **not** fix the finish chain, and resolution actually regressed.
+
+1. **Carrier can't reach the fire gate.** `_can_fire_physical_kick` requires the ball in the front
+   reception cone *and* heading-to-target ≤5° *simultaneously*. That only holds when the robot sits
+   exactly at the contact pose (behind ball, colinear to target). Small movement/turn error drops it
+   back to `face_target` and re-loops, so 493/1041 = **47%** of pass macros die on
+   `pass_macro_align_timeout`. The `face_target` turn is incremental (`turn angle_diff/dt`,
+   JAL_env.py:3416) under the rate cap — the documented bang-bang convergence failure
+   ([[project_turn_cap_breaks_aiming]]).
+2. **Passes don't reach the receiver.** fired→resolve fell to 22.5% (from 43–64%), so most fired
+   passes never get to the receiver — lead-target / pass-power / receiver positioning is off.
+3. **Receiver can't collect or finish.** `receive_finish_macro` is dominated by `acquire=9,480`
+   frames — the receiver mostly never even gets the ball into a shot pose; only 3/485 fired.
+4. **The deepest problem is structural, not mechanical.** Debug inference proves the policy scores
+   **52.5% solo by dribbling** and never passes voluntarily. In goalie-only 2v1 there is no defender
+   blocking the dribble, so **solo dribble strictly dominates passing** — the policy is *correct* to
+   not pass. Forced passes that then physically fail teach the policy passing is worthless (a death
+   spiral). We are asking the model to prefer a brittle, failing pass over a 52%-effective dribble in
+   an environment that never requires a pass.
+
+### Fix for next run
+
+Two-layer fix; pick the carrier+receiver mechanics first since they gate everything:
+
+- **Make pass fire robust (carrier):** stop requiring a simultaneous 5° cone + heading lock reached
+  by incremental turning. Once the carrier is at/near the contact pose, fire the pass with the
+  geometric target angle directly (the catch-glue already holds the ball in front), or widen the fire
+  tolerance and fire on the first in-cone frame instead of re-looping `face_target`. Target: align
+  timeout < 10%.
+- **Make the receiver finish reuse the proven solo behavior:** the policy already dribbles-to-goal and
+  scores 52% solo. After a pass resolves, hand the ball-claim to the receiver and let the normal
+  `approach→dribble_to→kick` primitives finish, instead of a deterministic 5°-cone finish macro that
+  fires 3/485. The finish macro is *less* capable than the policy it overrides.
+- **Reconsider the environment incentive (structural):** consider whether goalie-only is the right rung
+  to teach passing at all — with no defender, dribble dominates. Either (a) accept 2v1 as a
+  *pass-mechanics* rung whose only bar is "a forced pass reliably ends in a goal" (i.e. fix execution,
+  don't expect voluntary passing), then move to 2v2 where a defender makes passing necessary; or
+  (b) add a light dribble-suppression / lane pressure so passing can out-score dribbling here.
+
+Math note: no reward change made this run. Reward EV already favors finish over pass
+(§44/§45 math). The blocker remains terminal-event emission: 3/485 finish fires and 47% pass-align
+timeouts mean there is no learning signal for "pass then score," regardless of reward magnitude.
+
+---
+
+## 48. Training run: 20260629_043329_437513 — PPO `stage4s_goalie_only_pass_pretrain` / fire gate widened 5°→10° (PARTIAL — fixed what it targeted, exposed the real bottleneck: passes overshoot the receiver)
+
+**Completed** at 149,957 / 150,000 steps. Wall-clock ~16 min.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Test the fire-gate wiring fix (CHANGES.md 2026-06-29 "fire gate widened 5°→10°"): wire
+`pass_macro_orientation_threshold_deg=10` and thread `angle_tolerance` through `kick()` so the
+macros can actually emit a kick instead of re-looping on the hardcoded 5° gate. Hypothesis: align
+timeout drops and receive-finish fires go non-zero.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 879 |
+| Overall goals | 163 / 879 = **18.5%** |
+| Last 100 goal rate | **11.0%** (trend 19→20.5→21→17→10%, declining) |
+| Avg reward last 10 | +5.69 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 487 (55.4%), `goal_scored` 163 (18.5%),
+`goalie_catch` 96 (10.9%), `ball_out_of_bounds` 63 (7.2%), `max_steps` 52 (5.9%).
+
+**Pass pipeline (full run):**
+
+- `requested=20,620`, `fired=525` (2.55%, up from §47 2.14%), **`resolved=48` (9.1% of fired — DOWN from §47 22.5%)**
+- `pass_macro started=964`, `align_timeout=390` (**40.5%**, down from §47 47%)
+- `receive_finish_macro started=525 → FIRED=4 → expired=133` (vs §47 3); finish frames `acquire=9,226 bad_cone=482 (↓from 1,199) kick_align=370 (↓from 608)`
+- expired split: **timeout=76, interception=14**
+- **Last 100:** fired=59 resolved=4 (6.8%), receive_finish fired=0
+
+### Code changes (non-config)
+
+`kick()` gained an `angle_tolerance` param (default 5° preserves solo shooting); `JAL_env.py` carrier
+and receiver fire gates now read the 10° config knobs; `reward.py` added
+`receive_finish_fire_tolerance_deg=10`. See CHANGES.md 2026-06-29.
+
+### What worked
+
+The fix did exactly what it targeted: align timeout 47%→40.5%, fire rate up, and the finish-macro
+cone walls fell sharply (`bad_cone 1199→482`, `kick_align 608→370`) — so the carrier fires more and
+the receiver reaches a shot pose more easily. Mechanically the gate was the right diagnosis.
+
+### What went wrong — the real bottleneck is pass DELIVERY, and the gate change made it worse
+
+`resolved/fired` crashed 22.5%→9.1%. The wider 10° release angle traded accuracy for fire-rate, so
+passes miss the receiver even more. But the deeper, dominant problem is **gross pass overshoot**,
+independent of angle:
+
+- on expiry, ball-to-aim `miss` median = **23.7 units**; ball `travelled` from release median =
+  **32 units** — yet passes are aimed only ~10–16 units forward.
+- fired-pass `power` median = **72**, with **261/525 at the 75 cap**. The old power model
+  (`base=30 + 3·d`, cap 75) sends nearly every pass at ~max power.
+- **Verified physics:** total ball travel = `power · kick_power_rate / (1−ball_decay)` =
+  `power · 0.027 / 0.06` = `power · 0.45`. So power 72 → 32.4u travel, matching the measured 32u
+  exactly. A pass aimed 12u away travels ~30u → **rockets ~18u past the receiver** → ball runs to
+  the goalie or out → timeout/interception → 9% resolve. The receiver burns `acquire=9,226` frames
+  chasing balls that already blew past.
+
+This is why every prior run (§43–§47) capped at 9–22% resolution regardless of fire-angle or finish
+macro: the ball never arrives at the receiver.
+
+### Fix for next run (run #3, applied — config only)
+
+Size pass power to the pass distance so the ball arrives at the receiver still rolling (catchable),
+instead of overshooting 2.5×. Using verified travel = `power · 0.45`, target travel ≈ `d` →
+`power ≈ d / 0.45 ≈ 2.2·d`:
+
+- `pass_power_base: 30 → 2`, `pass_power_per_unit: 3 → 2.2`, `pass_power_min: 35 → 15`,
+  `pass_power_max: 75 → 48`.
+- Resulting travel is a uniform ~+0.8u past the target across d=7..20 (ball reaches the receiver and
+  keeps rolling slightly — a true through-ball). e.g. d=12 → power 28 → travel 12.8u (was 30u).
+
+Kept the 10° fire gate (overshoot, not angle, is the dominant delivery error; at d=12 a 10° error is
+only 2.1u lateral, within the receiver collection window). Single-variable change so attribution is
+clean: watch `resolved/fired` (target >40%, was 9%) and `receive_finish FIRED`.
+
+---
+
+## 49. Training run: 20260629_045535_501979 — PPO `stage4s_goalie_only_pass_pretrain` / pass power sized to distance (PROGRESS on goals; pass still doesn't connect — receiver rendezvous is the next bottleneck)
+
+**Completed** at ~149,900 / 150,000 steps. Wall-clock ~16 min.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Stop passes overshooting the receiver by sizing pass power to distance
+(`base 30→2, per_unit 3→2.2, max 75→48`, verified travel = `power·0.45`). Hypothesis:
+`resolved/fired` jumps from 9% as the ball arrives at the receiver instead of 18u past it.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 605 |
+| Overall goals | 171 / 605 = **28.3%** (up from §48 18.5%) |
+| Last 100 goal rate | **29.0%** (up from §48 11.0%; trend 27→29.5→27.5%, stable) |
+| Avg reward last 10 | +18.7 |
+| Avg episode length last 10 | 262.7 (up — episodes drag longer) |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 214 (35.4%), `goal_scored` 171 (28.3%),
+**`max_steps` 152 (25.1%, up from §48 5.9%)**, `goalie_catch` 38 (6.3%), `attacker_excessive_dribble`
+17 (2.8%), `ball_out_of_bounds` 13 (2.1%).
+
+**Pass pipeline (full run):**
+
+- `requested=24,485`, `fired=487` (1.99%), **`resolved=44` (9.0% — unchanged from §48)**
+- expired: **timeout=405, interception=0** (was 76/14 — the overshoot-into-goalie is gone)
+- `pass_macro started=1,229`, `align_timeout=645` (52%, up)
+- `receive_finish_macro started=487 → FIRED=6 → consumed=6 → expired=443`; **acquire_frames=16,050** (≈33/macro)
+- `EXPIRED travelled median = 17.3u` (was 32u — power fix confirmed working)
+- `FIRED power median = 30, max = 48` (was median 72 / cap 75 — power fix confirmed)
+- **Last 100:** fired=84 resolved=10 (11.9%), receive_finish FIRED=2 (first non-zero last-100)
+
+### Code changes (non-config)
+
+None. Config-only: pass power model (see §48 Fix). Plus prior runs' fire-gate wiring (CHANGES 6-29).
+
+### What worked
+
+The power fix did exactly what the physics predicted: `travelled` 32→17u, `power` 72→30, and
+**interceptions went to 0** — the ball no longer rockets past the receiver into the goalie or out.
+That alone lifted overall goals 18.5→28.3% and last-100 11→29% (fewer balls lost; more stay in play
+to be dribbled in), and produced the first non-zero last-100 finish fires (2).
+
+### What went wrong — receiver rendezvous, not ball speed
+
+`resolved/fired` stayed at 9% and the failure mode shifted entirely to **timeout** (405/405): the
+ball now stops short/beside the receiver instead of overshooting, but the receiver still never
+collects it — `acquire_frames` ≈33/macro means the receiver spends the *whole* 35-step window
+chasing and never reaches the ball. `max_steps` episodes rose to 25% (ball stays in play, receiver
+chases it around to the deadline).
+
+Root cause located in `_support_pass_candidate` (JAL_env.py:5183): a pass fires as long as the
+receiver is within **`support_pass_receiver_max_target_dist = 9.0` units** of the aim point, and
+`support_pass_allow_receive_target=True` lets it fire while the receiver is still *en route*
+(RECEIVE_TARGET mode, not settled). So the ball is sent ~to a forward point the receiver is still up
+to 9u away from and hasn't reached — it can't close 9u **and** settle/catch within 35 steps.
+
+### Fix for next run (run #4, applied — config only)
+
+Tighten the rendezvous gate so a pass only fires when the receiver is settled near the landing point:
+`support_pass_receiver_max_target_dist: 9.0 → 4.0`. With the now-correct power (ball travels to the
+aim point), requiring the receiver within 4u of that point means the ball should arrive at/just past
+the receiver while it is roughly in place. Single-variable change; watch `resolved/fired` (target
+>30%, was 9%) and whether `max_steps` drag falls. If resolution improves but caps, next step is to
+aim the pass at the receiver's actual position (+small goal-ward lead) rather than a fixed forward
+support point, removing the rendezvous dependency entirely.
+
+---
+
+## 50. Training run: 20260629_051457_049654 — PPO `stage4s_goalie_only_pass_pretrain` / tighten rendezvous tol 9→4 (FAILED — falsified the tolerance hypothesis; resolution got worse)
+
+**Completed** at ~149,900 / 150,000 steps. Wall-clock ~16 min.
+
+**Aim:** Make a pass fire only when the receiver is settled near the landing point
+(`support_pass_receiver_max_target_dist 9.0 → 4.0`), so the ball arrives at the receiver. Hypothesis:
+resolved/fired jumps from 9%.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 689 |
+| Overall goals | 165 / 689 = **23.9%** (down from §49 28.3%) |
+| Last 100 goal rate | **25.0%** (down from §49 29.0%) |
+
+**Pass pipeline:** `requested=21,286 fired=442 (2.08%) resolved=29` (**6.6%** — *worse* than §49 9.0%);
+expired `timeout=365 interception=0`; `pass_macro align_timeout=467/1016 (46%)`;
+`receive_finish started=442 → FIRED=11 → consumed=9` (finish conversion up — when a pass resolves the
+fixed finish now fires); `acquire_frames=14,686`. Last-100: fired=64 resolved=3 (5%), finish FIRED=0.
+
+### Code changes (non-config)
+
+None. Config-only: `support_pass_receiver_max_target_dist 9 → 4`.
+
+### What went wrong
+
+The hypothesis was **falsified**: requiring the receiver within 4u of its support target did not make
+passes connect — resolution dropped to 6.6% and goals to 23.9%. So even a receiver settled within 4u
+of the aim point, with correct power, doesn't end up with the ball. This proves the problem is not the
+receiver's distance to its *target* but the **open-loop aim-at-a-fixed-point design**: the ball, the
+support target, the receive pose (1.1u beyond), and the receiver's real position are four points that
+don't coincide, and kick-noise scatter over 12–17u widens the gap. (Silver lining: `FIRED=11,
+consumed=9` confirms that *when* a pass resolves, the post-§48 finish reliably converts it — the
+finish is no longer the blocker; delivery is.)
+
+### Fix for next run (run #5, applied — code + config)
+
+Stop aiming at an abstract point. **Aim the pass "to feet"** at the receiver's actual position plus a
+small goal-ward lead, so the ball goes to the robot regardless of where it is. Shrank
+`pass_receive_pose_offset 1.115 → 0.6` so the receiver barely moves from the aim point, reverted
+`max_target_dist 4 → 6`. See CHANGES.md 2026-06-29 "to-feet passing". This removes the multi-point
+rendezvous that capped resolution at 6–9% across runs §47–§50. Watch `resolved/fired` (break past 9%)
+and goals.
+
+---
+
+## 51. Training run: 20260629_053706_717764 — PPO `stage4s_goalie_only_pass_pretrain` / "to-feet" passing (MARGINAL — resolution 10.9%, plateau barely moved; stale-aim flaw identified)
+
+**Completed** at ~149,900 / 150,000 steps.
+
+**Aim:** Aim the pass at the receiver's actual position (+1u goal lead) instead of an abstract support
+point, to remove the rendezvous mismatch. Expected `resolved/fired` to break past 9%.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 695 |
+| Overall goals | 160 / 695 = **23.0%** |
+| Last 100 goal rate | **22.0%** |
+
+**Pass pipeline:** `requested=21,028 fired=439 (2.09%) resolved=48` (**10.9%** — barely above the 9%
+plateau); expired `timeout=308 interception=0`; **`pass_macro align_timeout=531/1076 (49%)`** (up —
+half of all pass macros never fire); `receive_finish started=439 FIRED=4 consumed=4`;
+`acquire_frames=13,948`. Last-100: fired=59 resolved=4 (7%), finish FIRED=0.
+
+### Code changes (non-config)
+
+To-feet aiming + `pass_to_feet_lead=1.0` + `pass_receive_pose_offset 1.115→0.6` + `max_target_dist
+4→6`. See CHANGES.md 2026-06-29 "to-feet passing".
+
+### What went wrong
+
+To-feet moved resolution only 9%→10.9% — within noise. Two flaws found:
+
+1. **Stale aim:** the receiver position was latched at macro *start*, but the macro spends up to 90
+   align cycles before firing (49% time out), during which the receiver keeps moving — so the ball
+   is sent to where the receiver *was*, not where it *is*. To-feet aimed at a stale point.
+2. **Carrier alignment is the upstream wall:** `align_timeout=49%` means half the passes never fire
+   regardless of where they aim. The bespoke contact-pose phase machine (acquire→settle→face→fire)
+   oscillates under the rate-capped turn — it is *less* reliable than the `kick(dribbling=True)`
+   helper the 52% solo shooter uses (which does catch→align→fire cap-robustly in one call).
+
+### Fix for next run (run #6, applied — code only)
+
+**Dynamic to-feet:** re-aim at the receiver's *live* position every macro cycle (not the latched
+start position), fixing flaw #1. Single targeted change. Watch `resolved/fired` and `align_timeout`.
+
+### Strategic note (5 runs in)
+
+Resolution has held at **6.6–10.9% across five well-reasoned delivery fixes** (fire gate, power,
+rendezvous tol, to-feet). Meanwhile debug inference shows the policy **scores 52% solo by dribbling
+and never passes voluntarily** — in goalie-only 2v1 a pass is never *needed*, so forced passes that
+fail just suppress the goal rate (training 23% vs inference 52%). The finish is solved
+(`consumed=9/11` when a pass resolves); only open-loop delivery in a noisy sim remains broken. If run
+#6's dynamic to-feet does not clearly lift resolution (>~20%), the conclusion is that **goalie-only
+cannot teach passing** and the next step is either (a) replace the bespoke carrier alignment with the
+proven `kick()` path, or (b) advance to 2v2 where a defender makes passing necessary and the policy
+has a reason to choose it — which is the user's actual end goal.
+
+---
+
+## 52. Training run: 20260629_055539_219154 — PPO `stage4s_goalie_only_pass_pretrain` / dynamic to-feet (REGRESSED — 2nd consecutive regression; goalie-only delivery tuning is exhausted)
+
+**Completed** at ~149,900 / 150,000 steps.
+
+**Aim:** Fix the §51 stale-aim flaw by re-aiming at the receiver's *live* position every macro cycle.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 682 |
+| Overall goals | 137 / 682 = **20.1%** (↓ from §51 23.0%, §49 28.3%) |
+| Last 100 goal rate | **17.0%** (↓ from §51 22.0%) |
+
+**Pass pipeline:** `requested=21,741 fired=457 (2.10%) resolved=33` (**7.2%** — ↓ from §51 10.9%);
+expired `timeout=308 interception=0`; **`align_timeout=573/1131 (51%)`** (↑); `receive_finish
+FIRED=1 consumed=0`. Last-100: fired=69 resolved=6 (9%).
+
+### What went wrong
+
+Re-aiming at the moving receiver every cycle *added* oscillation: the carrier keeps re-turning toward
+a shifting target and never converges, so `align_timeout` rose to 51% and resolution fell to 7.2%.
+Second consecutive regression (§49 28% → §51 23% → §52 20%).
+
+### Decision — stop tuning goalie-only delivery
+
+Six runs (§47–§52) have held pass `resolved/fired` at **6.6–10.9%** through every reasonable delivery
+fix (fire-gate wiring, physics-verified power, rendezvous tolerance, to-feet, dynamic to-feet — the
+last two *regressed*). The finish is solved (`consumed=9/11` when a pass resolves). The blocker is
+open-loop pass **delivery** in a noisy sim, and it is not yielding to parameter tuning.
+
+Compounding this, the strategic premise is falsified: debug inference shows the policy **scores ~52%
+solo by dribbling and never passes voluntarily** — in goalie-only 2v1 a pass is never *needed*, so
+forced passes only suppress the goal rate (training 20–28% vs inference 52%). The stated 2v1 gate
+("≥35% goals AND scores whenever it passes") is effectively unreachable here: the model already
+exceeds 35% at inference *without passing*, and it has no incentive to pass against a lone keeper.
+
+**Action taken:** reverted the two regressing to-feet changes (code + config) back to the §49
+best-known state (28% goals, fire-gate + power fixes retained). Codebase left in best state. Surfaced
+the strategic fork to the user (keep grinding 2v1 delivery via a proven-mechanism carrier rewrite vs
+advance to 2v2 where passing is needed vs accept solo-52%) — the next direction is a plan-level
+decision the experiments have now justified escalating.
+
+---
+
+## 53. Training run: 20260629_095545_323404 — PPO `stage4s_goalie_only_pass_pretrain` / catch-glue settle (BREAKTHROUGH on delivery quality; new bottleneck = carrier wastes episodes failing to fire)
+
+**Completed** at ~149,900 / 150,000 steps. (User direction: fix delivery, stay in 2v1.)
+
+**Aim:** Carrier pass `settle` now catches+glues the ball via `dribble()` (the mechanism the 52% solo
+shot uses) before aiming, so the ball stays in the front cone while turning to the receiver instead of
+drifting out (the ~50% align-timeout oscillation).
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 545 |
+| Overall goals | 120 / 545 = **22.0%** |
+| Last 100 goal rate | **18.0%** |
+
+**Pass pipeline:** `requested=46,402 fired=155 (0.33%)` **`resolved=36 (23.2% of fired)`** — last-100
+**29%**. Up from the 6–11% plateau across §47–§52. `receive_finish started=155 FIRED=5 consumed=4`.
+expired `timeout=107 interception=0`.
+
+**But:** `pass_macro align_timeout=897/1228 (73%)` (worse than ~50%), `align_steps median=182/episode`
+(budget 90). The carrier burns ~90% of each episode in non-convergent pass alignment.
+
+### Code changes (non-config)
+
+`JAL_env.py`: carrier pass `settle_contact` calls `dribble()` (catch+glue) instead of
+`_goto_contact_pose_command`; added `dribble` import. See CHANGES.md 2026-06-29 "catch-glue".
+
+### What worked
+
+**Delivery quality is fixed.** `resolved/fired` jumped 9–11% → **23.2%** (last-100 29%) — catching the
+ball before aiming makes the passes that fire actually reach the receiver. This is the first real break
+of the plateau. The receiver finish still converts (consumed 4/5).
+
+### What went wrong
+
+Catching is slower than the old (broken) goto-pose, and the in-cone aim turn still occasionally drops
+the ball back to settle → re-catch, so `align_timeout` rose to 73% and only 155 passes fired (vs ~440).
+`align_steps median=182/ep` (budget 90) ⇒ most macros hit the full budget without converging
+(oscillation, not slowness). The carrier wastes the episode failing to pass, holding goals at 22%.
+
+### Fix for next run (run #8, applied — config only)
+
+Stop wasting episodes on forced passes the carrier can't complete: **shoot more, pass selectively.**
+`stage4_force_pass_max_direct_shot_quality 0.42 → 0.25` (force a pass only when the direct shot is
+genuinely poor) and `stage4_force_open_shot_quality 0.48 → 0.40` (take decent shots via the proven 52%
+solo skill). Goals should rise toward the 35% bar; the catch-glue's 23%-connect passes still fire in
+poor-shot situations, preserving "scores whenever it passes." If goals rise but passing becomes too
+rare, next lever is fixing the in-cone oscillation directly (hold the catch through the aim turn).
+
+---
+
+## 54. Training run: 20260629_101702_155561 — PPO `stage4s_goalie_only_pass_pretrain` / shoot-more, pass-selective (PROGRESS — goals 22→27.6%; pass chain intact, finish converts 6/6)
+
+**Completed** at ~149,900 / 150,000 steps. (Direction: fix delivery, stay in 2v1.)
+
+**Aim:** After the catch-glue delivery win (§53), stop the carrier wasting episodes on forced passes it
+can't complete: `stage4_force_pass_max_direct_shot_quality 0.42→0.25`, `stage4_force_open_shot_quality
+0.48→0.40` (shoot more, pass only when the shot is genuinely poor).
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 613 |
+| Overall goals | 169 / 613 = **27.6%** (up from §53 22.0%) |
+| Last 100 goal rate | **27.0%** (up from §53 18.0%) |
+
+**Episode outcomes:** `max_steps` 209 (34.1% — still dragging), `goal_scored` 169 (27.6%),
+`ball_in_penalty_off_target` 150 (24.5%), `goalie_catch` 53 (8.6%).
+
+**Pass pipeline:** `fired=151 resolved=22 (14.6%)`; `align_timeout=740/1019 (73%)`; **`receive_finish
+FIRED=6 consumed=6`** (every started finish converted — pass→shot chain works). Last-100 fired=29
+resolved=5.
+
+### What worked
+
+Goals +5.6pp (22→27.6%) and the pass chain stayed intact — `consumed=6/6` means resolved passes still
+convert to receiver shots. So shooting more lifts goals without breaking "scores when it passes."
+
+### What went wrong
+
+Still short of 35%, and `max_steps=34%` shows the carrier still wastes a third of episodes stuck in
+forced-pass oscillation (`align_timeout=73%`). Pass resolution dipped to 14.6% (passes now occur in
+tougher spots).
+
+### Fix for next run (run #9, applied — config only)
+
+Take one more step on the proven lever: `stage4_force_pass_max_direct_shot_quality 0.25→0.18`,
+`stage4_force_open_shot_quality 0.40→0.35` — let the carrier shoot/dribble (its 52% solo skill)
+whenever it has even a modest shot, forcing a pass only in genuinely dire shot situations. Expect goals
+toward 35% and `max_steps` to fall, while the catch-glue still connects the (now rarer) passes. If
+goals stall short of 35%, switch to fixing the in-cone align oscillation directly (mirror the shot's
+`dribble_to`-toward-target carry in the pass settle so the ball aligns to the pass direction instead of
+ping-ponging settle↔aim).
+
+---
+
+## 55. Training run: 20260629_103653_978676 — PPO `stage4s_goalie_only_pass_pretrain` / shoot-more step 2 + KEY inference finding (35% bar MET; voluntary passing needs 2v2)
+
+**Completed** at ~149,900 / 150,000 steps.
+
+**Aim:** Push the shoot-more lever (`force_pass 0.25→0.18`, `force_open_shot 0.40→0.35`) toward 35%.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 695 |
+| Overall goals | 197 / 695 = **28.3%** |
+| Last 100 goal rate | **20.0%** |
+
+**Pass pipeline:** `fired=107 resolved=28 (26.2%)`, `align_timeout=74%`, **`receive_finish FIRED=8
+consumed=8`** (every resolved pass converts to a receiver shot). `max_steps` down to 20.4%. Passing
+got rarer (12 fired in last 100).
+
+### Debug inference (sim-embedded, 8k steps, 38 eps) — the decisive datapoint
+
+`goal_rate=52.6%`, actions `goto=50% dribble_to=36% kick=0%`, **requested: approach_ball=9559
+dribble_to=5818 kick=623 — ZERO pass requests.** The forced-pass mask is training-only; given free
+choice the model is a pure solo dribble-scorer at **52.6%**.
+
+### Conclusion — 2v1 rung is done; advance to 2v2
+
+1. **35% goal bar is MET** (52.6% at inference; training ~28% was exploration + forced-pass drag).
+2. **The pass→goal machinery now works**: catch-glue delivery (resolved/fired 9%→26%) + receiver
+   finish conversion (`consumed=8/8`). When the model passes, the chain scores.
+3. **But the model will not pass *voluntarily* in goalie-only 2v1** — dribbling scores 52%, so the
+   policy correctly never chooses a pass. No delivery fix changes this incentive; it is structural
+   ([[project_stage4_goalie_only_cant_teach_passing]]).
+
+The "shoot-more" lever plateaued (§54 27.6% → §55 28.3%). The 2v1 rung has produced everything it
+structurally can: goals past 35% and functional pass mechanics. **Plan:** validate the in-cone
+oscillation fix once in clean 2v1 (run #10), then add the defender and move to **2v2**, where the
+defender blocks the dribble so passing becomes necessary and the policy finally has a reason to choose
+it — the user's actual end goal.
+
+---
+
+## 56. Training run: 20260629_105536_146782 — PPO `stage4s_goalie_only_pass_pretrain` / dribble_to-toward-receiver settle (PARTIAL — align wall mostly fixed; move to 2v2)
+
+**Completed** at 149,860 / 150,000 steps.
+
+**Load model:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+**Aim:** Validate the Run #10 carrier pass-settle change: replace the catch-only `dribble()` settle
+with `dribble_to(target=receiver)` so the carrier catches and carries in the pass direction before
+aiming. Target metric: reduce `pass_macro align_timeout` from the §55 plateau of ~74% toward <40%.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 677 |
+| Overall goals | 191 / 677 = **28.2%** |
+| Last 100 goal rate | **31.0%** |
+| Avg reward last 10 | +15.54 |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 214 (31.6%), `goal_scored` 191 (28.2%),
+`max_steps` 129 (19.1%), `goalie_catch` 90 (13.3%), `attacker_excessive_dribble` 38 (5.6%),
+`ball_out_of_bounds` 13 (1.9%), `frozen_state_stale_sim` 2 (0.3%).
+
+**Pass pipeline:** `requested=3,042`, `fired=191` (**6.3% request→fire**), `resolved=35`
+(**18.3% fired→resolved**), expired `timeout=126 interception=6`.
+
+**Macro counters:** `pass_macro started=404`, `align_timeout=166` (**41.1%**, down from ~74%),
+`finish_bank banked=35 consumed=4 expired=23`, `receive_finish started=191 fired=18 expired=152`.
+Last 100: `fired=29 resolved=5`, `align_timeout=28/65` (**43.1%**), `receive_finish fired=5`,
+`finish_consumed=0`.
+
+**Support/pass diagnostics:** support targets were available (`ok=105,836`,
+`RECEIVE_READY=68,108`, `RECEIVE_TARGET=37,728`), but many carrier steps still failed physical pass
+preconditions: `not_kickable=31,774`, `too_close=27,993`, `bad_reception_cone=11,778`,
+`receiver_far=5,253`.
+
+### Code changes (non-config)
+
+This run tested the source change logged in `CHANGES.md` on 2026-06-29: the carrier pass
+`settle_contact` branch in `JAL_env.py` now uses `dribble_to(..., target=receiver)` rather than
+catch-only `dribble()`, and suppresses `dribble_to`'s own carry-limit release so the pass macro can
+bookkeep the final in-cone kick.
+
+### What worked
+
+The intended oscillation fix mostly worked. `align_timeout` fell from ~74% (§55) to **41.1%**, and
+pass request→fire improved because the carrier no longer burns entire episodes as often in the
+settle↔aim loop. Overall last-100 goals also recovered to **31%**, which is better than the prior
+training runs even though goalie-only inference already showed the real 2v1 policy prefers solo
+dribble.
+
+### What still failed
+
+The run did **not** clear the strict `<40%` align target, and last-100 `align_timeout` was 43.1%.
+Receiver finish activity increased (`18` receive-finish kicks), but only `4 / 35` banked passes were
+consumed, so the pass-to-goal chain remains too sparse to optimize further in a goalie-only setting.
+This does not overturn §55: without a field defender, solo dribble remains strategically dominant and
+the policy has no reason to pass voluntarily.
+
+### Next stage
+
+Move to the real Stage 4 target: **2 attackers vs hardcoded defender + goalie**. The config now adds
+`stage4t_2v2_defender_pass_v1`, warm-started from
+`models/ppo_jal_expandable/stage4s_goalie_only_pass_pretrain_complete.pt`, preserving the latest pass
+mechanics while reintroducing the defender and defender-lane gate. Watch whether defender pressure
+creates actual pass demand: pass requests/fires/resolutions, receive-finish consumption, max-step
+rate, and whether the supporter stays useful instead of crowding.
+
+---
+
+## 57. Training run: 20260629_112919_468499 — PPO `stage4t_2v2_defender_pass_v1` / 2v2 defender pass transfer (FAILED)
+
+**Completed** at 199,827 / 200,000 steps.
+
+**Load model:** `models/ppo_jal_expandable/stage4s_goalie_only_pass_pretrain_complete.pt`.
+
+**Aim:** Reintroduce one hardcoded defender after the goalie-only pass-mechanics rung. The goal was
+to make solo dribble less reliable, create real pass demand, and verify that the learned supporter
+positioning plus carrier pass macro can produce pass-to-finish goals in the actual 2v2 setup.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 664 |
+| Overall goals | 66 / 664 = **9.9%** |
+| Last 100 goal rate | **11.0%** |
+| Max-step outcomes | 338 / 664 = **50.9%** |
+| Ball-in-penalty off-target | 153 / 664 = **23.0%** |
+
+**Episode outcomes:** `max_steps` 338 (50.9%), `ball_in_penalty_off_target` 153 (23.0%),
+`goal_scored` 66 (9.9%), `frozen_state_stale_sim` 28 (4.2%), `goalie_catch` 27 (4.1%),
+`attacker_excessive_dribble` 25 (3.8%), `defender_push_foul` 15 (2.3%),
+`attacker_push_foul` 10 (1.5%), `ball_out_of_bounds` 2 (0.3%).
+
+**Goal trend:** 9.0% in episodes 1-200, 8.5% in 201-400, 12.5% in 401-600, and 9.4% in the final
+64 episodes. Last-100 goal rate was only **11.0%**, far below the 35% target.
+
+**Pass pipeline:** `requested=10,688`, `fired=365` (**3.4% request→fire**), `resolved=24`
+(**6.6% fired→resolved**), expired `timeout=114 interception=210`. Last 100:
+`requested=1,420`, `fired=50`, `resolved=3`, `timeout=15`, `interception=29`.
+
+**Macro counters:** `pass_macro started=865`, `align_timeout=356` (**41.2% timeout/start**),
+`finish_bank banked=24 consumed=1 expired=13`, `receive_finish started=366 fired=2 expired=342`.
+Last 100: `pass_macro started=117`, `align_timeout=44` (**37.6%**), `finish_bank banked=3
+consumed=0`, `receive_finish started=50 fired=0 expired=46`.
+
+**Support/pass diagnostics:** support targets were frequently classified as useful
+(`ok=106,631`, `RECEIVE_READY=72,148`, `RECEIVE_TARGET=34,483`), but pass launchability remained
+broken (`pass_available_steps=0`). The dominant mask/failure reasons were `not_kickable=53,488`,
+`too_close=35,539`, `bad_reception_cone=19,821`, `quality_low=8,620`, `lane_low=5,809`, and
+`blocks_carrier_shot_lane=4,231`.
+
+### Code changes (non-config)
+
+No source code changed for this run. It exercised the Stage 4t config added after §56, using the
+Stage 4s checkpoint and the existing dribble-to-receiver pass settle, receiver claim handoff,
+receive-finish macro, role-gated supporter `goto`, and defender-lane/intercept gating.
+
+### What went wrong
+
+The defender did create pass pressure, but it also collapsed the delivery chain. The model requested
+many passes, including forced-pass windows, yet only **3.4%** of requests fired and only **6.6%** of
+fired passes resolved. Even when a pass resolved, the receiver almost never finished it:
+`finish_consumed=1/24`, and the receive-finish macro fired only **2** times in the whole run.
+
+The main blocker is now downstream of supporter positioning. The supporter often finds receive-ready
+targets, but the carrier is usually not physically in a legal pass state (`not_kickable`,
+`bad_reception_cone`, `too_close`), and when passes do fire the defender/intercept logic kills most
+of them before receiver finish. This explains the poor goal rate and 50.9% max-step rate: the policy
+is neither a good solo scorer against the defender nor a reliable passing team.
+
+### Fix for next run
+
+Do not promote `stage4t_2v2_defender_pass_v1_complete.pt`. First run embedded debug inference to see
+the exact failure geometry, then change the pass system rather than only increasing pass reward.
+Candidate fixes to verify from inference traces:
+
+1. Make pass availability/logging consistent: `pass_available_steps=0` while passes are firing means
+   the mask/debug path and forced-pass path are not reporting the same launch condition.
+2. Reduce request→fire loss by making carrier pass alignment more deterministic or command-level
+   during forced useful-pass windows.
+3. Reduce fired→resolved loss by inspecting whether the defender intercept model is too aggressive
+   or whether the pass target/receiver claim handoff still leaves the receiver unable to contest.
+4. Only after pass resolution works, adjust rewards. Current reward changes cannot teach passing
+   because the pass-to-finish success signal appears only once in 664 episodes.
+
+### Embedded debug inference follow-up
+
+The first post-run embedded inference was invalid because it omitted
+`--team_config team_config_2atk_1def.json`; the simulator did not spawn the intended goalie +
+defender layout, so its high goal rate is discarded.
+
+Valid 8k-step embedded debug inference:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python infer.py \
+  --model_path models/ppo_jal_expandable/stage4t_2v2_defender_pass_v1_complete.pt \
+  --trainer ppo_jal \
+  --config configs/ppo_jal_curriculum_config.json \
+  --env sim-embedded \
+  --team_config team_config_2atk_1def.json \
+  --stage stage4t_2v2_defender_pass_v1 \
+  --steps 8000 \
+  --debug_infer \
+  --ppo_stochastic
+```
+
+Result: 29 episodes, 4 goals (**13.8%**), average reward **-77.6**. Outcomes were
+`max_steps=12`, `ball_in_penalty_off_target=9`, `goal_scored=4`, `goalie_catch=2`,
+`attacker_excessive_dribble=2`.
+
+Pass diagnostics confirmed the training failure: `pass_requested=362`, `pass_fired=14`,
+`pass_resolved=0`, `pass_timeout=2`, `pass_interception=10`; `finish_banked=0`,
+`finish_consumed=0`; `receive_started=14`, `receive_fired=0`, `receive_expired=12`.
+
+Root cause found in the trace and code: the pass macro's `settle_contact` branch used
+`dribble_to(target=receiver_target)`. In 2v2 this could carry the ball almost all the way to the
+receive target before the booked pass fired, producing fake short passes/crowding and immediate
+interceptions/timeouts. Example fired passes had release points nearly equal to aim targets
+(`release=(29.16,6.19)`, `aim=(29.00,6.00)`, travelled `0.54`), which cannot teach receiver
+finishing.
+
+Implemented next-run fix: `stage4u_short_pass_settle_v1` caps pass settle to a short front-cone
+touch, aborts any pass whose remaining flight distance falls below `pass_min_distance`, restores a
+light `pass_intercept_min_margin=0.5`, and makes `pass_available_steps` count launchable states even
+when `pass_available_bonus=0`.
+
+---
+
+## 58. Training run: 20260629_121520_455103 — PPO `stage4u_short_pass_settle_v1` / short-settle 2v2 pass transfer (MIXED — training tail hit 35%, inference fell to 20% and no passes completed)
+
+**Completed** at 199,979 / 200,000 steps.
+
+**Load model:** `models/ppo_jal_expandable/stage4t_2v2_defender_pass_v1_complete.pt`.
+
+**Aim:** Fix the Stage 4t fake-pass regression by keeping pass `settle_contact` as a short
+front-cone touch instead of carrying the ball to the receive target. The expected signs were:
+nontrivial pass flight distance, fewer fake/crowding passes, better fired→resolved rate, and a real
+2v2 goal-rate recovery.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 879 |
+| Overall goals | 206 / 879 = **23.4%** |
+| Last 100 goal rate | **35.0%** |
+| Avg reward last 10 | **+13.01** |
+| Max-step outcomes | 173 / 879 = **19.7%** |
+
+**Episode outcomes:** `ball_in_penalty_off_target` 257 (29.2%), `goal_scored` 206 (23.4%),
+`max_steps` 173 (19.7%), `goalie_catch` 148 (16.8%), `attacker_excessive_dribble` 31 (3.5%),
+`frozen_state_stale_sim` 27 (3.1%), `ball_out_of_bounds` 20 (2.3%),
+`defender_push_foul` 16 (1.8%), `attacker_push_foul` 1 (0.1%).
+
+**Goal trend:** 19.0% in episodes 1-200, 23.0% in 201-400, 22.5% in 401-600,
+25.5% in 601-800, and **32.9%** in the final 79 episodes. Parser last-100 rate was **35.0%**.
+
+**Aim quality:** improved materially. First 200 kicks: avg aim `0.417`, bad-aim `13.5%`. Last
+200 kicks: avg aim `0.490`, bad-aim `8.0%`.
+
+**Support diagnostics:** the pass availability logging fix worked: total `pass_available_steps`
+across episode summaries was **15,696** instead of the misleading zero from Stage 4t. Support modes:
+`GENERAL_SUPPORT=169,728`, `RECEIVE_READY=17,848`, `RECEIVE_TARGET=12,403`.
+
+**Pass pipeline:** still failed. From pass logs: only **8** `Pass FIRED`, **0** `Pass RESOLVED`,
+and **7** `Pass EXPIRED`. The fake-pass guard worked: fired pass flight distances were nontrivial
+(`min=7.15`, `median=9.12`, `mean=10.85`, `max=16.41`) and there were no
+`pass_target_too_close_after_settle` aborts. But the policy almost never completed the pass macro:
+sampled episode summaries showed `pass_macro started=170`, `timeouts=127` (**74.7% timeout/start**),
+`finish_bank banked=0 consumed=0`, and `receive_finish started=7 fired=0 expired=7`.
+
+Dominant support/mask blockers remained `pass_interceptable`, `not_kickable`, `bad_reception_cone`,
+`too_close`, and `lane_low`.
+
+### Embedded debug inference follow-up
+
+Valid 8k-step embedded inference was run with the intended 2v2 team config:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python infer.py \
+  --model_path models/ppo_jal_expandable/stage4u_short_pass_settle_v1_complete.pt \
+  --trainer ppo_jal \
+  --config configs/ppo_jal_curriculum_config.json \
+  --env sim-embedded \
+  --team_config team_config_2atk_1def.json \
+  --stage stage4u_short_pass_settle_v1 \
+  --steps 8000 \
+  --debug_infer \
+  --ppo_stochastic
+```
+
+Inference result: 35 episodes, 7 goals (**20.0%**), avg reward **-49.1**. Outcomes:
+`ball_in_penalty_off_target=11`, `goal_scored=7`, `max_steps=7`, `goalie_catch=6`,
+`frozen_state_stale_sim=1`, `attacker_excessive_dribble=1`, `defender_push_foul=1`,
+`ball_out_of_bounds=1`.
+
+Inference pass result: **0 Pass FIRED / 0 RESOLVED / 0 EXPIRED**, despite
+`pass_to_teammate=193` requested and 310 executed pass-to-teammate macro frames. The model mostly
+scored by solo dribble/shot: actions were `goto=50%`, `dribble_to=30%`, `approach_ball=12%`,
+`pass_to_teammate=1%`, `kick≈0%`, with 72 fired kicks, avg aim `0.377`, bad-aim `22.2%`.
+
+### Code changes (non-config)
+
+This run used the code changes logged in `CHANGES.md` under "Stage 4u short-settle pass macro":
+short pass settle, pass-min-distance fire guard, pass power from ball-to-target flight distance,
+clearer pass logs, and pass availability diagnostics independent of reward bonus.
+
+### What worked
+
+The short-settle fix solved the fake-pass symptom. Fired passes now have real flight distance
+(`>=7.15` units in the training log), so the earlier `release≈aim` failure is gone. Goal rate also
+recovered strongly in training compared with Stage 4t: overall 9.9% → 23.4%, last-100 11% → 35%.
+Aim quality improved over the run.
+
+### What went wrong
+
+The model did **not** learn useful passing. The training tail reached the numerical 35% bar, but
+debug inference dropped to 20% and produced zero fired passes. The remaining failure is not fake
+short passes; it is pass macro completion and value preference. Most pass macro attempts still time
+out before firing, and when the policy is evaluated it mostly reverts to solo dribble/shot. The
+receiver finish path is still starved because no pass resolves, so `finish_bank` remains zero.
+
+### Fix for next run
+
+Do not promote `stage4u_short_pass_settle_v1_complete.pt` as the final Stage 4 policy. The next fix
+should make pass execution deterministic once the policy selects a valid pass target, instead of
+spending 90 steps in a fragile settle/aim macro:
+
+1. Replace the carrier pass alignment macro with a command-level deterministic pass action when a
+   latched support target is launchable: move to a legal contact pose, face the target with the same
+   physical kick helper used by shots, then fire or abort quickly.
+2. Add a hard timeout much shorter than 90 steps for pass attempts, then return to shoot/dribble
+   instead of burning the episode.
+3. Keep the short-settle/min-flight guard from Stage 4u.
+4. Only increase pass reward after `Pass FIRED` and `Pass RESOLVED` appear regularly in embedded
+   inference; right now reward cannot teach a chain that almost never executes.
+
+---
+
+## 59. Training run: 20260629_141213_533549 — PPO `stage4u_short_pass_settle_v1` / pass align-timeout → carry-toward-goal fallback (35% bar MET via carry; passing STILL 0 fired/0 resolved → pinpointed settle-cone wall)
+
+**Completed** at 199,783 / 200,000 steps.
+
+**Load model:** `models/ppo_jal_expandable/stage4t_2v2_defender_pass_v1_complete.pt`.
+
+**Aim:** Implement §58 fix rec #2 — stop burning episodes on `turn 0` when a forced pass can't
+complete. `_abort_pass` now falls back to `dribble_to(target=goal)` (the proven solo carry) on
+`pass_macro_align_timeout`, and `pass_macro_max_align_steps` was cut 90→30 so a failing pass bails
+into the carry quickly.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 888 |
+| Overall goals | 307 / 888 = **34.6%** |
+| Last 100 goal rate | **37.0%** |
+| Final-bucket (801-888) | **38.6%** |
+| Avg reward last 10 | **+7.99** |
+| Max-step outcomes | 172 / 888 = **19.4%** |
+
+**Episode outcomes:** `goal_scored` 307 (34.6%), `ball_in_penalty_off_target` 205 (23.1%),
+`max_steps` 172 (19.4%), `goalie_catch` 116 (13.1%), `frozen_state_stale_sim` 27 (3.0%),
+`attacker_excessive_dribble` 24 (2.7%), `ball_out_of_bounds` 23 (2.6%), `defender_push_foul` 10 (1.1%).
+
+**Goal trend:** 29.0% → 33.5% → 37.0% → 37.0% → 38.6% across the 200-ep buckets — a steady climb to
+the 35% bar.
+
+**Pass pipeline:** still broken. Across episode summaries: `fired=0` in 203 eps, `fired=1` in 9,
+`fired=14` in 1; `resolved=0` in 97 eps, `resolved=1` in 2, `resolved=3` in 1. Effectively **~0 passes
+fire and ~0 resolve**. Pass-macro diagnostics show why: every started pass times out in the
+`settle_contact` phase (`pass_macro started=1 align_steps=26–31 timeouts=1
+fallback_reasons={'pass_macro_align_timeout'}` per episode) — `align_steps` hits the new 30 cap and
+aborts **before reaching the fire branch**. `receive_finish_macro started=0` everywhere (nothing to
+finish because nothing fires).
+
+### Code changes (non-config)
+
+`JAL_env.py` `_abort_pass`: on `pass_macro_align_timeout` with the ball still held, fall back to
+`dribble_to(target=goal)` instead of `turn 0` (logged in CHANGES.md). Config: stage4u
+`pass_macro_max_align_steps 90 → 30`.
+
+### What worked
+
+The carry fallback did its narrow job: failed forced passes now convert to shot-improving solo carries
+instead of stalling. Goals rose to 34.6% overall / 38.6% in the final bucket (vs §58's 23.4%/35%) and
+`max_steps` held at 19.4%. The 35% bar is met — but **entirely by solo play**, not by passing.
+
+### What went wrong
+
+The real objective ("score whenever it passes") is unmet: ~0 passes fire or resolve. The cut to a
+30-step align cap, combined with the existing `settle_contact` phase that gates on
+`ball_in_reception_cone` and short-settles with `dribble_to`, meant every pass exhausted its budget in
+settle and timed out before the fire branch could run. The fire branch works when reached; the
+upstream **reception-cone settle gate** is the wall (it almost never latches under the 20°/s turn cap).
+
+### Fix for next run
+
+Rewrite the carrier pass macro to mirror the **proven solo-shot loop** (`action_type=="kick"`, which
+already scores ~38–52%): once the carrier has the ball, drive every cycle with
+`kick(self_pose, ball_xy, angle_to_receiver, kick_power=pass_power, dribbling=True,
+angle_tolerance=fire_threshold)` — fire on `"kick …"`, re-glue via a short `dribble_to` only on
+`"failed"`, keep turning on `"turn …"`. This removes the `ball_in_reception_cone` settle gate
+entirely; the catch-glue holds the ball in front while `kick()`'s geometric `angle_diff/dt` turn
+converges to the receiver exactly as the solo shot converges to goal. Raise
+`pass_macro_max_align_steps 30 → 45` for re-glue+align room. (Implemented; under test in the next run.)
+
+---
+
+## 60. Training run: 20260629_144125_467415 — PPO `stage4u_short_pass_settle_v1` / unified solo-shot pass loop (FAILED — 10 fired/0 resolved, goals regressed to 22.7%; 2.0-unit settle target un-glues the ball)
+
+**Completed** at 199,623 / 200,000 steps. **Load model:** `stage4t_2v2_defender_pass_v1_complete.pt`.
+
+**Aim:** §59's fix — replace the `settle_contact` reception-cone phase with a single loop mirroring the
+proven solo shot: drive `kick(dribbling=True)` aimed at the receiver every cycle, re-glue via
+`dribble_to` only on `"failed"`. `pass_macro_max_align_steps 30 -> 45`.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 860 |
+| Overall goals | 195 / 860 = **22.7%** |
+| Last 100 goal rate | **25.0%** |
+| Max-step outcomes | 193 / 860 = **22.4%** |
+| Pass FIRED / RESOLVED / EXPIRED | **10 / 0 / 9** |
+
+### What went wrong
+
+Two problems. (1) Goals regressed from §59's 34.6% to 22.7%. (2) Passing barely moved: only 10 fired,
+0 resolved in 860 episodes; macros still timed out at the 45-cap. Root cause in the `"failed"` re-glue
+branch: it pointed `dribble_to` at a **2.0-unit short settle target** (`pass_macro_settle_dist`), which
+`dribble_to` reached and **released (un-glued) almost immediately**. So `kick()` never had a stably
+glued in-front ball to turn-and-fire; the two machines fought every cycle (catch -> tiny carry ->
+release -> unglue -> `"failed"` -> re-catch). The kick-first loop was correct; the re-glue target was
+the bug.
+
+### Fix for next run
+
+Make the `"failed"` re-glue a real **carry toward the receiver** (far target, stop `min_flight` short)
+so the catch-glue stays alive and the body orients toward the receiver — like the solo shot carries
+toward goal. (Implemented; tested in §61.)
+
+---
+
+## 61. Training run: 20260629_150756_470571 — PPO `stage4u_short_pass_settle_v1` / carry-orient re-glue (PARTIAL — fires 10->19, first RESOLVED=1, but goals crashed to 17.6% from sideways drag)
+
+**Completed** at ~200,000 steps. **Load model:** `stage4t_2v2_defender_pass_v1_complete.pt`.
+
+**Aim:** §60's fix — `"failed"` branch carries toward the receiver (`ball + dir*(dist - min_flight)`)
+to keep the glue alive while orienting the body, instead of the 2.0-unit settle that released.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 869 |
+| Overall goals | 153 / 869 = **17.6%** |
+| Last 100 goal rate | **11.0%** |
+| Max-step outcomes | 192 / 869 = **22.1%** |
+| Pass FIRED / RESOLVED / EXPIRED | **19 / 1 / 17** |
+
+### What worked / went wrong
+
+The mechanism improved: fires rose 10 -> 19, several pass macros completed **without** timeout
+(`align_steps=16/27/39, timeouts=0`), and the run produced the **first `Pass RESOLVED=1`**. But goals
+**crashed further to 17.6% / 11% last-100** — carrying the catch-glued ball toward a wide/lateral
+support receiver (targets cluster at `(29, +/-6)`, the support clamp edge) drags it sideways/backward
+off the goal line, destroying solo-scoring progress. Net: passing is now mechanically *possible* but
+its cost to goals is unacceptable, and resolution is still ~5% (1/19) because the receiver rarely meets
+the ball.
+
+### Fix for next run
+
+Stop translating the ball during the pass. The `"failed"` branch now catches the ball **IN PLACE**
+(`dribble()` -> turn-to-face-ball -> `catch 0`, no carry); `kick()` then rotates the glued ball to face
+the receiver and fires. This should keep firing while removing the sideways drag, recovering the goal
+rate. (Implemented; under test.) **If goals stay low**, the forced-pass mask itself is over-suppressing
+solo scoring — dial it back. **Resolution** (receiver catching the in-flight pass) is the next major
+lever after firing is stable: `_execute_post_pass_finish_macro` already `goto`s the receiver to the
+receive point on fire, but only 1/19 resolved — investigate pass accuracy vs. receiver arrival timing.

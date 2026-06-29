@@ -1,0 +1,28 @@
+# Codex CLI config for the RoboCup ai-team project.
+# Minimal and safe. No secrets — secrets/tokens belong in ~/.codex/ (global, untracked)
+# or environment variables, never here.
+
+# Ask before running commands that aren't already auto-approved.
+approval_policy = "on-request"
+# Codex may edit files in the workspace but not reach outside it or the network
+# without approval.
+sandbox_mode = "workspace-write"
+
+# Project docs: AGENTS.md loads first. If a teammate's checkout lacks it, fall back to
+# CLAUDE.md, and always also pull in the checked-in project memory.
+project_doc_fallback_filenames = ["CLAUDE.md", "MEMORY.md"]
+# CLAUDE.md (~9KB) + AGENTS.md + MEMORY.md need more than the 32 KiB default.
+project_doc_max_bytes = 65536
+
+# Cross-session recall layer (global, stored in ~/.codex/memories/, not per-project).
+# Project rules that must always apply live in AGENTS.md / MEMORY.md, not here.
+[features]
+memories = true
+
+[memories]
+use_memories = true
+generate_memories = true
+
+# MCP servers
+[mcp_servers.notion]
+url = "https://mcp.notion.com/mcp"

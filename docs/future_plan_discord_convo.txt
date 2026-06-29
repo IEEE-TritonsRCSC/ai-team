@@ -1,0 +1,43 @@
+Will we end up training our AI against defender or attacker opponent team, or a mixture?
+Cause for Stage 3 we currently trained it against defender but it hasn't learned to go against attacker
+Adnan | AI — 1:55 AM
+Because of the time crunch I was thinking of training the our attackers against their defender
+defenders + goalie
+and then for the tournament we can just use the hardcoded goalie + hardcoded defenders + RL trained attackers
+Evan Chou | AI Lead — 1:56 AM
+Makes sense, so in that case our strategy would sorta be like
+
+goalie + 2 defenders intercept ball from opponent team once they kick
+3 attackers go on offense but idk if it can intercept ball if its in opponents hands?
+Would it be possible to have some hard-coded logic for goalie and defenders to pass the ball to a teammate attacker if it intercepts or catches the ball from the opponent? That could make it easier for RL training as the only thing the AI would be controlling is the 3 attackers, meaning we only need it to learn how to position itself so that it can receive the ball from the defenders + goalie
+Adnan | AI — 1:59 AM
+Yes we can hard-code some coordination between them
+I was thinking that too
+Yash Tandon | AI — 2:08 AM
+The last point is not feasible, we will concede a lot of goals then
+Ideally in our 4v4, 5v5 scenario, the robots learn to man-mark and intercept
+Adnan | AI — 2:09 AM
+What do you suggest we do then?
+Yash Tandon | AI — 2:10 AM
+We could try to hardcode some coordination- all we need is the defender to pass to the robot that is some combination of the nearest + most alone. I hope the RL robots then learn to drop deep to pick up the ball
+Yash Tandon | AI — 2:11 AM
+I think the 5v5 scenario should handle this (we will make interceptions, possessions, etc. more valuable in the reward function). But i feel like all robots should then be trained together
+Adnan | AI — 2:11 AM
+So are you saying that we don't do hardcoded defenders?
+What if we use hardcoded defenders but let the policy be aware of them and just decide which robot needs to be defender?
+Yash Tandon | AI — 2:12 AM
+It can work- but it will just limit them in attacking scenarios
+Yash Tandon | AI — 2:12 AM
+Yes that works
+But we should also make sure that interceptions and man marking is in the reward function so that the RL trained robots can do that as well
+Adnan | AI — 2:13 AM
+Then our defenders will be robot-agnostic and we can have a defender strategy where one tries to intercept the ball and the other man marks 
+Adnan | AI — 2:14 AM
+Yes we'll need to do that for effective attacking + coordination of attackers
+Yash Tandon | AI — 2:14 AM
+Yeah that could work
+Adnan | AI — 2:14 AM
+And we can just adapt the defender strategy from Tiger Manheim
+I've adapted one defender and it's performing really well
+Yash Tandon | AI — 2:14 AM
+Exactly, it's just that the defenders then don't contribute so much to the attack

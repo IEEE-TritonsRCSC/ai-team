@@ -4,6 +4,1762 @@ All changes made to fix training issues, improve the environment, and implement 
 
 ---
 
+## 2026-06-29 IST — Pass macro rewritten to mirror the proven solo-shot loop (kill the reception-cone settle wall)
+
+### Problem
+
+The first abort-fallback run (§59 stage4u, run 20260629_141213) hit the 35% goal bar (34.6% overall,
+38.6% last bucket — the carry fallback worked) but passing was still **0 fired / 0 resolved**. The
+pass-macro diagnostics localized the failure precisely: every started pass timed out in the
+`settle_contact` phase (`align_steps` 26–31, hitting the 30 cap; `fallback_reasons={'pass_macro_align_timeout'}`),
+**never reaching the fire branch**. The `settle_contact` phase gated on `ball_in_reception_cone` and
+short-settled with `dribble_to`; under the 20°/s turn cap that separate cone almost never latched, so
+the macro burned its whole alignment budget there. The fire branch itself works when reached — the
+upstream settle gate was the wall.
+
+### Fix
+
+[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py) pass action branch: **replaced the
+`settle_contact`/`face_target`/`fire` phase machine with a single unified loop that mirrors the proven
+solo-shot path** (`action_type=="kick"`, which scores ~38–52%). Once the carrier has the ball, every
+cycle now calls `kick(self_pose, ball_xy, angle_to_receiver, kick_power=pass_power, dribbling=True,
+angle_tolerance=fire_threshold)`:
+- returns `"kick …"` → register the pending pass + fire (unless the receiver drifted inside
+  `pass_min_distance`, which bails to the carry fallback);
+- returns `"failed"` (ball not glued in front) → re-acquire with a short, min-flight-preserving
+  `dribble_to` settle touch (the only place `dribble_to` is still used);
+- returns `"turn …"` → still aligning; the geometric `angle_diff/dt` turn converges despite the cap.
+
+This removes the `ball_in_reception_cone` settle gate entirely. The catch-glue keeps the ball in front
+while `kick()`'s geometric turn aligns the heading toward the receiver — the exact convergence the solo
+shot already achieves. (Highest-EV untried fix from `project_stage4_goalie_only_cant_teach_passing`.)
+
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json) stage4u:
+`pass_macro_max_align_steps 30 → 45` to give the converging loop room for a re-glue grab plus the
+geometric alignment (the solo `kick_macro` cap is 120; 45 is generous for a pass while still bailing a
+genuinely-stuck attempt into the carry fallback quickly).
+
+**Follow-up (same day, after the first unified-loop run 20260629_144125):** the unified loop still
+fired only 10 passes / 860 eps and goals regressed to 22.7%. Root cause in the `"failed"` re-glue
+branch: it pointed `dribble_to` at a **2.0-unit short settle target**, which `dribble_to` reached and
+**released (un-glued) almost immediately** — so `kick()` never had a stably-glued in-front ball to
+turn-and-fire; the two machines fought (catch → tiny carry → release → unglue → "failed" → re-catch).
+Fix: the `"failed"` branch now drives a `dribble_to` **carry in the receiver's direction** (a far
+target = `ball + dir·(dist − min_flight)`), exactly like the solo shot carries toward goal — keeping
+the catch-glue alive and rotating the body to face the receiver, stopping `min_flight` short so the
+carry can never collapse the pass below the legal minimum. `kick()` (first each cycle) fires the moment
+the heading aligns, before the carry reaches the stop point.
+
+**Follow-up #2 (same day, after carry-orient run 20260629_150756):** carry-orient raised fires (10→19)
+and got the first `Pass RESOLVED=1`, but goals **crashed further to 17.6%** — carrying the ball toward
+a wide/lateral receiver drags it sideways/backward off the goal line. Fix: the `"failed"` re-glue
+branch now catches the ball **IN PLACE** with `dribble()` (turn-to-face-ball → `catch 0`), no
+translation. `kick()` then rotates the glued ball to face the receiver and fires, so the pass no longer
+sacrifices forward progress toward goal. If the ball drifts out of kickable range, re-approach with
+`approach_ball`. (Goal trend across these runs: 34.6% settle-cone wall → 22.7% un-glue fight → 17.6%
+sideways drag → in-place catch under test.)
+
+---
+
+## 2026-06-29 IST — Stage 4 pass align-timeout falls back to carry-toward-goal (don't burn the episode in 2v2)
+
+### Problem
+
+In the 2v2 run (§58 stage4u), pass-macro completion stayed broken: `align_timeout=74.7%`, 8 fired /
+0 resolved. Under defender pressure the carrier cannot finish the settle/aim, and the old abort just
+emitted `turn 0` and re-entered the forced-pass macro next step — burning whole episodes
+(`max_steps≈20%`) without scoring or passing. (Implements the parallel worker's §58 "fix for next
+run" rec #2: short timeout + fall back to shoot/dribble.)
+
+### Fix
+
+[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py) `_abort_pass`: on
+`pass_macro_align_timeout` (and when the carrier still has the ball), the abort now falls back to
+`dribble_to(target=goal)` — the proven solo-carry skill — instead of `turn 0`. This advances the ball
+toward goal so a failed forced pass turns into shot-improving progress (and the `dribble` carry can
+continue via the existing carry-continuation path), instead of stalling. Essential dribble bookkeeping
+(`dribble_session_active`, anchor, target) is set; any dribble_to `failed`/`done` safely reverts to
+`turn 0`.
+
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json) stage4u:
+`pass_macro_max_align_steps 90 → 30` so a failing pass bails into the productive carry quickly
+(successful 2v1 alignments completed in a ~17-step median, so 30 keeps real passes while cutting the
+wasteful 90-step stalls).
+
+### Validation
+
+```text
+py_compile: passed
+tests/test_stage4_support_pass.py + tests/test_ball_action_recovery.py: 56 direct tests passed
+config json: valid
+```
+
+Watch in 2v2: `max_steps` drag should fall and goals rise (failed passes now score via carry); passes
+that DO align (<30 steps) still fire. Reward changes deferred until passes fire+resolve regularly (per
+§58 rec #4).
+
+---
+
+## 2026-06-29 IST — Stage 4u short-settle pass macro (fix fake short passes and pass diagnostics)
+
+### Problem
+
+Stage 4t completed at only **9.9%** training goals and a valid 8k-step embedded debug inference
+reached only **13.8%** goals. The model requested many passes, but the pass chain still failed:
+`requested=362`, `fired=14`, `resolved=0` in inference.
+
+The root cause was in the carrier pass macro. During `settle_contact`, the macro used
+`dribble_to(target=receiver_target)`. That helped the earlier goalie-only alignment wall, but in
+2v2 it could carry the ball almost all the way to the receiver target before the pass fired. Those
+were not useful passes; they became short crowding dribbles or immediate defender interceptions
+(`release` nearly equal to `aim`, e.g. `release=(29.16,6.19)`, `aim=(29.00,6.00)`).
+
+One diagnostic was also misleading: `pass_available_steps` was only incremented when
+`pass_available_bonus > 0`, so stages with the bonus disabled logged zero launchable-pass frames
+even if the mask/path made passes available.
+
+### Fix
+
+[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- changed pass `settle_contact` from full `dribble_to(target=receiver_target)` to a **short
+  settle touch** in the pass direction;
+- capped that settle touch by the remaining legal pass flight distance, preserving
+  `pass_min_distance`;
+- added a fire-time guard: if the remaining ball-to-target distance is below `pass_min_distance`,
+  abort with `pass_target_too_close_after_settle` instead of logging a fake pass;
+- compute pass power from the true remaining ball-to-target flight distance, not robot-to-target
+  distance;
+- log fired passes with `flight`, `passer_shot_q`, `target_q`, and `lane_q`;
+- keep the old `passer_lane_q` pending-pass key for reward compatibility, but also write
+  `passer_shot_q` so future diagnostics do not confuse shot quality with pass-lane quality;
+- increment `pass_available_steps` for actual `support_pass_launchable` frames independently of
+  whether `pass_available_bonus` is enabled.
+
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- preserved failed `stage4t_2v2_defender_pass_v1` with `timesteps=0`;
+- added active `stage4u_short_pass_settle_v1`, warm-starting from
+  `models/ppo_jal_expandable/stage4t_2v2_defender_pass_v1_complete.pt`;
+- kept `pass_macro_settle_dist=2.0`;
+- restored a light defender-intercept margin with `pass_intercept_min_margin=0.5`, so forced passes
+  are still possible but no longer fire through obviously reachable defender lanes;
+- set the top-level `load_model` to the Stage 4t complete checkpoint and made Stage 4u the only
+  nonzero-timestep curriculum rung.
+
+### Validation
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Result: JSON parses successfully. The next run should use
+`stage4u_short_pass_settle_v1` and watch the new pass logs for nontrivial `flight` distance,
+lower `pass_target_too_close_after_settle`, higher `fired→resolved`, and nonzero
+`pass_available_steps` when launchable states exist.
+
+---
+
+## 2026-06-29 IST — Stage 4t 2v2 defender pass transfer config
+
+### Problem
+
+Run §56 showed the `dribble_to(target=receiver)` pass-settle fix did what it was meant to do
+mechanically: `pass_macro align_timeout` dropped from ~74% to 41%. But goalie-only 2v1 still cannot
+teach voluntary passing because solo dribble remains the best strategy when no field defender blocks
+the lane.
+
+### Fix
+
+Added an active `stage4t_2v2_defender_pass_v1` curriculum rung in
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- warm-starts from `models/ppo_jal_expandable/stage4s_goalie_only_pass_pretrain_complete.pt`;
+- runs `2` RL attackers vs TeamB scripted goalie + one hardcoded defender using
+  `team_config_2atk_1def.json`;
+- preserves the latest Stage 4s pass machinery: physical pass power (`base=2`, `per_unit=2.2`,
+  `max=48`), `dribble_to` carrier settle, support target rewards, forced open-shot finish,
+  receiver finish macro, and role-gated supporter `goto`;
+- enables defender-aware reward gates: `use_defender_lane_gate=true` and
+  `defender_lane_penalty=0.5`;
+- keeps the defender intercept gate permissive enough for exploration
+  (`pass_intercept_defender_speed=0.9`, `pass_intercept_min_margin=0.0`) instead of restoring the
+  old Stage 4r over-strict valid-pass surface.
+
+`stage4s_goalie_only_pass_pretrain` is preserved with `timesteps=0`; `stage4t_2v2_defender_pass_v1`
+is the only active Stage 4 rung.
+
+### Validation
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Result: config JSON parses successfully and reports one active Stage 4 rung,
+`stage4t_2v2_defender_pass_v1`.
+
+---
+
+## 2026-06-29 IST — Stage 4 carrier pass settle: dribble_to-toward-receiver (kill the settle↔aim oscillation)
+
+Refines the catch-glue fix below. Run §53/§55 showed catch-glue fixed delivery quality
+(resolved/fired 9%→23–26%) but `align_timeout` rose to ~73%: `dribble()` faces the *ball*, which
+fought the subsequent turn-to-*target*, ping-ponging settle↔aim. Now the pass `settle_contact` calls
+`dribble_to(target=receiver)` — the exact carry the 52% solo shot uses — which catches AND carries the
+ball in the pass direction, so it enters the front cone already facing the receiver and the in-cone
+`kick()` fires immediately. dribble_to's own carry-limit release is suppressed (`kick`→`turn 0`) so the
+bookkept in-cone pass-fire path registers the pass. [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py).
+Validation: py_compile passed; 56 stage4 + ball-action tests passed. Watch `align_timeout` (target
+<40%, was 73%).
+
+---
+
+## 2026-06-29 IST — Stage 4 carrier pass: catch-glue the ball before aiming (mirror the 52% shot)
+
+### Problem
+
+Across runs §47–§52, pass `resolved/fired` stayed at 6–11% and `pass_macro align_timeout` sat at
+~50% — half of all pass macros never fired. Root cause: the carrier pass `settle_contact` phase used
+`_goto_contact_pose_command` (drive to a pose behind the ball) which **never issues a `catch`**, so
+the ball was never glued to the dribbler. When the macro then turned to aim at the receiver, the
+unglued ball drifted out of the front reception cone → back to settle → **oscillation** that burned
+the whole align budget. The proven solo shot (`action_type=="kick"`, ~52% goals) does not have this
+problem because its `dribble_to` **catches** the ball first; once glued, bare turns from `kick()`
+keep it in front while aligning.
+
+The "to-feet" aiming experiments (previous CHANGES entry) were **reverted** — they regressed
+(`resolved` 9%→7%, goals 28%→20%) because re-aiming at the moving receiver added more oscillation on
+top of the unglued-ball problem. The real bug was the missing catch, not the aim point.
+
+### Fix
+
+[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py): the carrier pass `settle_contact`
+branch now calls `dribble(self_pose, ball_xy)` (turns to face the ball, then `catch 0` to glue it to
+the dribbler) instead of `_goto_contact_pose_command`. Falls back to `approach_ball` only if the ball
+is out of catch range. Once the ball is caught and in the front cone, the existing in-cone
+`kick(dribbling=True, angle_tolerance=10°)` align+fire path runs exactly like the 52% shot — bare
+turns keep the glued ball in front, so it reaches the fire gate instead of oscillating. Added
+`dribble` to the basic_commands import.
+
+### Validation
+
+```text
+py_compile: passed
+tests/test_stage4_support_pass.py + tests/test_ball_action_recovery.py: 56 direct tests passed
+```
+
+Watch in training: `pass_macro align_timeout` should fall well below 50% and `resolved/fired` should
+break past the 6–11% plateau (the receiver finish already converts resolved passes at consumed≈9/11).
+
+---
+
+## 2026-06-29 IST — Stage 4 "to-feet" passing (aim at the receiver, not an abstract support point) — REVERTED
+
+> Reverted same day: to-feet aiming regressed (resolved 9%→7%, goals 28%→20%) because the real bug
+> was the missing catch (see entry above), not the aim point. Kept for the record.
+
+### Problem
+
+After the pass-power fix (run §49) stopped passes overshooting (`travelled` 32→17u,
+interceptions→0, goals 18→28%), `resolved/fired` stayed stuck at ~9% across four runs (§47–§50).
+Diagnosis: every pass was aimed at an abstract forward **support target**, while the receiver was
+driven there separately and then pushed to a receive pose ~1.1u *beyond* it. The ball, the support
+target, the receive pose, and the receiver's actual position were four different points that never
+reliably coincided — and kick-noise scatter over 12–17u widened the gap. Tightening the rendezvous
+tolerance (§50, `max_target_dist 9→4`) made it *worse* (6.6%), confirming the open-loop
+aim-at-a-point design was the problem, not the tolerance.
+
+### Fix
+
+Aim the pass **to the receiver's actual position** (with a small goal-ward lead) so the ball goes to
+the robot, not a point the robot has to rendezvous with.
+
+- [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py): when the pass macro registers, the
+  aim target is overridden to `receiver_position + pass_to_feet_lead · unit(receiver→goal)` (using the
+  receiver's live pose from `pose_by_robot_id`). The carrier then aligns to and fires at the receiver.
+- [ai_interface/envs/reward.py](../ai_interface/envs/reward.py): added `pass_to_feet_lead = 1.0`.
+- [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json) (stage4s):
+  `pass_to_feet_lead = 1.0`; shrank `pass_receive_pose_offset 1.115 → 0.6` so the receiver barely
+  moves from where the ball is sent; reverted `support_pass_receiver_max_target_dist 4 → 6` (to-feet
+  now handles delivery, so the gate only needs to confirm the receiver is in a sensible spot).
+
+### Geometry
+
+Receiver at R, aim = R + 1.0·(toward goal). With the §49 power model the ball travels ~aim_dist+0.8u,
+so it stops ~1.8u past R along the pass line. The receive pose is aim + 0.6u (= ~1.6u past R), facing
+the incoming ball, so the ball arrives ~0.2u in front of the receiver's mouth — inside the kickable
+reception cone — and the receiver only steps ~1.6u forward onto it instead of chasing an abstract
+point up to 9u away.
+
+### Validation
+
+```text
+py_compile: passed (JAL_env.py, reward.py)
+config json: valid
+tests/test_stage4_support_pass.py + tests/test_ball_action_recovery.py: 56 direct tests passed
+  (updated test_pass_fire_starts_inflight_receive_finish_macro to assert to-feet aiming:
+   receive_target ≈ receiver position + ~1u goal-ward lead, not the old (32,6) support point)
+```
+
+---
+
+## 2026-06-29 IST — Stage 4 pass/finish fire gate widened from 5° to 10° (wiring fix)
+
+### Problem
+
+Training run §47 (first test of the deterministic contact-pose macros) still failed the finish bar:
+`pass_macro started=1,041` with **`align_timeout=493` (47%)**, and the receiver finish macro fired only
+**3 / 485** (0 in the last-100 episodes). Debug inference showed the policy scores **52.5% solo by
+dribbling** and never passes voluntarily — so the only deliverable left is making a *forced* pass
+reliably end in a goal, which requires the macros to actually emit terminal kick events.
+
+Root cause was a tight, mis-wired fire gate:
+
+- The pass/receive macros decide "aligned enough to fire" but then call the shared `kick()` primitive,
+  which **hardcoded a 5° heading tolerance** ([ai_interface/utils/basic_commands.py](../ai_interface/utils/basic_commands.py) `kick`).
+  So even when `_can_fire_physical_kick` (carrier) passed at a wider tolerance, `kick()` re-gated at 5°
+  and returned a `turn` → `pass_kick_failed` / `kick_align_timeout` → macro times out.
+- Codex's `pass_macro_orientation_threshold_deg = 10.0` knob existed in `reward.py` but was **never
+  wired into JAL_env** — every fire gate hardcoded `math.radians(5.0)` (JAL_env.py:3413, 3449, 4494).
+- 5° is far too tight for the rate-capped, glue-drift align dynamics; the contact-pose oscillates in
+  and out of the gate and the macro burns its whole budget.
+
+### Fix
+
+- [ai_interface/utils/basic_commands.py](../ai_interface/utils/basic_commands.py): `kick()` gained an
+  `angle_tolerance` parameter (default `radians(5)` — the solo-shoot path that already scores 52% is
+  **unchanged**). Only the pass/receive macros pass a wider value.
+- [ai_interface/envs/reward.py](../ai_interface/envs/reward.py): added
+  `receive_finish_fire_tolerance_deg = 10.0` (carrier reuses the existing
+  `pass_macro_orientation_threshold_deg = 10.0`).
+- [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+  - carrier fire gate (`fire_threshold`) now reads `pass_macro_orientation_threshold_deg`;
+  - the carrier `kick(...)` call passes `angle_tolerance=fire_threshold` (the actual wiring bug);
+  - the receiver finish `kick(...)` call passes `angle_tolerance=receive_finish_fire_tolerance_deg`.
+- [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json): stage4s sets both
+  knobs to `10.0` explicitly (so the log-training parser captures them).
+
+### Shot geometry check
+
+A 10° heading error at a 12-env-unit finish gives a lateral miss of `12·tan(10°) ≈ 2.1` units, well
+inside the `5.0`-unit goal half-height — so a wider finish still hits the goal mouth. Pass release at
+10° is comfortably inside the receiver collection window. No reward values changed (this is a fire-gate
+wiring fix, not a reward change).
+
+### Validation
+
+```text
+py_compile: passed (JAL_env.py, reward.py, basic_commands.py)
+smoke: kick() returns "turn" at 8° with default 5° gate, "kick" at 8° with 10° gate, "turn" at 12°/10° gate
+tests/test_stage4_support_pass.py + tests/test_ball_action_recovery.py: 56 direct tests passed
+  (updated near-aligned test to 14° to keep guarding the "turn, not pass_kick_failed" path;
+   added test_pass_macro_fires_within_widened_orientation_gate for the 7° fire case)
+config json: valid
+```
+
+---
+
+## 2026-06-29 IST — Stage 4 deterministic pass/finish contact-pose macros
+
+### Problem
+
+The latest Stage 4s goalie-only training run showed that pass exploration was no longer the main
+blocker, but physical execution still failed:
+
+- `22,840` pass requests produced only `62` fired passes (`0.27%` request -> fire);
+- `3,042 / 3,447` pass macro starts ended as `pass_kick_failed`;
+- `40` resolved passes produced `0` consumed finish banks and `0` receiver finish shots;
+- the receiver macro spent many frames in `bad_cone` and `kick_align`, then expired;
+- the passer could still reclaim/crowd the ball after a pass fired.
+
+The code root cause was that the pass macro considered the carrier "aligned" at a configurable
+`10 deg` threshold, then called the normal physical kick helper. That helper only emits a real
+`kick` inside the front reception cone and within `5 deg`; otherwise it returns a turn/catch/failed
+path. A pass in the `5-10 deg` band therefore reset as `pass_kick_failed`, destroying the committed
+pass attempt.
+
+### Fix
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- Added shared contact-pose geometry helpers:
+  - `_front_contact_pose(ball_xy, target_xy)`;
+  - `_at_contact_pose(...)`;
+  - `_target_heading_error(...)`;
+  - `_can_fire_physical_kick(...)`;
+  - `_goto_contact_pose_command(...)`.
+- Extended pass macro state with `pass_macro_phase` and `pass_macro_phase_steps`.
+- Reworked carrier pass execution into deterministic phases:
+  `acquire -> settle_contact -> face_target -> fire`.
+- The pass macro now fires only after the same physical checks as `kick()` pass:
+  ball in front reception cone and heading error within `5 deg`.
+- A one-frame failed fire check no longer resets the whole pass macro. The macro keeps aligning or
+  times out through the explicit phase caps.
+- Added short phase caps:
+  `pass_macro_bad_cone_max_steps`, `pass_macro_face_max_steps`, and existing
+  `pass_macro_max_align_steps`.
+- Added `passer_support_lock_until_count`: after a pass fires, the passer is temporarily excluded
+  from ball-claim selection so it cannot crowd the receiver.
+- Reworked post-pass bad-cone recovery:
+  - receiver now moves to the shot contact pose behind the ball instead of repeatedly running a
+    dribble settle loop;
+  - bad-cone and kick-align phases have short caps via
+    `post_pass_finish_macro_bad_cone_max_frames` and
+    `post_pass_finish_macro_kick_align_max_steps`.
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added config knobs:
+  `pass_macro_contact_pose_radius`, `pass_macro_bad_cone_max_steps`,
+  `pass_macro_face_max_steps`, `pass_support_lock_steps`,
+  `post_pass_finish_macro_bad_cone_max_frames`, and
+  `post_pass_finish_macro_kick_align_max_steps`.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Active `stage4s_goalie_only_pass_pretrain` now explicitly uses:
+  - `pass_macro_bad_cone_max_steps: 12`;
+  - `pass_macro_face_max_steps: 20`;
+  - `pass_macro_contact_pose_radius: 0.45`;
+  - `pass_support_lock_steps: 20`;
+  - `post_pass_finish_macro_bad_cone_max_frames: 12`;
+  - `post_pass_finish_macro_kick_align_max_steps: 20`.
+
+Updated [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+
+- Added regression coverage that the contact pose puts the ball in the physical front cone.
+- Added regression coverage that a near-aligned pass turns/continues instead of resetting as
+  `pass_kick_failed`.
+- Added regression coverage for short receive bad-cone expiry.
+- Added regression coverage for the passer support lock handing ball claim to the teammate.
+
+### Validation
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py ai_interface/envs/reward.py tests/test_stage4_support_pass.py
+/opt/anaconda3/envs/rcai/bin/python - <<'PY'
+import tests.test_stage4_support_pass as t
+for name in [n for n in dir(t) if n.startswith("test_")]:
+    getattr(t, name)()
+print("stage4 support tests passed")
+PY
+/opt/anaconda3/envs/rcai/bin/python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Result:
+
+```text
+py_compile: passed
+stage4 support tests: 36 direct test functions passed
+config json: valid
+pytest not run: rcai env has no pytest module
+```
+
+---
+
+## 2026-06-29 IST — Stage 4 Sumatra-inspired committed pass/receive macro
+
+### Problem
+
+The Stage 4 passing pipeline had moved past the first blocker (`pass_to_teammate` could be sampled),
+but the behavior was still physically brittle:
+
+- pass requests often failed to become fired passes because the carrier had to already be in the
+  front reception cone before the pass macro could even run;
+- after a pass fired, the receiver only entered the post-pass finish macro once the pass had already
+  resolved, which is too late for an incoming ball;
+- the receiver behaved like a passive supporter/collector instead of preparing a receive pose before
+  the ball arrived;
+- the passer could continue normal support behavior around the same ball after release, recreating
+  crowding near the receiver;
+- the failure mode matched what Sumatra avoids: treating a pass as one carrier action rather than a
+  committed two-robot play.
+
+### Sumatra reference
+
+Reviewed local TIGERs Mannheim/Sumatra code under `/private/tmp/sumatra` and adapted the executable
+parts that fit this Python env:
+
+- `StandardPassActionMove`: a pass only becomes a true release after ball contact plus small
+  orientation error.
+- `PassReceiverRole`: the receiver drives to a pre-contact pose behind the pass target and faces the
+  incoming source.
+- `ReceiveState`: receiving is an active interception skill, not passive `goto` waiting.
+- `PassCreator`/`PassGenerator`: pass validity accounts for receiver reachability and preparation,
+  not just a clear static line.
+
+### Fix
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- Relaxed the primitive mask so `pass_to_teammate` is not disabled solely because the carrier has the
+  ball just outside the physical front cone. It is still masked when there is no valid receiver target
+  or the carrier is out of possession range.
+- Reworked the carrier pass execution into a committed physical macro:
+  `acquire -> settle front cone -> align -> fire`.
+- Added a settle phase that uses the dribble/catch macro to pull the ball into the front reception
+  cone before pass release instead of falling back to `turn 0`.
+- Changed the pass orientation gate to a Sumatra-style threshold (`10 deg` by default) before firing.
+- When a pass fires, the env now immediately starts an unresolved receiver macro using the pass
+  `release_pos` and `receive_target`.
+- Added `_pass_receive_pose(...)`, which computes the receiver pre-contact pose:
+  `receive_pose = receive_target + unit(release->target) * (PLAYER_SIZE + BALL_SIZE)`.
+  With current constants this offset is `0.9 + 0.215 = 1.115` env units.
+- The unresolved receiver macro now drives to that pre-contact pose, faces the pass source, waits
+  there while the ball is still far, then actively approaches/collects once the ball reaches the
+  receive window.
+- When the pending pass resolves, the same receiver macro is marked `resolved=True` and continues into
+  the existing settle/finish logic instead of being replaced with a geometry-less late macro.
+- If a pending pass expires or is intercepted, the unresolved receiver macro is cancelled so the
+  receiver does not chase a dead pass.
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added configurable knobs:
+  `pass_macro_orientation_threshold_deg`, `pass_macro_settle_dist`,
+  `pass_receive_pose_offset`, `pass_receive_pose_radius`,
+  `pass_receive_ball_obstacle_dist`, and `pass_receive_hold_ball_dist`.
+
+Updated [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+
+- Added regression coverage for fired pass -> unresolved receiver macro creation.
+- Added regression coverage for the in-flight receiver macro moving to the pre-contact receive pose.
+
+### Validation
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py ai_interface/envs/reward.py tests/test_stage4_support_pass.py
+/opt/anaconda3/envs/rcai/bin/python - <<'PY'
+# direct smoke: aligned pass fires and starts unresolved receiver macro
+PY
+~/.local/bin/graphify update .
+```
+
+Result:
+
+```text
+py_compile: passed
+direct smoke: pass fired, receiver macro started with resolved=False and receive_pose=(32.997..., 6.498..., -2.677...)
+graphify update: passed
+pytest not run: rcai env has no pytest module; base conda pytest lacks gymnasium
+```
+
+---
+
+## 2026-06-28 (Late PM) — Stage 4s pass-finish behavior fixes
+
+### Problem
+
+The Stage 4s goalie-only debug inference exposed a different failure from the earlier pass-mask
+starvation:
+
+- the policy could request passes, but the receiver almost never converted them into shots;
+- post-pass finish macros were starting and then expiring: `macro_started=17`, `macro_fired=0`,
+  `macro_expired=16` in the latest 15k embedded debug run;
+- macro diagnostics were dominated by `bad_cone`/`settle` frames, meaning the receiver had the ball
+  near it but not inside the physical front reception cone;
+- the previous bad-cone branch tried to `dribble_to(target=ball_xy)`, which is degenerate because the
+  target is already at the ball, so the dribble macro can settle/complete without moving the ball into
+  a shootable lane;
+- support targets were still too deep/wide for reliable immediate finishing, contributing to
+  `ball_in_penalty_off_target` and receivers turning away from the goal;
+- standalone pass completion reward was large enough that PPO could learn "complete a pass" without
+  learning "complete a pass, receive, and shoot";
+- after a pass resolved, the old passer decoded a normal support wedge around the same ball point and
+  could drive back toward the receiver, recreating attacker crowding;
+- `goto()` could emit an unnormalised body-relative dash angle, which made some movement look like it
+  was taking the long/reflex rotation path.
+
+### Fix
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- Added a latched `settle_target` to the post-pass finish macro state.
+- Added `_post_pass_finish_settle_target(...)`, which chooses a short, legal, non-degenerate carry
+  target instead of targeting the current ball position during bad-cone recovery.
+- The settle target samples small forward/centerward candidates, filters field bounds and opponent
+  defense-area/off-target positions, and scores candidates by current shot quality.
+- The bad-cone macro branch now reuses the latched settle target and calls `dribble_to()` toward that
+  point. If no legal settle target exists, it turns toward the ball using the shortest normalised
+  angle instead of falling into a no-op dribble.
+- Added `_post_pass_finish_kick_target_y(...)`, which chooses among center and keeper-away in-mouth
+  targets using goalie-gap quality, then breaks ties by the smallest heading change from the receiver's
+  current orientation. This prevents the receiver from aiming past the goal when an equivalent shorter
+  finish exists.
+- Added `_post_pass_clearout_target(...)` and wired it into `_decode_support_goto_target(...)`.
+  During an active post-pass finish macro, non-receivers clear away from the receiver/ball lane instead
+  of decoding a normal receive wedge around the same ball point.
+
+Updated [ai_interface/utils/basic_commands.py](../ai_interface/utils/basic_commands.py):
+
+- Normalised the body-relative dash angle in `goto(...)`, so path-following uses the shortest angular
+  direction consistently.
+
+Updated active Stage 4s settings in
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- tightened receive coordinates to more finishable lanes:
+  `support_forward_min: 8.0`, `support_forward_max: 16.0`, `support_target_max_x: 29.0`,
+  `support_target_y_clip: 6.0`, `support_target_y_clip_x_min: 26.0`;
+- reduced dense support shaping so it does not dominate the actual pass-finish objective:
+  `support_receive_target_bonus: 0.04`, `support_receive_ready_bonus: 0.08`;
+- made the receiver need to be closer to its selected target before a pass launch is considered valid:
+  `support_pass_receiver_max_target_dist: 9.0`;
+- reduced standalone resolved-pass reward:
+  `possession_transfer_bonus: 0.5`, `pass_quality_weight: 1.5`;
+- disabled pass-available waiting reward: `pass_available_bonus: 0.0`;
+- made the finish the main source of pass-chain value:
+  `pass_finish_bonus: 24.0`, `pass_finish_quality_weight: 20.0`;
+- lowered the post-pass macro shot-quality threshold to `0.20` so it shoots acceptable open finishes
+  instead of over-staging until the deadline.
+
+Reward math after this change:
+
+- A resolved pass with quality `q=0.5` now pays only `0.5 + 1.5*0.5 = 1.25` total before team
+  averaging, so it is not enough to train pass-only wandering.
+- A receiver finish macro kick with quality `q=0.5` banks `24 + 20*0.5 = 34` total before team
+  averaging and shot-quality scaling. With two attackers, that is `17` team reward before scaling, so
+  the profitable behavior is pass→receive→shoot.
+- The settle carry samples at most `6` env units, still below the `8.5` env-unit safety cap and the
+  SSL `1m = 10` env-unit dribble limit.
+
+### Validation
+
+```text
+/opt/anaconda3/envs/rcai/bin/python -m py_compile \
+  ai_interface/envs/JAL_env.py \
+  ai_interface/utils/basic_commands.py \
+  ai_interface/envs/reward.py
+
+/opt/anaconda3/envs/rcai/bin/python -m json.tool \
+  configs/ppo_jal_curriculum_config.json
+```
+
+`pytest` is not installed in the `rcai` environment, so the closest Stage 4/pass and ball-action
+regression tests were invoked directly:
+
+```text
+/opt/anaconda3/envs/rcai/bin/python - <<'PY'
+import importlib
+mods = ['tests.test_stage4_support_pass', 'tests.test_ball_action_recovery']
+count = 0
+for mod_name in mods:
+    mod = importlib.import_module(mod_name)
+    for name in sorted(dir(mod)):
+        if name.startswith('test_') and callable(getattr(mod, name)):
+            count += 1
+            getattr(mod, name)()
+print(f'{count} direct tests passed')
+PY
+```
+
+Result:
+
+```text
+49 direct tests passed
+```
+
+---
+
+## 2026-06-28 (PM) — Stage 4s goalie-only pass pretrain
+
+### Problem
+
+The latest Stage 4r defender run proved the receiver-claim handoff and longer pass-align budget were
+not enough. The run finished at 25.9% overall goals and 21% last-100, with only
+`301 requested -> 14 fired -> 3 resolved` passes. The key diagnostic was that the defender made the
+valid-pass surface too sparse: `pass_available_steps=0` in logged summaries, with target/mask
+rejections dominated by `pass_interceptable`, `not_kickable`, `bad_reception_cone`,
+`too_close_for_ssl_pass`, and `pass_lane_blocked`.
+
+That means Stage 4 was still asking PPO to learn supporter positioning, pass timing, pass execution,
+receiver collection, and defender-aware lane creation all at once. The model never got enough
+successful pass completions for the downstream receiver-finish macro to train.
+
+### Fix
+
+Added a new active curriculum rung in
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- `stage4s_goalie_only_pass_pretrain`
+- `timesteps: 150000`
+- `team_config: team_config_2atk_goalie.json`
+- `num_opponents: 1`
+- only one aux opponent controller: TeamB scripted goalie `robot_id=1`
+- previous defender stage `stage4r_intercept_gate_v1` is preserved with `timesteps: 0`
+
+The new rung keeps the Stage 4 coordination machinery active:
+
+- `ball_action_recovery: true`
+- sticky claimant split for attacker/supporter roles
+- supporter remains `goto`-driven through the dynamic mask
+- role-relative support targets
+- pass macro with `pass_macro_max_align_steps: 90`
+- pending-pass receiver claim handoff
+- post-pass receive-finish macro
+
+But it removes field-defender pressure:
+
+- `use_defender_lane_gate: false`
+- `defender_lane_penalty: 0.0`
+- TeamB has only the goalie, so there is no hardcoded defender shadowing the pass lane
+- pass intercept gating is relaxed for this mechanics rung with `pass_intercept_defender_speed: 0.0`
+  and `pass_intercept_min_margin: 0.0`
+
+Reward/config adjustments for the pretrain:
+
+- support target shaping is denser: `support_receive_target_bonus: 0.08`,
+  `support_receive_ready_bonus: 0.14`, `support_bad_target_penalty: 0.04`
+- pass distance floor is relaxed but still meaningful: `support_min_pass_distance: 7.0`,
+  `pass_min_distance: 7.0` (`0.7m` with the 10 env-units/m conversion)
+- `support_receive_ready_radius: 6.0` and
+  `support_pass_receiver_max_target_dist: 12.0` make the receive state easier to discover
+- `pass_available_bonus: 0.02` for at most 6 steps teaches the precondition without making waiting
+  profitable
+- open-shot urgency remains active so the carrier still shoots when the direct shot is clearly better
+
+This stage is not meant to be the final Stage 4 policy. It is a pass-mechanics pretrain: train
+without the defender until pass fire/resolve/receive-finish is real, then reintroduce defender
+pressure in a later rung.
+
+### Validation
+
+```text
+/opt/anaconda3/envs/rcai/bin/python -m json.tool configs/ppo_jal_curriculum_config.json
+
+/opt/anaconda3/envs/rcai/bin/python - <<'PY'
+import json
+from ai_interface.envs.reward import RewardConfig
+cfg = json.load(open('configs/ppo_jal_curriculum_config.json'))
+active = [(k, v.get('timesteps')) for k, v in cfg['curriculum'].items() if int(v.get('timesteps', 0)) > 0]
+print(active)
+RewardConfig(**cfg['curriculum']['stage4s_goalie_only_pass_pretrain']['reward_config_overrides'])
+PY
+```
+
+Result:
+
+```text
+active [('stage4s_goalie_only_pass_pretrain', 150000)]
+stage4s RewardConfig OK
+```
+
+---
+
+## 2026-06-28 (PM) — Stage 4r pass receiver claimant handoff + pass-align budget
+
+### Problem
+
+Stage 4r fixed the pass-mask starvation bug: pass requests rose sharply, proving the dynamic
+intercept gate no longer blocks exploration. The next failure moved downstream:
+
+- pass requests were now visible, but request→fire conversion stayed very low;
+- fired passes rarely resolved because the intended receiver remained the non-claimant supporter;
+- the supporter mask kept the receiver `goto`-only, so it could stand near the receive target but
+  could not `approach_ball` to collect a pass or recover a loose one;
+- pass alignment still timed out under the physical 20 deg/s turn cap.
+
+The important math for the second issue: at `0.1s/step` and `20 deg/s`, a turn command changes robot
+heading by about `2 deg/step`. The previous active Stage 4r `pass_macro_max_align_steps=24` could
+cover only about `48 deg`, but Stage 4 spawns use random headings over `[-180, 180]`, so many valid
+pass attempts could need much more alignment time.
+
+### Fix
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- `_ball_claimant(...)` now treats an active pending pass as a temporary ownership transfer.
+- While `_pending_passes` contains an in-window pass, the intended receiver becomes the claimant.
+- That unmasks the receiver's ball-collection path (`approach_ball` when far; kick/dribble paths once
+  close) instead of forcing it back to supporter `goto`.
+- Active `post_pass_finish_macro` owners also become claimant, keeping observation/reward/mask role
+  bits consistent while the receive-finish macro is running.
+- Expired pending passes are ignored by the claimant handoff, so stale pass events do not trap the
+  receiver as claimant forever.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Active `stage4r_intercept_gate_v1` now uses `pass_macro_max_align_steps: 90`.
+- Preserved historical Stage 4 rungs were left at their previous values.
+
+### Validation
+
+```text
+conda run -n rcai python -m py_compile \
+  ai_interface/envs/JAL_env.py ai_interface/envs/reward.py tests/test_stage4_support_pass.py
+
+manual tests.test_stage4_support_pass runner: ran 30 tests, all passed
+conda run -n rcai python tests/test_ball_action_recovery.py: 19 passed
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json: OK
+```
+
+`tests/test_stage3_reward_rules.py` was not runnable in the current `rcai` environment because
+`pytest` is not installed there.
+
+---
+
+## 2026-06-28 (PM) — Stage 4r sim-only inference team config
+
+Added [team_config_2atk_goalie.json](../team_config_2atk_goalie.json) for evaluating the
+`stage4r_intercept_gate_v1` checkpoint under `--env sim-only` with the **2 attackers vs.
+goalie-only** matchup (`TritonBots` 2/0, `TeamB` 1/1 — one opponent, flagged as keeper, no field
+defender). The existing root configs didn't cover this case: `team_config_2atk_1def.json` adds a
+field defender (`TeamB` 2/1) and `team_config_stage2/3.json` only spawn a single attacker. Use it
+with:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python launch_infer.py \
+  models/ppo_jal_expandable/stage4r_intercept_gate_v1_complete.pt \
+  --trainer ppo_jal --config configs/ppo_jal_curriculum_config.json \
+  --stage stage4r_intercept_gate_v1 \
+  --team_config team_config_2atk_goalie.json \
+  --env sim-only --steps 3000
+```
+
+> Note: `--env sim-only` is the **external** rcssserver, which lacks the embedded catch-glue dribble
+> patches — dribble carries won't reproduce the way they do under `sim-embedded`. This config is for
+> watching pass/shoot behavior and the keeper matchup, not dribble evaluation.
+
+---
+
+## 2026-06-28 (PM) — Stage 4r v2: the intercept gate was over-rejecting and mask-starving pass exploration
+
+### Problem (why "the model still won't explore `pass_to_teammate`")
+
+The first Stage 4r gate (below) fixed the *concept* but was **mis-calibrated and over-rejected**, which
+is strictly worse than the static gate it replaced: it made a legal pass target essentially never
+exist, so the action mask zeroed `pass_to_teammate` ~99% of the time and the policy could not even
+*sample* a pass — there is nothing to explore and no gradient toward passing.
+
+Evidence (live, run `20260628_183635_702568`, confirmed `stage4r_intercept_gate_v1`):
+
+- Over **485 episodes**: passes `requested=7`, `fired=1`. The policy almost never selects pass.
+- Aggregated `pass_mask_reasons` (why `mask[slot,5]=0` for the carrier): `not_kickable` 35,938,
+  `too_close` 32,973, **`pass_interceptable` 22,338**, `bad_reception_cone` 19,893, `lane_low` 6,522.
+- Aggregated supporter `target_reasons` (classification of the receive target): of 118k,
+  **`ok` = 1.1%**; `too_close_for_ssl_pass` 46.5%, **`pass_interceptable` 41.2%**, `pass_lane_blocked` 10.4%.
+
+A grid sweep over receive targets reproduced it exactly: with the defender **central** (its normal
+defending position, directly between ball and goal) the intercept gate rejected **100%** of forward
+passes (`legal-ok = 0` at every short-pass defender pose); only a defender already drifted ≥6u
+off-centre left any passable target.
+
+Two distinct bugs in `pass_intercept_margin` (mine, from the first 4r):
+
+1. **Constant ball speed.** I modeled the pass at a fixed `pass_speed`. A real kick decays
+   (`BALL_DECAY=0.94`): the ball covers 12u in ~11.7 steps, not the ~8.6 a constant model assumes,
+   so late-flight time was under-counted.
+2. **No directional filter (the big one).** `t_def` let *any* defender run to the nearest lane point.
+   A defender **behind the ball** (trailing the play) or **behind the receiver** (it cannot reach a
+   ball already past it) still produced a negative margin and vetoed the pass. Concretely, a defender
+   at `(30,0)` *behind* a receiver at `(27,0)` returned margin −6.24 → "interceptable", which is
+   physically nonsense. Because some real defender is almost always *somewhere*, this rejected nearly
+   everything.
+
+These compounded with `min_pass_distance = 12` (46.5% `too_close`), leaving the ~1.1% feasible window.
+
+### Fix (code + config recalibration)
+
+**Code** — [ai_interface/envs/stage4_support.py](../ai_interface/envs/stage4_support.py)
+`pass_intercept_margin(...)`:
+
+- **Decaying-speed ball model** via new helper `_ball_travel_time(distance, pass_speed, decay)`:
+  treats `pass_speed` as launch speed `v0`, inverts the geometric-series travel
+  `s(k)=v0·(1−decay^k)/(1−decay)` to get the true step count to each lane point (`decay≈1`
+  degenerates to the old `distance/pass_speed`). Honest, slower late-flight `t_ball`.
+- **Directional eligibility filter**: a blocker only counts at a lane point if its projection onto the
+  pass direction lies between the ball and the receiver (±`catch_radius`). Defenders behind the ball
+  or beyond the receiver no longer veto. Returns `+inf` when no blocker is ever eligible.
+
+**Config** — `stage4r_intercept_gate_v1` recalibrated (a `min_intercept_margin` sweep showed a sharp
+knee: `0.0` = gate effectively off, `~0.5–1.0` = robust feasible region, higher = diminishing):
+
+- `pass_intercept_min_margin` 3.0 → **1.0**
+- `support_min_pass_distance` & `pass_min_distance` 12 → **8**
+- `support_forward_min` 12 → **14**, `support_forward_max` 18 → **20** (receiver clears the distance floor)
+
+**Result** (grid sweep, config-wired through the real `env._classify_support_target`): legal-ok pass
+fraction **1.1% → ~9%** overall, rising to **18–50 targets** per open-lane defender pose, while a
+defender dead-on a short forward lane is still (correctly) rejected, and behind-ball / behind-receiver
+defenders now correctly read as `ok`. Tests: `tests/test_stage4_support_pass.py` +2 (directional
+filter, decaying speed); 28/28 pass, 62/62 across the stage3/4 + accounting + recovery suites.
+
+> Watch on the next run: passes **REQUESTED** per episode must climb off ~0 first (exploration
+> unblocked) — *then* RESOLVED rises and interception share of non-resolved passes falls. If REQUESTED
+> stays ~0, the block is no longer the gate. If passing volume looks too loose, raise `min_margin`
+> toward 1.5–2.0 (tune this knob, **not** the gate geometry).
+
+---
+
+## 2026-06-28 — Stage 4r Dynamic Intercept-Time Pass Gate (the real fix)
+
+### Problem (true root cause of the whole stage4j–4q passing saga)
+
+A dozen Stage 4 rungs (4i→4q) never produced coordinated passing — every run collapsed back to
+solo dribbling (`pass_to_teammate` 0–2%), and reward/mask tuning never broke it. Diagnosis across the
+runs showed **interceptions dominate every non-resolved pass** (stage4o: `104` interceptions vs `55`
+resolved; 4m: `82` vs `50`). The carrier's value function correctly learned that passing loses and
+kept reverting to dribbling.
+
+The root cause is **not** reward shaping and **not** a geometric impossibility (an earlier claim that
+fired passes had "lane quality 0.16–0.38" was wrong — that metric, `positional_gap_quality`, is the
+carrier's open-goal SHOT angle, which is *correctly* low when the carrier passes because it can't
+shoot; it says nothing about interception).
+
+The actual defect is in the **pass-legality gate**. `classify_support_target(...)` scored the pass
+lane with `lane_clear_quality(...)`, a **static, instantaneous** metric: the defender's *current*
+perpendicular distance to the ball→target line, divided by `block_dist`. It is blind to ball-flight
+time. A pass takes ~1–2 s to travel, during which the defender runs *onto* the lane and touches the
+ball (interception is adjudicated at resolution as "opponent touches ball", a true dynamic-pursuit
+event in [JAL_env.py](../ai_interface/envs/JAL_env.py) `_resolve` path). So the gate green-lit passes
+that were physically doomed. No config knob fixes a time-blind metric — which is exactly why every
+rung failed, and why Stage 4q (raising the *static* threshold `0.35 → 0.45`) made it worse: it just
+suppressed passing (`12` fired vs 4p's `61`, macro fired `0×`) without changing intercept physics.
+
+### Fix (code, not config)
+
+Added a **dynamic interception-time gate** and a new active stage `stage4r_intercept_gate_v1`.
+
+Added [ai_interface/envs/stage4_support.py](../ai_interface/envs/stage4_support.py) `pass_intercept_margin(...)`:
+
+- Models the pass as the ball traveling start→target in a straight line at constant `pass_speed`
+  (env units/step). For sampled points `P` along the lane, ball arrival is
+  `t_ball = dist(start,P)/pass_speed`; a defender `D` can cut the lane near `P` at
+  `t_def = max(0, dist(D,P) - catch_radius)/defender_speed`.
+- Returns `min over P,blockers of (t_def - t_ball)`: **positive** means every defender reaches every
+  lane point only *after* the ball passes (safe); **negative** means a defender can sit on the lane
+  first (interceptable). `+inf` when no blockers / disabled.
+- `classify_support_target(...)` now rejects targets as `"pass_interceptable"` when
+  `margin < pass_intercept_min_margin` (skipped when the margin knob is `0`, preserving old behavior).
+
+Wired through [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py) `_classify_support_target(...)`
+and added four `RewardConfig` knobs in [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+`pass_intercept_ball_speed`, `pass_intercept_defender_speed`, `pass_intercept_catch_radius`,
+`pass_intercept_min_margin` (all default `0` → gate disabled / behavior unchanged).
+
+Stage 4r config:
+
+- Reverts Stage 4q's counterproductive geometry/threshold changes back to the proven 4p values
+  (support wedge `forward 12–18`, `lateral 12`, `y_clip 10`; static `support_pass_lane_min_quality`
+  back to `0.35` as a coarse pre-filter; `pass_macro_max_align_steps 24`).
+- Enables the new gate: `pass_intercept_ball_speed=1.4`, `pass_intercept_defender_speed=0.9`,
+  `pass_intercept_catch_radius=0.9`, `pass_intercept_min_margin=3.0` (derived from
+  `KICK_POWER_RATE=0.027`, `BALL_DECAY=0.94`, `PLAYER_DECAY=0.4`; all tunable as config).
+- Warm-starts from the Stage 4o 160k checkpoint, not the failed 4p/4q policies.
+- Marks `stage4q_pass_resolve_v1` failed/withdrawn (`timesteps: 0`).
+
+### Validation
+
+```bash
+conda run -n rcai python -m py_compile \
+  ai_interface/envs/stage4_support.py ai_interface/envs/JAL_env.py ai_interface/envs/reward.py
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json   # OK
+# active stages: [('stage4r_intercept_gate_v1', 200000)]
+```
+
+Manual test harness (rcai has no pytest):
+
+```text
+tests.test_stage4_support_pass: 26 passed, 0 failed   (incl. 2 new intercept-gate tests)
+tests.test_ball_action_recovery: 19 passed, 0 failed
+tests.test_stage3_reward_rules:  11 passed, 0 failed
+```
+
+The decisive new test proves the fix catches what the old code missed: a defender at `(28,3)` —
+**off** the ball→target line so static `lane_clear=0.67` (gate-OFF classifies the pass "ok") — is
+reachable in flight, so gate-ON correctly rejects it as `"pass_interceptable"`.
+
+### Training Watchpoints
+
+Success signal: `Pass RESOLVED` per episode rises **and the interception share of non-resolved
+passes falls** (the gate should mostly eliminate doomed passes pre-launch). If passing volume drops
+to ~0, `pass_intercept_min_margin=3.0` is too strict — lower it toward `1.0–2.0` (this is the first
+knob to tune, not the geometry).
+
+---
+
+## 2026-06-28 — Stage 4q Pass-Resolution Fix (config-only) — WITHDRAWN
+
+> Superseded by Stage 4r above. This config-only attempt raised the **static** lane threshold to fix
+> interceptions, but the static metric is time-blind so it only suppressed passing without changing
+> intercept physics (run `20260628_174911_977658`, stopped ~55%: `12` passes fired, macro fired `0×`,
+> goals up only because the policy dribbled more). Kept for history; the entry below describes what
+> was tried.
+
+## 2026-06-28 — Stage 4q Pass-Resolution Fix (config-only)
+
+### Problem
+
+Stage 4p (run `20260628_171015_717398`, TRAINING.md §41) did not improve scoring and the
+receive-finish macro it was built for almost never executed:
+
+- Goal rate flat at `199/826 = 24.1%` (all solo-dribble goals; `dribble_to` 56–83%, `kick` 0–2%,
+  `pass_to_teammate` 0–2%, supporter `goto=100%`).
+- **Passes do not resolve:** `Pass FIRED=61`, `Pass RESOLVED=9` over the whole run (~15%).
+- The pass-align macro is requested heavily (`requested=27–46/episode`) but `fired≈0` — it spins
+  `align_steps≈27–46` per episode and re-latches without launching, draining the clock.
+- The receive-finish macro **started 9 times in 826 episodes and fired 2 times**; finish banks
+  totalled `banked=9, consumed=2, expired=5`.
+- Fired pass aims cluster at the clamp edges `x=31.50` (`support_target_max_x`) and `|y|=10.0`
+  (`support_target_y_clip`) with low `passer_lane_q≈0.21–0.29`, so even resolved passes bank ~0.
+
+Root cause is **upstream of the finish macro**: the pass launch/align gate lets the carrier latch a
+pass and spin for tens of steps without firing, and the support receive wedge projects deep/wide
+into low-lane-quality space. The finish macro is validated (it fired twice, proving the plumbing) but
+is starved because passes rarely complete.
+
+### Fix
+
+Config-only (the macro code from Stage 4p is correct and kept). Added `stage4q_pass_resolve_v1`,
+marked `stage4p_receive_finish_macro_v1` failed (`timesteps: 0`). Warm-starts from the Stage 4o 160k
+checkpoint, **not** the failed 4p policy.
+
+Changes vs Stage 4p, all in
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Fire fast or abandon: `pass_macro_max_align_steps` `60 → 18`. A geometric turn-to-face needs only a
+  few steps; a latch that hasn't fired in 18 is chasing a bad/drifting target. Stops the 27–46
+  step/episode spin.
+- Pull receive targets out of the clamp edges so passes are reachable and lane-clear:
+  - `support_forward_min` `12 → 8`, `support_forward_max` `18 → 14` (shorter lead → `tx` stops
+    pinning at the x-clamp when the ball is already advanced);
+  - `support_lateral_max` `12 → 8` (less wide → `ty` stops pinning at the y-clip, lane stays clearer);
+  - `support_target_y_clip` `10 → 7`, `support_target_y_clip_x_min` `29 → 27` (harder cap on
+    deep-wide);
+  - `support_pass_receiver_max_target_dist` `9 → 7` (receiver must actually be near the target).
+- Require completable, meaningfully-better passes instead of forcing low-quality ones:
+  - `support_pass_lane_min_quality` `0.35 → 0.45`;
+  - `stage4_force_pass_min_target_quality` `0.22 → 0.32`;
+  - `stage4_force_pass_min_quality_gain` `0.05 → 0.10`.
+
+Everything else (receive-finish macro, finish-bank quality scaling, pass power, urgency, reward EV)
+is unchanged from Stage 4p.
+
+### Validation
+
+```bash
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json   # OK
+# active stages: [('stage4q_pass_resolve_v1', 200000)]
+# load_model: models/ppo_jal_expandable/stage4o_forced_pass_finish_v1_steps160000.pt
+```
+
+### Training Watchpoints
+
+The intended first sign of improvement is **not** higher pass volume — it is `Pass RESOLVED` per
+episode rising and pass aims leaving the `x=31.5`/`|y|=10` clamp edges. Stop early (~50k) if:
+
+- `fired ≈ 0` while `requested` is still high → the fix is still in the launch/align legality gate,
+  not reward;
+- `Pass RESOLVED` per episode stays near 0 → receive geometry still wrong;
+- goal rate stays at ~24% with `dribble_to` dominant → still solo-dribble, passing not contributing.
+
+---
+
+## 2026-06-28 — Stage 4p Post-Pass Receive-Finish Macro
+
+### Problem
+
+Stage 4o proved that the team can sometimes create and resolve passes, but the receiver still did not
+turn those resolved passes into shots:
+
+- pass-finish credit was banked after pass resolution;
+- the receiver was still controlled by the normal policy/mask path on following frames;
+- if the receiver was not the current claimant, supporter `goto` behavior could take over again;
+- the mask-only post-pass finish scaffold did not reliably handle receive, settle, aim, and kick.
+
+The result was the failure mode we saw in logs: `finish_banked > 0` but `finish_consumed == 0`.
+
+### Fix
+
+Added a command-level per-robot receive-finish macro in
+[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py).
+
+- A successful pass resolution now starts `post_pass_finish_macro[receiver_id]`.
+- The macro runs before normal action decoding/masking, so the receiver can finish even if it is
+  not currently the sticky ball claimant.
+- Non-owner attackers keep normal role behavior.
+- The macro expires after `post_pass_finish_macro_window_steps` (`80` by default, i.e. `8s` at
+  `0.1s/step`).
+
+Macro phases:
+
+- `acquire`: if the receiver is outside kickable distance, use
+  `approach_ball(..., obstacle_avoidance=True)`.
+- `settle`: if kickable but outside the front reception cone, run a deterministic `dribble_to`
+  reacquire/settle step toward the live ball.
+- `settle`/staging: if the ball is in the cone but current `Q3(ball)` is poor, allow one short
+  staging carry to the best local sampled point.
+- `kick`: once kickable and inside the reception cone, reuse the existing keeper-away kick macro,
+  reception cone, retargeting, and `kick_fired` accounting.
+
+Staging target math:
+
+- Candidate points are sampled from the ball toward goal with forward distances `{2, 4, 6}` env
+  units and lateral offsets `{-4, 0, +4}`.
+- Candidates are filtered inside the field, outside wide opponent penalty-area entry, and under
+  `post_pass_finish_macro_staging_max_carry = 6.0`.
+- Since SSL excessive dribbling is `10` env units (`1m`) and our normal safe segment cap is `8.5`,
+  the macro staging carry is deliberately shorter than the training dribble cap.
+
+Reward handling:
+
+- Existing finish banks are still created on pass resolution.
+- With `post_pass_finish_macro_enabled=true`, a bank is consumed only when the receiver fires a real
+  macro kick (`post_pass_finish_macro_fired=true`).
+- `post_pass_finish_macro_scale_reward_by_shot_quality=true` scales the bank payout by the shot
+  quality at the fire frame, so a forced low-quality kick cannot collect the full pass-finish reward.
+- Example: quality-`0.5` pass bank is `(14 + 12*0.5)/2 = +10.0`; a macro kick with fire-time shot
+  quality `0.25` pays `+2.5`.
+
+### Code Changes
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added macro config knobs:
+  - `post_pass_finish_macro_enabled`;
+  - `post_pass_finish_macro_window_steps`;
+  - `post_pass_finish_macro_min_shot_quality`;
+  - `post_pass_finish_macro_staging_max_carry`;
+  - `post_pass_finish_macro_scale_reward_by_shot_quality`.
+- Added `support_pass_select_best_receiver` for Stage 5+ receiver selection.
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- Added per-robot `post_pass_finish_macro` state.
+- Added helpers:
+  - `_start_post_pass_finish_macro(...)`;
+  - `_execute_post_pass_finish_macro(...)`;
+  - `_expire_post_pass_finish_macro(...)`;
+  - `_post_pass_finish_staging_target(...)`;
+  - `_post_pass_finish_shot_quality(...)`.
+- Started the macro immediately after successful pending-pass resolution.
+- Executed macro payloads before normal `kick`/`dribble_to`/`pass`/supporter decode branches.
+- Added debug counters for macro started/acquire/settle/kick-align/fired/expired/bad-cone frames
+  and average fire-time shot quality.
+- Made `_support_pass_candidate(...)` optionally choose the highest-quality receiver when multiple
+  legal receiver targets exist.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Preserved `stage4o_forced_pass_finish_v1` with `timesteps: 0`.
+- Added active `stage4p_receive_finish_macro_v1` for `200000` steps.
+- Warm-starts from `models/ppo_jal_expandable/stage4o_forced_pass_finish_v1_steps160000.pt`.
+- Uses `pass_finish_window_steps: 80`, `pass_macro_max_align_steps: 60`, macro enabled, and
+  finish-bank quality scaling enabled.
+
+Updated [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+
+- Added tests for macro start after pass resolution.
+- Added tests that the macro overrides supporter `goto`.
+- Added acquire, bad-cone settle, in-cone fire, scaled-payout math, expiry, and Stage 5-style
+  best-receiver selection coverage.
+- Added an `env.step(...)` integration test proving macro-fired kicks consume finish banks through
+  the same shot-quality-scaled path training uses.
+
+### Validation
+
+```text
+conda run -n rcai python -m py_compile \
+  ai_interface/envs/JAL_env.py \
+  ai_interface/envs/reward.py \
+  tests/test_stage4_support_pass.py
+
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json
+
+manual tests.test_stage4_support_pass runner: ran 24 tests, all passed
+active curriculum stages: [('stage4p_receive_finish_macro_v1', 200000)]
+load_model: models/ppo_jal_expandable/stage4o_forced_pass_finish_v1_steps160000.pt
+```
+
+---
+
+## 2026-06-28 — Stage 4o Debug-Only Coordination Diagnostics
+
+### Problem
+
+Before starting Stage 4o training, the existing logs could still leave an ambiguous failure:
+we could see pass counts, but not whether the new forced pass/finish scaffold was actually being
+entered, whether pass macros were timing out, or whether post-pass finish chances were being banked
+and then expiring unused.
+
+### Fix
+
+Added debug-only episode counters in [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py).
+These go to `train_log.log` because the file handler is `DEBUG`, but they do not print to the terminal
+because the console handler is `INFO`.
+
+- Counts forced Stage 4o mask decisions:
+  `forced(pass=..., open_shot=..., post_pass_finish=...)`.
+- Counts pass macro lifecycle:
+  `started`, `align_steps`, `timeouts`, and `fallback_reasons`.
+- Counts post-pass finish-bank lifecycle:
+  `banked`, `consumed`, and `expired`.
+- Changed support/pass diagnostic summaries and pass summaries from `info` to `debug`.
+- Changed the `Pass→kick finish bonus` line from `info` to `debug`.
+
+Look for:
+
+```text
+stage4o diagnostics
+support/pass diagnostics
+Episode N passes
+Pass→kick finish bonus
+```
+
+### Validation
+
+```text
+py_compile: passed
+manual regression harness: OK 45 tests
+```
+
+---
+
+## 2026-06-28 — Stage 4o Forced Pass/Finish Scaffold + Approach-Ball Obstacle Fix
+
+### Problem
+
+Stage 4n completed but still did not teach coordinated attacking:
+
+- Final goal rate was `10/799 = 1.3%`; last-100 goal rate was `1.0%`.
+- `max_steps` was `684/799 = 85.6%`, so most episodes timed out.
+- Passes existed (`Pass FIRED=101`, `Pass RESOLVED=34`), but `Pass→kick finish bonus=0`.
+- Late categorical entropy was very low, and the policy collapsed back into carrier `dribble_to`.
+
+Root causes:
+
+- The model was asked to discover a long sparse chain: supporter target, carrier pass, receiver
+  control, receiver shot. Reward-only shaping did not provide enough examples of the whole chain.
+- The carrier could still choose raw `goto`/`turn`, even though those primitives are not useful for
+  an in-possession carrier. They created no-progress escape hatches while the supporter was the only
+  robot that should learn field-position `goto`.
+- The pass mask used the latched support target, but pass execution could rebuild from the current
+  same-step supporter action. This made “pass is valid” and “pass target used” inconsistent.
+- `approach_ball` needed obstacle avoidance for recovery, but a naive avoidance call would treat the
+  destination ball itself as an obstacle and steer away from the ball.
+
+### Fix
+
+Added Stage 4o, `stage4o_forced_pass_finish_v1`, and preserved Stage 4n as failed
+(`timesteps: 0`).
+
+- Carrier learned primitives are now scaffolded by role:
+  - supporter remains `goto` only;
+  - carrier raw `goto` and standalone `turn` can be masked;
+  - carrier still recovers with `approach_ball`, carries with `dribble_to`, shoots with `kick`, and
+    passes with `pass_to_teammate`.
+- Useful pass windows can now force `pass_to_teammate`:
+  - direct shot quality must be below `stage4_force_pass_max_direct_shot_quality`;
+  - pass target quality must exceed `stage4_force_pass_min_target_quality`;
+  - pass target quality must beat direct shot quality by `stage4_force_pass_min_quality_gain`.
+- Open-shot windows can force `kick` when the carrier has a high-quality direct shot.
+- After a resolved pass banks finish credit, the receiver can be temporarily forced into
+  recover-or-kick behavior:
+  - if not kickable, only `approach_ball`;
+  - if kickable and inside the reception cone, only `kick`;
+  - otherwise, only `dribble_to` to reorient/re-acquire.
+- Pass execution can now use the same latched support target that made the pass mask/observation
+  launchable.
+- `approach_ball(...)` now uses obstacle avoidance by default, but calls `goto(..., avoid_ball=False)`
+  so robot obstacles are avoided while the destination ball is not treated as an obstacle.
+- PPO exploration is raised for the active run:
+  - `target_kl: 0.01`;
+  - `ent_coef_initial: 0.02`;
+  - `ent_coef_final: 0.004`.
+
+Math/logic check:
+
+- A resolved quality-`0.5` pass now pays `(4 + 6*0.5)/2 = +3.5` immediately.
+- The receiver finish bank pays `(14 + 12*0.5)/2 = +10.0` only if a shot follows.
+- The full pass→shot chain is therefore `+13.5`, while a dead-end pass remains only `+3.5`.
+- Interception remains `-16/2 = -8`, so pass EV stays negative unless the pass is likely to complete
+  and lead to a finish.
+- Dribble target rewards are reduced (`progress=0.05`, `quality=0.5`, achieved-gap `1.0`) so they no
+  longer compete with the pass→finish chain.
+
+### Code Changes
+
+Updated [ai_interface/utils/basic_commands.py](../ai_interface/utils/basic_commands.py):
+
+- Added `include_ball` to `build_avoid_points(...)`.
+- Added `avoid_ball` to `goto(...)`.
+- Made `approach_ball(...)` obstacle-aware by default while excluding the ball from avoid points.
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added Stage 4 coordination scaffold knobs:
+  `stage4_mask_carrier_goto`, `stage4_mask_carrier_turn`, `stage4_force_pass_window`,
+  `stage4_force_pass_max_direct_shot_quality`, `stage4_force_pass_min_target_quality`,
+  `stage4_force_pass_min_quality_gain`, `stage4_force_open_shot_finish`,
+  `stage4_force_open_shot_quality`, `stage4_force_post_pass_finish`, and
+  `stage4_use_latched_pass_target`.
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- `get_primitive_valid_mask(...)` now applies the new carrier role masks.
+- Added forced pass, forced open-shot kick, and forced post-pass receiver finish mask branches.
+- Added `_has_post_pass_finish_bank(...)`.
+- `_action_to_commands(...)` now can use latched support targets for pass launch/execution, keeping
+  observation, mask, and executed pass target aligned.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Marked `stage4n_safer_pass_finish_v1` as failed and set `timesteps: 0`.
+- Added active `stage4o_forced_pass_finish_v1` for `300000` steps.
+- Lowered Stage 4o dense dribble rewards and moved most pass value into receiver finish credit.
+- Raised PPO entropy/KL settings for the active recovery run.
+
+Updated [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+
+- Added regression tests for ball exclusion in approach avoidance.
+- Added tests for carrier `goto`/`turn` masking.
+- Added tests for forced pass-window masking.
+- Added tests for forced post-pass receiver finish masking.
+
+### Validation
+
+```bash
+conda run -n rcai python -m py_compile \
+  ai_interface/utils/basic_commands.py \
+  ai_interface/envs/JAL_env.py \
+  ai_interface/envs/reward.py \
+  tests/test_stage4_support_pass.py
+
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Manual regression harness result:
+
+```text
+OK 45 tests
+```
+
+---
+
+## 2026-06-28 — Stage 4n Safer Pass + Finish-Gated Coordination
+
+### Problem
+
+Stage 4m did not improve scoring. It solved the previous sparse-pass issue, but created a new failure:
+passes became common without becoming useful football.
+
+- Latest Stage 4m run stayed at `0/631 = 0.0%` goals.
+- `pass_available_steps` became healthy (`71819`, about `31%` of env steps), so observability and
+  role-relative support worked.
+- Passes fired (`186`, about `0.295/episode`) but only `35/186 = 18.8%` resolved.
+- Direct shooting collapsed to `53` kicks over `631` episodes (`0.084/episode`).
+- Many pass targets were too deep and wide, commonly clamped near `x=33.5` with large `|y|`, which
+  sent the ball toward the opponent penalty area or a dead wide receiver.
+- Resolved passes were still rewarded immediately even when the receiver did not shoot afterward.
+
+Root cause: Stage 4m rewarded “make pass available / complete transfer” more than “create and finish a
+better scoring chance.” The supporter target manifold was too aggressive near the opponent defense
+area, and the carrier was allowed to pass even when its current direct shot was already as good as the
+support target.
+
+### Fix
+
+Added Stage 4n, `stage4n_safer_pass_finish_v1`, and preserved Stage 4m as failed (`timesteps: 0`).
+Stage 4n starts again from the Stage 3 v3 defender checkpoint, not from the failed Stage 4m policy.
+
+- Support role-relative target decode now has optional safety clamps:
+  - `support_target_max_x` caps receive targets before the penalty-area edge;
+  - `support_target_y_clip` with `support_target_y_clip_x_min` prevents deep wide targets;
+  - Stage 4n uses `support_target_max_x=31.5`, `support_target_y_clip=10.0`, x gate `29.0`.
+- Pass launch now compares the pass target against the current direct shot:
+  - if current `Q3(ball) >= support_pass_current_shot_lock_quality`;
+  - then pass is masked unless target quality exceeds current shot quality by
+    `support_pass_min_quality_gain_over_shot`.
+  - Stage 4n uses `0.38` and `+0.12`.
+- Pass power is configurable and lower in Stage 4n:
+  - `pass_power = clip(base + per_unit * distance, min, max)`;
+  - Stage 4n uses `min=35`, `base=30`, `per_unit=3`, `max=75`.
+- Pass reward is now finish-gated:
+  - immediate transfer credit is reduced to `possession_transfer_bonus=4`,
+    `pass_quality_weight=6`;
+  - a resolved pass banks finish credit for the receiver;
+  - the larger `pass_finish_bonus + pass_finish_quality_weight * quality` pays only if the receiver
+    kicks within `pass_finish_window_steps`;
+  - Stage 4n uses a 20-step finish window and `10 + 10 * quality`.
+- `pass_available_bonus` is reduced to `0.02` and capped at 6 steps, so availability remains visible
+  but cannot dominate shooting.
+- Open-shot urgency is slightly stronger and earlier (`quality=0.38`, grace `6`, step `0.14`) to
+  restore direct-shot frequency.
+
+Math check:
+
+- Old Stage 4m quality-`0.5` resolved pass paid `(14 + 18*0.5)/2 = +11.5` team reward immediately,
+  even if the receiver never shot.
+- Stage 4n pays only `(4 + 6*0.5)/2 = +3.5` immediately.
+- The finish bank pays `(10 + 10*0.5)/2 = +7.5` only when the receiver kicks within 20 steps.
+- Total successful pass→shot chain remains `+11.0`, close to the old value, but a dead-end pass loses
+  most of the reward.
+- Interception stays `-16/2 = -8`, so pass EV is positive only when it has a realistic chance to lead
+  to a finish.
+
+### Code Changes
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added Stage 4 support/pass knobs:
+  `support_target_max_x`, `support_target_y_clip`, `support_target_y_clip_x_min`,
+  `support_pass_current_shot_lock_quality`, `support_pass_min_quality_gain_over_shot`,
+  `pass_power_min`, `pass_power_base`, `pass_power_per_unit`, `pass_power_max`,
+  `pass_finish_window_steps`, `pass_finish_bonus`, and `pass_finish_quality_weight`.
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- `_decode_support_goto_target(...)` now applies optional max-x and deep-y clamps.
+- `_support_pass_candidate(...)` now rejects `direct_shot_better` when the carrier already has a
+  comparable or better direct shot.
+- `pass_to_teammate` uses configurable pass power instead of hardcoded `40 + 6*distance`.
+- Added `_post_pass_finish_banks` and helpers:
+  `_bank_post_pass_finish_reward(...)`, `_consume_post_pass_finish_reward(...)`, and
+  `_age_post_pass_finish_banks(...)`.
+- A resolved pass can now bank finish credit for the intended receiver, paid only on a later
+  receiver kick inside the configured window.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Marked `stage4m_role_relative_pass_v1` as preserved/failed and set `timesteps: 0`.
+- Added active `stage4n_safer_pass_finish_v1` with the safer support target geometry, direct-shot pass
+  lock, lower pass power, lower immediate pass reward, finish-gated pass reward, and stronger
+  open-shot urgency.
+
+Updated [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+
+- Added regression coverage for deep/wide support target clamps.
+- Added regression coverage for `direct_shot_better` pass masking.
+- Added regression coverage for post-pass finish bank payout.
+
+### Validation
+
+```bash
+conda run -n rcai python -m py_compile \
+  ai_interface/envs/JAL_env.py \
+  ai_interface/envs/reward.py \
+  ai_interface/envs/stage4_support.py \
+  tests/test_stage4_support_pass.py
+
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Manual regression harness result:
+
+```text
+tests.test_stage4_support_pass 11
+tests.test_ball_action_recovery 19
+tests.test_stage3_reward_rules 11
+manual tests ok 41
+```
+
+### Training Watchpoints
+
+Stop Stage 4n early around `50k` steps if:
+
+- goal rate is still `0%`;
+- kick rate stays below `0.4/episode`;
+- `pass_fired` is above `0.3/episode` but `pass→kick` finish payout is rare;
+- `ball_in_penalty_off_target` remains above about `10%` of episodes.
+
+The intended first sign of improvement is not high pass volume. It is: direct kicks recover, pass
+targets stop clustering near `x=33.5`, and resolved passes are followed by receiver shots.
+
+---
+
+## 2026-06-28 — Stage 4m Time-Crunch Passing Recovery
+
+### Problem
+
+The Stage 4k/4l recovery ladder still did not make the model pass. The latest completed run showed
+that the policy was no longer crowding the ball, but the supporter almost never became a usable
+receiver:
+
+- Stage 4l goal rate stayed low: `33/817 = 4.0%`, last 100 episodes `7.0%`.
+- Passes never actually entered play: `requested=1`, `fired=0`, `resolved=0`.
+- `pass_available_steps` was only `236` over about `299,664` env steps:
+  `236 / 299664 = 0.079%`.
+- Support target modes were still almost entirely non-receive:
+  `GENERAL_SUPPORT=98.19%`, `RECEIVE_TARGET=1.56%`, `RECEIVE_READY=0.25%`.
+
+Root cause: the supporter was asked to discover valid pass locations from raw global `goto(Dx,Dy)`
+coordinates over the full field. Most samples landed outside the small useful receive region, then
+failed legality/quality gates (`opponent_defense_area`, `outside_field`, `quality_low`,
+`receiver_far`, `bad_reception_cone`). Even when a target briefly became valid, the carrier had to
+sample `pass_to_teammate` on that same frame and already be aligned well enough to fire. This made
+coordinated passing a rare one-frame lottery, not a learnable behavior.
+
+### Fix
+
+Stage 4 now has a time-crunch recovery rung, `stage4m_role_relative_pass_v1`, focused on making pass
+attempts common enough for PPO to learn from.
+
+- Supporter `goto(Dx,Dy)` can now be decoded as a **role-relative receive wedge** instead of raw global
+  field coordinates:
+  - forward offset from ball/carrier direction to goal: `12..24` env units (`1.2m..2.4m`);
+  - lateral offset: `±16` env units, with a minimum lateral separation of `6` units to avoid sitting
+    directly on the carrier shot lane;
+  - target clamped inside the field and just outside the opponent defense area.
+- `pass_to_teammate` is now a committed macro:
+  - first valid pass request latches receiver + target;
+  - later policy frames cannot interrupt the pass alignment;
+  - the carrier turns toward the latched target for up to `pass_macro_max_align_steps`;
+  - once aligned and still physically legal, the pass fires and records the normal pending-pass event.
+- Stage 4m relaxes pass discovery gates so fired passes can emerge:
+  - `support_pass_lane_min_quality: 0.25`;
+  - `support_pass_shot_min_quality: 0.10`;
+  - `support_pass_receiver_max_target_dist: 12.0`;
+  - `support_receive_ready_radius: 6.0`.
+- Support shaping was strengthened but kept below idle-profit levels:
+  - `support_receive_target_bonus: 0.12 * quality`;
+  - `support_receive_ready_bonus: 0.20 * quality`;
+  - `pass_available_bonus: 0.10 * quality`, capped to the first `10` launchable steps;
+  - `support_bad_target_penalty` reduced to `0.03` so early exploration is not crushed.
+
+Math check: with target quality `0.5`, a ready support point pays `0.20 * 0.5 = +0.10` to the
+supporter, or about `+0.05` after two-robot team averaging. That offsets only half of the `-0.1`
+step cost, so idle camping at a ready point is still not profitable by itself.
+
+### Code Changes
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- Added per-robot pass macro state:
+  `pass_macro_active`, `pass_macro_receiver`, `pass_macro_target`,
+  `pass_macro_support_info`, and `pass_macro_align_steps`.
+- Added `_reset_pass_macro(...)`.
+- Added `_decode_support_goto_target(...)`.
+  When `support_role_relative_targets=true`, this maps the supporter's raw `Dx,Dy` into the tactical
+  receive wedge ahead/lateral of the ball instead of absolute field coordinates.
+- `_build_support_targets(...)` now classifies the role-relative target when enabled.
+- `_action_to_commands(...)` now executes the same decoded role-relative target for supporter `goto`,
+  so the location being rewarded is the same location the robot moves toward.
+- `pass_to_teammate` now latches a valid support candidate and continues alignment across frames until
+  it fires, times out, or loses physical legality.
+- Pass diagnostics now include macro fields:
+  `pass_macro_active`, `pass_macro_receiver`, `pass_macro_target`, and `pass_macro_align_steps`.
+- Pass request counting now counts raw categorical `pass_to_teammate` selections only; macro
+  continuation frames do not inflate `requested`.
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added Stage 4 recovery knobs:
+  `support_role_relative_targets`, `support_forward_min`, `support_forward_max`,
+  `support_lateral_max`, `support_lateral_min_abs`, and `pass_macro_max_align_steps`.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Marked `stage4k_support_receive_pretrain` as preserved/failed and set `timesteps: 0`.
+- Marked `stage4l_pass_execute_v1` as preserved/failed and set `timesteps: 0`.
+- Added active `stage4m_role_relative_pass_v1`:
+  - `timesteps: 300000`;
+  - warm-start remains
+    `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`;
+  - `support_role_relative_targets: true`;
+  - relaxed pass gates and strengthened setup rewards as listed above.
+
+Updated [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+
+- Added regression coverage for role-relative support target decoding.
+- Added regression coverage that one `pass_to_teammate` request latches the pass macro and later
+  frames continue the pass alignment.
+
+### Validation
+
+```bash
+conda run -n rcai python -m py_compile \
+  ai_interface/envs/JAL_env.py \
+  ai_interface/envs/reward.py \
+  ai_interface/envs/stage4_support.py \
+  tests/test_stage4_support_pass.py
+
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Manual regression harness result:
+
+```text
+tests.test_stage4_support_pass 8
+tests.test_ball_action_recovery 19
+tests.test_stage3_reward_rules 11
+manual tests ok 38
+```
+
+### Training Watchpoints
+
+Stop the Stage 4m run early at about `50k` steps if either of these remains true:
+
+- `pass_fired < 0.3/episode`;
+- `pass_available_steps < 5%` of env steps.
+
+If either fails, the next fix should come from the new pass macro/support diagnostics rather than
+letting the full `300k` run complete.
+
+---
+
+## 2026-06-28 — Stage 4j Supporter Target + Passing Reward Upgrade
+
+### Problem
+
+Stage 4 training was not becoming a real `2 attackers vs defender + goalie` task. The latest logs
+showed the carrier mostly behaving like a Stage 3 solo attacker while the second attacker became a
+passive or poorly positioned teammate:
+
+- The supporter had been masked away from ball actions, but there was no strong, explicit signal for
+  *where* it should go.
+- Passes could be attempted from carrier-side heuristics rather than from a supporter-selected receive
+  coordinate, so the policy was not learning the supporter's `goto(Dx,Dy)` as the pass target.
+- `pass_min_distance=3.0` meant a "pass" could be only `0.3m` in Division B units (`1m = 10 env
+  units`), which is too short and rewards non-football possession shuffling.
+- Successful pass credit was too weak and failed pass outcomes were mostly just event deletion, so
+  interceptions and timeouts were not clearly negative.
+- `dribble_achieved_gap_weight` was still directly payable, so the model could keep farming carry-angle
+  reward without a finish.
+- When the carrier had an open, high-quality shot/pass window, there was no urgency cost for waiting.
+
+### Fix
+
+Stage 4 now has an explicit Sumatra-inspired support-target system. The non-claimant still only gets
+`goto`, but its decoded `goto(Dx,Dy)` is now treated as the proposed receive/support coordinate. The
+environment classifies that point as:
+
+- `RECEIVE_READY`: legal target, clear pass lane, useful continuation shot/pass quality, and receiver
+  is within `2.5` env units.
+- `RECEIVE_TARGET`: legal and useful receive point, but the receiver is still moving there.
+- `GENERAL_SUPPORT`: not a valid receive target; still logged and shaped as general support, with bad
+  targets penalized when they are illegal or block the carrier.
+
+The carrier's `pass_to_teammate` primitive is now masked unless there is exactly one ready supporter
+target and all physical/football gates pass:
+
+- carrier has the ball in the front reception cone;
+- support target lane clearance `>= 0.70`;
+- support target quality `>= 0.35`;
+- carrier-to-target and ball-to-target distance `>= 12.0` env units (`1.2m`);
+- target is inside field, outside the opponent defense area, not too close to opponents, not too close
+  to the carrier/ball, and not blocking the carrier's shot lane.
+
+When pass fires, it uses the supporter's selected target, not a separate carrier-generated lead target.
+The target is hysteresis-stabilized for `8` steps unless it becomes illegal, preventing rapid ready/not
+ready toggling.
+
+### Code Changes
+
+Added [ai_interface/envs/stage4_support.py](../ai_interface/envs/stage4_support.py):
+
+- Defines `SupportTargetInfo` and modes `RECEIVE_READY`, `RECEIVE_TARGET`, `GENERAL_SUPPORT`.
+- Implements `classify_support_target(...)` with the Stage 4 legality checks:
+  field bounds, opponent defense area, minimum SSL pass distance, opponent clearance, carrier shot-lane
+  blocking, pass-lane clearance, and continuation quality.
+- Uses existing `lane_clear_quality(...)` and `positional_shot_quality(...)` so pass/support scoring
+  stays consistent with the Stage 3 defender-lane and goalie-gap math.
+
+Updated [ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+
+- Added support target state:
+  `self._last_support_targets`, `self._support_target_hysteresis`,
+  `self._prev_support_target_dist`, `_open_shot_ready_steps`, `_open_shot_penalty_total`, and
+  `_banked_dribble_gap_rewards`.
+- Added `_stage4_support_enabled()`, `_classify_support_target(...)`,
+  `_build_support_targets(...)`, `_ready_support_pass_target(...)`, `_shot_quality_at_point(...)`,
+  `_consume_banked_dribble_gap_reward(...)`, and `_age_banked_dribble_gap_rewards()`.
+- `get_primitive_valid_mask()` now keeps supporters `goto`-only and masks claimant `pass_to_teammate`
+  unless a current ready support target exists and the claimant can physically pass from the front cone.
+- `_action_to_commands()` now:
+  - builds support targets from the supporter's decoded `goto` params each step;
+  - forces any non-claimant non-`goto` sample to execute its decoded `goto` target instead of falling
+    back to `turn 0`;
+  - routes `pass_to_teammate` through the ready support target when Stage 4j support gating is enabled;
+  - records pass diagnostics: target, mode, quality, lane clearance, pass-ready flag, and failure
+    reason.
+- Pass resolution now applies configured failed-pass penalties:
+  interception `-16 total`, timeout `-10 total`, pass-caused off-target penalty-area terminal `-18 total`.
+  Since team reward is averaged over two robots, these are about `-8`, `-5`, and `-9` scalar training
+  reward respectively.
+- Successful pass reward now uses:
+  `possession_transfer_bonus + pass_quality_weight * target_quality`, with Stage 4j values
+  `12 + 16*q`. For `q=0.5`, this is `20 total`, or about `+10` scalar team reward.
+- Positive achieved-gap dribble credit is banked for `20` steps and only paid if followed by a kick or
+  resolved pass. Negative achieved-gap remains immediate, so bad carries are still punished.
+- Added open-shot urgency: if the claimant has `Q3(ball) >= 0.45` and can legally kick/pass for more
+  than `10` steps, it pays `-0.12` per extra step, capped at `4.0`.
+- Fixed an existing achieved-gap bug while touching this path: the non-defender keeper-zone branch
+  referenced undefined `ag_ball_point`; it now uses the actual current ball point.
+
+Updated [ai_interface/envs/reward.py](../ai_interface/envs/reward.py):
+
+- Added Stage 4 support/pass config fields:
+  `support_pass_gate_enabled`, `support_target_progress_weight`,
+  `support_target_progress_clip`, `support_receive_ready_bonus`,
+  `support_bad_target_penalty`, `support_min_pass_distance`,
+  `support_receive_ready_radius`, `support_pass_lane_min_quality`,
+  `support_pass_shot_min_quality`, `support_target_hysteresis_steps`,
+  `pass_interception_penalty`, `pass_timeout_penalty`, `pass_off_target_penalty`,
+  `dribble_achieved_gap_finish_window`, and open-shot urgency fields.
+- Added reward inputs/intermediates for support target, previous distance, mode, quality, and bad-target
+  flag.
+- Non-claimant reward now pays:
+  `clip(prev_dist - current_dist, +/-1.0) * support_target_progress_weight`,
+  plus `support_receive_ready_bonus * target_quality` while ready,
+  and subtracts `support_bad_target_penalty` for illegal/bad targets.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+
+- Preserved old `stage4i_2atk_1def` with `timesteps: 0`.
+- Added active `stage4j_support_pass_v1` with:
+  - `timesteps: 300000`;
+  - attacking-half curriculum `ball x=[10,34]`, `y=[-15,15]`;
+  - `support_pass_gate_enabled: true`;
+  - `support_target_progress_weight: 0.4`;
+  - `support_receive_ready_bonus: 0.08`;
+  - `support_bad_target_penalty: 0.05`;
+  - `support_min_pass_distance: 12.0`;
+  - `pass_min_distance: 12.0`;
+  - `possession_transfer_bonus: 12.0`;
+  - `pass_quality_weight: 16.0`;
+  - pass failure penalties;
+  - `dribble_achieved_gap_weight: 2.0` and `dribble_achieved_gap_finish_window: 20`;
+  - open-shot urgency settings.
+- Updated top-level warm-start to:
+  `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`.
+
+Updated tests:
+
+- Added [tests/test_stage4_support_pass.py](../tests/test_stage4_support_pass.py):
+  support target classification, blocked-lane/defense-area rejection, primitive mask gating, pass
+  decode using the supporter's selected target, and reward math checks.
+- Updated [tests/test_ball_action_recovery.py](../tests/test_ball_action_recovery.py):
+  non-claimants are now expected to execute `goto` as supporters instead of falling back to `turn 0`;
+  non-claimant `turn` remains masked.
+
+### Validation
+
+`rcai` contains `gymnasium`, but it does not currently include `pytest`, so the test functions were
+run directly under `rcai` with a tiny `pytest.approx` stub for the Stage 3 rule tests:
+
+```bash
+conda run -n rcai python -m py_compile \
+  ai_interface/envs/JAL_env.py \
+  ai_interface/envs/reward.py \
+  ai_interface/envs/stage4_support.py \
+  tests/test_stage4_support_pass.py \
+  tests/test_ball_action_recovery.py \
+  tests/test_stage3_reward_rules.py
+
+conda run -n rcai python -m json.tool configs/ppo_jal_curriculum_config.json
+```
+
+Manual assertion harness result:
+
+```text
+tests.test_stage4_support_pass 5
+tests.test_ball_action_recovery 19
+tests.test_stage3_reward_rules 11
+manual tests ok
+```
+
+---
+
 ## 1. Added `approach_ball` Action
 
 **File:** [ai_interface/utils/basic_commands.py](ai_interface/utils/basic_commands.py)
@@ -2356,4 +4112,110 @@ PPO-JAL ball-action recovery tests: 19 passed
 Stage 3 reward/rule tests: 11 passed
 PPO-JAL expandable tests: 10 passed
 Config JSON parse: passed
+```
+
+---
+
+## 2026-06-26 IST — Stage 4i intermediate stage: 2-attacker coordination + passing
+
+### Context
+
+Stage 4 (`stage4_2v2`, 2 RL attackers vs GK + 2 defenders) failed (§38): ~0% goals, sim bricks,
+and no coordination — the 1→2 jump and a 3-defender block were both new at once. `stage4i_2atk_1def`
+is the documented-safe intermediate rung: **2 RL attackers (both warm-started from
+`final_models/stage3_complete.pt`) vs ONE scripted defender + goalie**, adding a real passing
+primitive and a coordination reward so only coordination is new. The first run of it reproduced the
+§38 failure mode (0 goals, `kick=0%`, recurring `ball_teleport` bricks), which the brick + reward
+fixes below address.
+
+### Changes — new passing primitive + coordination
+
+- Added `pass_to_teammate` as a 6th discrete primitive (`PRIMITIVE_NAMES` → index 5, `NUM_PRIMITIVES`
+  6 ≤ `NUM_PRIMITIVES_MAX` 12, no network rebuild; warm-starts cleanly from the reserved logit row).
+  It consumes **one** live param — the `Dx` slot reused as a `lead` for **through balls**
+  (`PRIMITIVE_PARAM_DIMS["pass_to_teammate"] = (0,)`). Receiver choice stays env-side (scalable to
+  N teammates for 6v6). `ai_interface/algorithms/ppo_jal.py`.
+- Wired pass execution into `JALTeamEnv._action_to_commands`
+  ([JAL_env.py:2589](ai_interface/envs/JAL_env.py#L2589)): gates on can-kick + front reception cone;
+  `_select_pass_target` picks the best **open** teammate (lane clear of opponents) and a through-ball
+  target `receiver + lead·dir(receiver→goal)` where `lead = (Dx_raw·0.5+0.5)·pass_lead_max`; turns to
+  face the target geometrically across steps, then fires `pass_to_teammate(...)` with power scaled by
+  pass distance. Records a pending-pass event for reward resolution.
+- Replaced the **exploitable** carrier-flip `possession_transfer_bonus` (two robots could oscillate
+  possession for unbounded bonus) with a **tracked pass-event resolution** (`self._pending_passes`).
+  A pass resolves only when the intended receiver gains the ball, the ball travelled ≥
+  `pass_min_distance`, within `pass_window_steps`, and no opponent touched it in between — through-ball
+  run-ons still credit, jostling never creates an event. New `RewardConfig` fields
+  ([reward.py:269](ai_interface/envs/reward.py#L269)): `pass_quality_weight` (× `clip(receiver_lane_q −
+  passer_lane_q, 0, 1)`), `pass_min_distance`, `pass_window_steps`, `pass_lead_max`.
+- Added obstacle avoidance to dribbling. `dribble_to(..., obstacle_avoidance=True,
+  obstacle_radius=0.9, obstacle_detour_margin=1.0)` ([basic_commands.py:408](ai_interface/utils/basic_commands.py#L408)):
+  the CARRY branch now builds opponent obstacles and dashes toward a `_select_detour` waypoint
+  (body-relative, so the glued ball is not orbited) instead of straight at the target. Open-space
+  carries unchanged. `goto`'s existing avoidance is left on.
+- Added `team_config_2atk_1def.json` (TritonBots ×2 vs TeamB GK + 1 defender) and the
+  `stage4i_2atk_1def` curriculum stage (`num_robots 2`, stage-3 defender + goalie as `aux_team_policies`,
+  `disabled_actions: []`, warm-start `final_models/stage3_complete.pt`, `timesteps 300000`; all other
+  stages `timesteps 0`).
+
+### Changes — Fix A: brick recovery (engine rebuild on brick terminal)
+
+`ball_teleport` / `frozen_state_stale_sim` bricks recurred (21 in the last 60 episodes of the first
+run) because `EmbeddedSimulatorBackend.reset`'s two rebuild triggers (sticky referee playmode,
+latched `_ball_caught_by`) miss some latch sources, so the cheap soft-reset ran and the next episode
+bricked again (1-step episodes). Added a symptom-level backstop that forces a full engine rebuild
+whenever the previous episode ended in a brick state:
+
+- `JALTeamEnv` records `self._last_terminal_reason` each step; new class constant
+  `_SIM_REBUILD_TERMINAL_REASONS = ("ball_teleport", "frozen_state_stale_sim")`; `reset()` computes
+  `force_rebuild` and clears the flag after. `ai_interface/envs/JAL_env.py`.
+- Threaded `force_rebuild` through `Networker.reset_sim` → `Commander.reset_sim` →
+  `EmbeddedSimulatorBackend.reset`, where it is OR'd into the existing rebuild condition (reuses
+  `_initialize_simulator()`). `networking/networker.py`, `networking/socket_utils.py`.
+
+### Changes — Fix B: kick-collapse reward retune (stage4i overrides)
+
+The first run hit `kick=0%` / 0 goals because the carrier was **paid to hold and dribble**
+(`has_ball_bonus 0.08`/step + `dribble_active_bonus 0.03` + `dribble_target_progress_weight 1.0`,
+clip ±0.5 → up to ~+0.2–0.5/step risk-free) while Stage 3's **shot-release pressure was dropped**
+(`carry_urgency` all 0). "Dribble forever" beat the gated, penalty-risking kick. Restored Stage-3's
+proven structure in `stage4i_2atk_1def.reward_config_overrides` (`configs/ppo_jal_curriculum_config.json`):
+
+- `has_ball_bonus` 0.08 → **0.0**, `dribble_active_bonus` 0.03 → **0.0** (stop paying to camp on the ball).
+- `dribble_target_progress_weight` 1.0 → **0.3** (per-step dribble cap drops 0.5→0.15).
+- restored `dribble_achieved_gap_weight` **5.0** (one-shot at carry-close; credits only carries that
+  actually open an angle).
+- restored `carry_urgency_grace_steps 25` / `carry_urgency_penalty_per_step 0.03` /
+  `carry_urgency_penalty_max 2.25` (per-`rid`, fires only while a dribble session is active; −0.03/step
+  after grace, cumulative `min(2.25, 0.03·late_steps)`).
+- restored `keeper_zone_radius 4.0` / `keeper_zone_floor 0.0` (scales gap-based kick/dribble/achieved-gap
+  rewards floor→1 over 4 m from the keeper; stops over-dribble into the catch zone).
+- `goal_progress_weight` left at 2.0 so legitimate goalward dribbling still pays — only the gratuitous
+  hold/dribble camp bonuses are removed.
+
+### Changes — Fix B (cont.): role-gating bug found during verification
+
+`enable_role_gating` was at its default **False** for `stage4i` (only `stage5_3v3` set it). At
+[reward.py:950](ai_interface/envs/reward.py#L950) that makes `is_chaser` always-true for both robots,
+so `spread_bonus`/`support_position_bonus` (gated `if not is_chaser:`) **never fired** (supporter
+positioning reward inert) and `near_ball_bonus` was paid to both robots (rewarding crowding). Added
+`"enable_role_gating": true` to the stage4i overrides so the carrier/supporter role split actually
+works. **Any multi-robot coordination stage must set this true.**
+
+### Validation
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -c "import ai_interface.envs.JAL_env, networking.networker, networking.socket_utils; print('imports OK')"
+/opt/anaconda3/envs/rcai/bin/python -c "import json,dataclasses; from ai_interface.envs.reward import RewardConfig; ov=json.load(open('configs/ppo_jal_curriculum_config.json'))['curriculum']['stage4i_2atk_1def']['reward_config_overrides']; RewardConfig(**ov); print('RewardConfig built OK')"
+/opt/anaconda3/envs/rcai/bin/python train.py --trainer ppo_jal_curriculum --config configs/ppo_jal_curriculum_config.json --env sim-embedded --timesteps 3000   # 3k-step embedded smoke
+```
+
+Result:
+
+```text
+imports OK
+RewardConfig built OK
+Smoke: 401 episodes, no Traceback/NaN; carry_urgency firing per math
+  ("Carry urgency penalty -0.03 (rid=1 age=34 grace=25 total=0.27/2.25)");
+  Fix A "Forcing embedded engine rebuild" fired 4× and the run continued.
 ```

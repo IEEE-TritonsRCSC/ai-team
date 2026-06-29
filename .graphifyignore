@@ -1,0 +1,40 @@
+# .graphifyignore — controls what the graphify knowledge graph indexes.
+# graphify uses this file INSTEAD of .gitignore per-directory, so log dirs
+# already in .gitignore must be repeated here.
+
+# --- Logs (huge, no code) ---
+game_logs/
+train_logs/
+text_logs/
+infer_logs/
+
+# --- Training artifacts / downloads ---
+robocup_downloads/
+mac_mini_trainings/
+support/
+
+# --- Model checkpoints (binary .zip, not source) ---
+models/
+final_models/
+*.zip
+
+# --- Stray training-output JSON checkpoints at repo root ---
+TD3_0.json
+TD3_0*.json
+
+# --- Images / plots (avoid LLM vision extraction cost) ---
+*.png
+*.jpg
+*.jpeg
+
+# --- Tooling / agent dirs ---
+.claude/
+.codex/
+.agents/
+.github/
+
+# --- graphify's own output + caches ---
+graphify-out/
+__pycache__/
+**/*.pyc
+.DS_Store
