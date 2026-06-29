@@ -4,6 +4,106 @@ All changes made to fix training issues, improve the environment, and implement 
 
 ---
 
+## 2026-06-29 — Hybrid supporter inference triage (theta units bug + frozen-scorer OOD)
+
+Diagnosed the two failed hybrid inference runs (`stage4_hardcoded_support_2v3`,
+logs `20260629_195910` embedded and `20260629_200442` sim-only). Three reported symptoms:
+supporter goes off the field, no passing, and the solo PPO attacker performs far worse than
+in pure-AI play. Root causes, with ground truth from the `.rcg` game log + obs dumps:
+
+### 1. Supporter goes off the field — FIXED (theta degrees-as-radians)
+
+`GameState.robot_poses` stores headings in **degrees** (`sim_get_robot_poses`); every env
+consumer converts via `np.deg2rad`. The new `HardcodedSupporter` read `pose[2]` **raw** and
+treated it as radians. A spawn heading of e.g. 121.85° was fed into `goto` as 121.85 *radians*,
+so `goto`'s dash direction `atan2(dy,dx) - theta` became a ~120-radian value — after the sim
+wraps it modulo 2π the robot dashes in a garbage direction and drifts to the boundary. The
+`.rcg` confirmed the supporter (`l 2`) roaming x∈[-48,48], y∈[-33,33] and pinning in the
+bottom-left corner regardless of where the ball was.
+
+Fix: convert degrees→radians once at the boundary in `_extract_pose` and `_team_poses`
+([ai_interface/hardcoded_supporter.py](../ai_interface/hardcoded_supporter.py)). Verified in
+isolation: from the same spawn the dash direction now resolves to ~45° toward the forward
+receive target instead of a 55-radian value.
+
+### 2. Solo attacker much worse — ROOT-CAUSED (frozen Stage 3 model is out-of-distribution)
+
+The PPO scorer is the **frozen** `stage3_defender_v2_finetune` checkpoint, which scores 54.5%
+in its native stage (embedded, stochastic). Dropped into the hybrid it produces **0 kicks /
+0 goals** and dribble-locks (`dribble_to` ~80%, has-ball ~72%, ball never advancing past
+x≈26). Findings:
+- It is **not** an inference-flag issue: `--ppo_stochastic` does not restore kicking here
+  (it does on native Stage 3).
+- The hybrid stage sets **`num_opponents=3`** (goalie + defender + marker_defender). The obs
+  fills `num_opponents` opponent context slots, and `num_opponents` is derived from the
+  opponent team size (`infer.py:764`), not the stage field. The frozen policy trained with
+  context slot 3 **always zero**; the marker populates it → out-of-distribution → it stops
+  kicking. Obs dump: native Stage 3 `ctx_mask=[0,1,1,0,…]`, hybrid `ctx_mask=[0,1,1,1,…]`.
+- Reducing the opponent team to 2 (goalie + defender) makes the reset obs **structurally
+  identical** to Stage 3, but the frozen model **still** does not kick — the second same-team
+  body (the supporter) perturbs the in-episode dynamics (ball contention/lanes/defender
+  tracking) that a single-agent policy never trained against.
+
+Conclusion: a frozen single-agent policy cannot be dropped into the hybrid and finish
+reliably. The `stage4_hardcoded_support_2v3` stage must be **fine-tuned** (warm-started from
+Stage 3) so the attacker adapts to playing alongside the supporter. "No passing" (symptom 3)
+follows from the scorer never kicking and the supporter never legally receiving.
+
+---
+
+## 2026-06-29 IST — Hardcoded Stage 4 hybrid supporter fallback
+
+### Problem
+
+The learned Stage 4 passing stack remained unreliable under the deadline: the RL policy could score
+solo with the Stage 3 behavior, but repeated Stage 4 attempts failed to learn a dependable
+supporter/pass/receive/finish chain. We need a Wednesday-safe fallback that keeps the working Stage 3
+scorer and removes the second attacker's low-level coordination burden from PPO.
+
+### Fix
+
+Added [ai_interface/hardcoded_supporter.py](../ai_interface/hardcoded_supporter.py):
+- `HardcodedSupporter` controls one same-team supporting attacker.
+- Off ball, it searches a compact Sumatra-inspired receive wedge ahead/lateral to the carrier,
+  scores candidates by carrier-to-support lane clearance, continuation shot quality, opponent
+  separation, and travel cost, then latches the chosen point for stability.
+- If the ball is already moving toward the supporter, it moves to an earliest reachable intercept
+  point instead of waiting passively at the support spot.
+- If the supporter gets the ball, it immediately shoots through the best legal in-mouth target, or
+  returns a clear pass to the learned attacker if the shot is poor.
+- Geometry helpers (`lane_clear_quality`, `legal_support_point`, `segment_distance`) are standalone
+  and covered by tests.
+
+Added `HardcodedSupporterCommandProvider` in
+[ai_interface/trainers/policy_control.py](../ai_interface/trainers/policy_control.py):
+- pads commands to the supporter's simulator unum, so a Stage 3 PPO model can keep controlling
+  TritonBots robot 1 while the hardcoded supporter controls robot 2 on the same team;
+- supports `controller_type: "hardcoded_supporter"` through the generic aux policy factory.
+
+Wired `controller_type: "hardcoded_supporter"` into:
+- [ai_interface/trainers/ppo_jal_curriculum_trainer.py](../ai_interface/trainers/ppo_jal_curriculum_trainer.py)
+  for training/eval loops;
+- [infer.py](../infer.py) for direct inference and `launch_infer.py` subprocesses.
+
+Added a preserved config rung in
+[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+- `stage4_hardcoded_support_2v3`;
+- one PPO-controlled attacker (`robot_ids: [1]`) plus same-team hardcoded supporter (`TritonBots`
+  robot 2);
+- TeamB keeps the existing scripted goalie + ball defender + marker defender.
+
+Added [team_config_hardcoded_support_2v3.json](../team_config_hardcoded_support_2v3.json) for
+`launch_infer.py`:
+- starts 2 TritonBots players so robot 1 can run the Stage 3 PPO attacker while robot 2 is driven by
+  the hardcoded supporter aux policy;
+- starts 3 TeamB players with TeamB robot 1 as goalie, matching the scripted goalie + two-defender
+  opponent setup used by `stage4_hardcoded_support_2v3`.
+
+Added [tests/test_hardcoded_supporter.py](../tests/test_hardcoded_supporter.py) for lane scoring,
+legal support-point bounds, forward separated receive selection, and same-team command padding.
+
+---
+
 ## 2026-06-29 IST — Pass macro rewritten to mirror the proven solo-shot loop (kill the reception-cone settle wall)
 
 ### Problem

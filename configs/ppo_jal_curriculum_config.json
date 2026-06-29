@@ -6,7 +6,7 @@
     "_arm_note": "Hierarchical PPO with hybrid action heads (Categorical primitive + Gaussian Dx/Dy/Dtheta). Replaces the failed TD3 setup. Path-2 architecture: single network used across all stages; stage 1 only enables param-free primitives so the Gaussian head sits idle but stays trainable, then stage 2+ unlocks primitives that read its outputs. See TRAINING.md and /Users/Adnan/.claude/plans/sprightly-singing-kite.md for the full rationale.",
     "curriculum": {
         "stage1_015_warm": {
-            "description": "DISABLED (timesteps=0). Stage 1 warmup was a TD3 holdover — its purpose was to bake in kick mechanics on an easy spawn distribution. PPO with hybrid action heads doesn't need that warm-start: the value function picks up the +150 goal reward just as fast at stage 1.090 alongside the more interesting kick-vs-turn discrete decision. Re-enable only if stage 1.090 stalls early and we want a 5k-step value-function pre-fill (in which case: set timesteps to ~5000 and keep this disabled_actions list).",
+            "description": "DISABLED (timesteps=0). Stage 1 warmup was a TD3 holdover \u2014 its purpose was to bake in kick mechanics on an easy spawn distribution. PPO with hybrid action heads doesn't need that warm-start: the value function picks up the +150 goal reward just as fast at stage 1.090 alongside the more interesting kick-vs-turn discrete decision. Re-enable only if stage 1.090 stalls early and we want a 5k-step value-function pre-fill (in which case: set timesteps to ~5000 and keep this disabled_actions list).",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -54,7 +54,7 @@
             }
         },
         "stage1_090_mid": {
-            "description": "RUNG 1 — DONE (300k complete; 100% last-100 eps, bad_aim 90%→0.0%; checkpoint stage1_090_mid_complete.pt is the lineage root, loaded via top-level load_model for the overnight chain). EXPANDABLE-BACKBONE STAGE 1 — RUNG 1 (aim bootstrap), retrained from scratch on the new attention network (flat-MLP checkpoints can't load into it). ball_y narrowed to ±6 so the goal window is wide enough to learn aim against the turn-noise floor (LOG_STD_MIN=-3.0). Adds `turn` (Gaussian Dtheta active via param_active_mask); kick enabled; approach_ball disabled (robot spawns within kickable_dist so approach is a no-op); dribbles disabled. This is the lineage root: rungs 2-5 (stage1_180_full/_y10/_y15/stage1_9) warm-start from this via top-level load_model, no rebuild. Flat-MLP §16 hit 94% goal / bad_aim 86%→4% from scratch; target the same bar. Budget 300k. New-lineage checkpoint: models/ppo_jal_expandable/stage1_090_mid_complete.pt.",
+            "description": "RUNG 1 \u2014 DONE (300k complete; 100% last-100 eps, bad_aim 90%\u21920.0%; checkpoint stage1_090_mid_complete.pt is the lineage root, loaded via top-level load_model for the overnight chain). EXPANDABLE-BACKBONE STAGE 1 \u2014 RUNG 1 (aim bootstrap), retrained from scratch on the new attention network (flat-MLP checkpoints can't load into it). ball_y narrowed to \u00b16 so the goal window is wide enough to learn aim against the turn-noise floor (LOG_STD_MIN=-3.0). Adds `turn` (Gaussian Dtheta active via param_active_mask); kick enabled; approach_ball disabled (robot spawns within kickable_dist so approach is a no-op); dribbles disabled. This is the lineage root: rungs 2-5 (stage1_180_full/_y10/_y15/stage1_9) warm-start from this via top-level load_model, no rebuild. Flat-MLP \u00a716 hit 94% goal / bad_aim 86%\u21924% from scratch; target the same bar. Budget 300k. New-lineage checkpoint: models/ppo_jal_expandable/stage1_090_mid_complete.pt.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -103,7 +103,7 @@
             }
         },
         "stage1_180_full": {
-            "description": "DISABLED (done) — next to run (overnight chain RUNG 2). TURN GENERALIZATION rung: same narrow ball_y ±6, spawn theta ±180°. Result: 98.6% overall goal rate, 100% last 100 eps, bad_aim 3%→0.5%. Skill transferred instantly from stage1_090_mid checkpoint — no warm-up phase needed. Checkpoint: models/ppo_jal_curriculum/stage1_180_full_complete.pt (OLD flat-MLP lineage — ignored; incompatible with the attention net). QUEUED — overnight chain RUNG 2 on the NEW expandable backbone; warm-starts IN-MEMORY from rung 1 (stage1_090_mid) final weights, NOT from any checkpoint path. New checkpoint: models/ppo_jal_expandable/stage1_180_full_complete.pt. Budget 150k.",
+            "description": "DISABLED (done) \u2014 next to run (overnight chain RUNG 2). TURN GENERALIZATION rung: same narrow ball_y \u00b16, spawn theta \u00b1180\u00b0. Result: 98.6% overall goal rate, 100% last 100 eps, bad_aim 3%\u21920.5%. Skill transferred instantly from stage1_090_mid checkpoint \u2014 no warm-up phase needed. Checkpoint: models/ppo_jal_curriculum/stage1_180_full_complete.pt (OLD flat-MLP lineage \u2014 ignored; incompatible with the attention net). QUEUED \u2014 overnight chain RUNG 2 on the NEW expandable backbone; warm-starts IN-MEMORY from rung 1 (stage1_090_mid) final weights, NOT from any checkpoint path. New checkpoint: models/ppo_jal_expandable/stage1_180_full_complete.pt. Budget 150k.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -152,7 +152,7 @@
             }
         },
         "stage1_180_y10": {
-            "description": "COMPLETED (§18). AIM STEEPENING rung: ball_y ±10, spawn theta ±180°. Result: 96.8% overall goal rate, 98% last 100 eps, bad_aim 1%→0.0%. Skill transferred instantly from stage1_180_full checkpoint. Checkpoint: models/ppo_jal_curriculum/stage1_180_y10_complete.pt (OLD lineage — ignored). QUEUED — overnight chain RUNG 3 on the NEW backbone; warm-starts IN-MEMORY from rung 2. New checkpoint: models/ppo_jal_expandable/stage1_180_y10_complete.pt. Budget 150k.",
+            "description": "COMPLETED (\u00a718). AIM STEEPENING rung: ball_y \u00b110, spawn theta \u00b1180\u00b0. Result: 96.8% overall goal rate, 98% last 100 eps, bad_aim 1%\u21920.0%. Skill transferred instantly from stage1_180_full checkpoint. Checkpoint: models/ppo_jal_curriculum/stage1_180_y10_complete.pt (OLD lineage \u2014 ignored). QUEUED \u2014 overnight chain RUNG 3 on the NEW backbone; warm-starts IN-MEMORY from rung 2. New checkpoint: models/ppo_jal_expandable/stage1_180_y10_complete.pt. Budget 150k.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -201,7 +201,7 @@
             }
         },
         "stage1_180_y15": {
-            "description": "COMPLETED (§19). FULL DIFFICULTY rung: widen ball_y ±10 → ±15 (full field width) at ±180° spawn theta — the original hard distribution. Enabled: kick, turn. Result: 89.0% overall goal rate, 87.7% deterministic inference, bad_aim 0.0%. Instant transfer from stage1_180_y10. Checkpoint: models/ppo_jal_curriculum/stage1_180_y15_complete.pt (OLD lineage — ignored). QUEUED — overnight chain RUNG 4 (full field width, the hard distribution) on the NEW backbone; warm-starts IN-MEMORY from rung 3. New checkpoint: models/ppo_jal_expandable/stage1_180_y15_complete.pt. Budget 200k.",
+            "description": "COMPLETED (\u00a719). FULL DIFFICULTY rung: widen ball_y \u00b110 \u2192 \u00b115 (full field width) at \u00b1180\u00b0 spawn theta \u2014 the original hard distribution. Enabled: kick, turn. Result: 89.0% overall goal rate, 87.7% deterministic inference, bad_aim 0.0%. Instant transfer from stage1_180_y10. Checkpoint: models/ppo_jal_curriculum/stage1_180_y15_complete.pt (OLD lineage \u2014 ignored). QUEUED \u2014 overnight chain RUNG 4 (full field width, the hard distribution) on the NEW backbone; warm-starts IN-MEMORY from rung 3. New checkpoint: models/ppo_jal_expandable/stage1_180_y15_complete.pt. Budget 200k.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -250,7 +250,7 @@
             }
         },
         "stage1_9": {
-            "description": "RUNG 5 — FINAL Stage-1 task (overnight chain, runs last, on the NEW expandable backbone; warm-starts IN-MEMORY from rung 4. New checkpoint: models/ppo_jal_expandable/stage1_9_complete.pt). HOME-SPOT APPROACH → TURN → KICK: final Stage 1 task. Robot starts at its fixed home pose (-10, 0) facing a random heading; ball spawns at full distribution (x∈[5,30], y∈[-15,15]). Must approach 15–43 units (approach_ball enabled for the first time), turn to aim, then kick. goto and dribbles stay disabled — Gaussian Dx/Dy head still idle, only Dtheta active. approach_weight=1.0 (not 1.8): worst-case park EV = 1.0×43−10 = 33 << goal 70; at 1.8 it would be 67≈goal (unsafe local optimum). Acceptance: goal ≥ 50% over final 1000 eps; no primitive > 90% in any 100-ep window. Warm-start: models/ppo_jal_curriculum/stage1_180_y15_complete.pt. Budget: 300,000 steps — first stage with genuine approach learning, not an instant transfer.",
+            "description": "RUNG 5 \u2014 FINAL Stage-1 task (overnight chain, runs last, on the NEW expandable backbone; warm-starts IN-MEMORY from rung 4. New checkpoint: models/ppo_jal_expandable/stage1_9_complete.pt). HOME-SPOT APPROACH \u2192 TURN \u2192 KICK: final Stage 1 task. Robot starts at its fixed home pose (-10, 0) facing a random heading; ball spawns at full distribution (x\u2208[5,30], y\u2208[-15,15]). Must approach 15\u201343 units (approach_ball enabled for the first time), turn to aim, then kick. goto and dribbles stay disabled \u2014 Gaussian Dx/Dy head still idle, only Dtheta active. approach_weight=1.0 (not 1.8): worst-case park EV = 1.0\u00d743\u221210 = 33 << goal 70; at 1.8 it would be 67\u2248goal (unsafe local optimum). Acceptance: goal \u2265 50% over final 1000 eps; no primitive > 90% in any 100-ep window. Warm-start: models/ppo_jal_curriculum/stage1_180_y15_complete.pt. Budget: 300,000 steps \u2014 first stage with genuine approach learning, not an instant transfer.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -297,7 +297,7 @@
             }
         },
         "stage2_goalie": {
-            "description": "DONE (timesteps=0) — STAGE 2A — GAP SHOOTING. 1v1 vs scripted goalie: approach + turn + kick + dribble. Ball spawns in attacking third (x=[25,34], y=±10). Reward: use_goalie_aim_gate breaks the center-shot habit; goalie_gap_blend_center=0.3 eases transfer from stage-1 checkpoint (fade to 0.0 once gap-shot rate stabilises). Dribble sessions: 1 m max radius, lateral-progress shaping at 0.1 weight. kick_near_goalie_penalty=2.0 discourages tug-of-war kicks when goalie has caught the ball. Load from the Stage-2 WIDE baseline models/ppo_jal_expandable_wide/stage2_0_baseline_complete.pt (the top-level load_model), NOT the stage-1 narrow final. combo bonus is now quality-scaled from the start (post_dribble_kick_quality_scale=true) to block dribble-then-wild-kick farming. Result: 49.3% overall goal rate, 57% last-100, dribble_to discovered (0%→66%). Checkpoint: models/ppo_jal_expandable_wide/stage2_goalie_complete.pt. Budget 300k complete. See stage2b_goalie_dribble for the dribble-mastery substage.",
+            "description": "DONE (timesteps=0) \u2014 STAGE 2A \u2014 GAP SHOOTING. 1v1 vs scripted goalie: approach + turn + kick + dribble. Ball spawns in attacking third (x=[25,34], y=\u00b110). Reward: use_goalie_aim_gate breaks the center-shot habit; goalie_gap_blend_center=0.3 eases transfer from stage-1 checkpoint (fade to 0.0 once gap-shot rate stabilises). Dribble sessions: 1 m max radius, lateral-progress shaping at 0.1 weight. kick_near_goalie_penalty=2.0 discourages tug-of-war kicks when goalie has caught the ball. Load from the Stage-2 WIDE baseline models/ppo_jal_expandable_wide/stage2_0_baseline_complete.pt (the top-level load_model), NOT the stage-1 narrow final. combo bonus is now quality-scaled from the start (post_dribble_kick_quality_scale=true) to block dribble-then-wild-kick farming. Result: 49.3% overall goal rate, 57% last-100, dribble_to discovered (0%\u219266%). Checkpoint: models/ppo_jal_expandable_wide/stage2_goalie_complete.pt. Budget 300k complete. See stage2b_goalie_dribble for the dribble-mastery substage.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -369,7 +369,7 @@
             }
         },
         "stage2b_goalie_dribble": {
-            "description": "DONE (§28, SUCCESS — cleared promote bar) — STAGE 2B RUNG 1 / NARROW (see TRAINING.md §27, §28) — DRIBBLE MASTERY via a WIDTH SUB-RAMP. Two prior 2B runs (§26, §27) both collapsed early and stalled ~33–40% — §27 proved the early dip is NOT from the step penalty (softening it to −0.07 made aim WORSE) but intrinsic to the ±10→±15 spawn-width jump outpacing the policy's aim. Fix: ladder the width like Stage 1 did (y6→y10→y15). This rung holds the 2A spawn width (±10) so the dribble-targeting weights take hold and aim sharpens WITHOUT the width shock; step_bonus restored to −0.1 (the urgency that drove §26's aim sharpening). Targeting weights held (dribble_target_quality_weight=4.0, post_dribble_kick_bonus=6.0 quality-scaled). ONLY width differs from rung 2. Load from models/ppo_jal_expandable_wide/stage2_goalie_complete.pt (top-level load_model). Budget 150k. Then evaluate, flip stage2b2_goalie_dribble_wide live (±15, 200k) chained from this rung's checkpoint. Promote bar: last-100 ≥55%, bad_aim ≤12%, dribble usage 30–40%.",
+            "description": "DONE (\u00a728, SUCCESS \u2014 cleared promote bar) \u2014 STAGE 2B RUNG 1 / NARROW (see TRAINING.md \u00a727, \u00a728) \u2014 DRIBBLE MASTERY via a WIDTH SUB-RAMP. Two prior 2B runs (\u00a726, \u00a727) both collapsed early and stalled ~33\u201340% \u2014 \u00a727 proved the early dip is NOT from the step penalty (softening it to \u22120.07 made aim WORSE) but intrinsic to the \u00b110\u2192\u00b115 spawn-width jump outpacing the policy's aim. Fix: ladder the width like Stage 1 did (y6\u2192y10\u2192y15). This rung holds the 2A spawn width (\u00b110) so the dribble-targeting weights take hold and aim sharpens WITHOUT the width shock; step_bonus restored to \u22120.1 (the urgency that drove \u00a726's aim sharpening). Targeting weights held (dribble_target_quality_weight=4.0, post_dribble_kick_bonus=6.0 quality-scaled). ONLY width differs from rung 2. Load from models/ppo_jal_expandable_wide/stage2_goalie_complete.pt (top-level load_model). Budget 150k. Then evaluate, flip stage2b2_goalie_dribble_wide live (\u00b115, 200k) chained from this rung's checkpoint. Promote bar: last-100 \u226555%, bad_aim \u226412%, dribble usage 30\u201340%.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -441,7 +441,7 @@
             }
         },
         "stage2c_goalie_balance": {
-            "description": "DONE — STAGE 2C — SELECTIVE DRIBBLING at ±10 (see TRAINING.md §31, §32, §33). Pivot after §32 proved the ±15 wall is structural; consolidate the working ±10 width (where we hold 59.5%) and build the real Stage-2 target behavior: dribble ONLY when it improves the shot. Warm-starts from §31's checkpoint models/ppo_jal_expandable_wide/stage2b_aim_lowent_complete.pt (top-level load_model). ent_coef restored to 0.03/0.005 — this stage changes the reward SHAPE so the value function recalibrates: EXPECT an early dip then re-climb (§30 lesson), and the policy needs exploration room to re-adapt. §33 reward fix: the planned combo-only fade did NOT enforce selectivity — post_dribble_kick_bonus rewards the dribble→kick chain UNCONDITIONALLY (scaled by center-mouth aim, not gap-improvement), so a useless dribble→kick netted ~+5 over a direct kick → over-dribble. Corrected weights: post_dribble_kick_bonus 10→3 (shrink the unconditional chain reward), dribble_target_quality_weight 2→8 (the gap-IMPROVEMENT one-shot — ZERO for useless dribbles — becomes the dominant dribble payoff), step_bonus −0.15→−0.2 (a pointless carry costs more), dribble_target_progress 0.5→0.3 / clip 0.3→0.2 (cut the per-step farm). Net EV: useless dribble ≈ break-even vs a direct kick, useful (gap-improving) dribble strongly positive → SELECTIVE. Budget 200k. Gate: goal rate ≥ ~55% (≥ baseline), dribble usage MODERATE (~15–40% of possessions, NOT >60%), opened carries show positive gap-improvement. If still over-dribbling (>60%), the residual cause is the combo still scaling by center-mouth aim (config can't fix) → apply the code change to gap-scale the combo (JAL_env.py ~L782). REVERT ent_coef after this stage. §34 RESULT (combo gap-scaled + this reward shape): goal 56.2%/last-100 61% (≥ gate), dribble usage moderate (264/1352 ≈ 19.5%, NOT over-dribbling) — the over-dribble failure is FIXED — BUT useful dribbling did NOT emerge: 263/264 carries moved to a WORSE angle (mean gap_delta −0.258, only 1 useful). Root cause is the dribble-target PARAMETERIZATION, not the reward: goto_y_raw scales by field_half_height (±30) so gap-improving targets (|y|<~5, near the mouth) are a ~17% slice the policy never finds by exploration. §35 FIX (this run): dribble_target_y_clip=10.0 — clamps the decoded dribble target's |y| to ≤10 (JAL_env applies it to BOTH the reward-tracking target and the target handed to dribble_to()), concentrating the head's output on reachable shot-improving targets so the gap-IMPROVEMENT one-shot can actually fire. The §34 (no-clamp) checkpoint is preserved as stage2c_goalie_balance_noclip_s34_complete.pt. Gate UNCHANGED; the real test is now whether opened carries show POSITIVE gap_delta (useful fraction climbs from ~0%).",
+            "description": "DONE \u2014 STAGE 2C \u2014 SELECTIVE DRIBBLING at \u00b110 (see TRAINING.md \u00a731, \u00a732, \u00a733). Pivot after \u00a732 proved the \u00b115 wall is structural; consolidate the working \u00b110 width (where we hold 59.5%) and build the real Stage-2 target behavior: dribble ONLY when it improves the shot. Warm-starts from \u00a731's checkpoint models/ppo_jal_expandable_wide/stage2b_aim_lowent_complete.pt (top-level load_model). ent_coef restored to 0.03/0.005 \u2014 this stage changes the reward SHAPE so the value function recalibrates: EXPECT an early dip then re-climb (\u00a730 lesson), and the policy needs exploration room to re-adapt. \u00a733 reward fix: the planned combo-only fade did NOT enforce selectivity \u2014 post_dribble_kick_bonus rewards the dribble\u2192kick chain UNCONDITIONALLY (scaled by center-mouth aim, not gap-improvement), so a useless dribble\u2192kick netted ~+5 over a direct kick \u2192 over-dribble. Corrected weights: post_dribble_kick_bonus 10\u21923 (shrink the unconditional chain reward), dribble_target_quality_weight 2\u21928 (the gap-IMPROVEMENT one-shot \u2014 ZERO for useless dribbles \u2014 becomes the dominant dribble payoff), step_bonus \u22120.15\u2192\u22120.2 (a pointless carry costs more), dribble_target_progress 0.5\u21920.3 / clip 0.3\u21920.2 (cut the per-step farm). Net EV: useless dribble \u2248 break-even vs a direct kick, useful (gap-improving) dribble strongly positive \u2192 SELECTIVE. Budget 200k. Gate: goal rate \u2265 ~55% (\u2265 baseline), dribble usage MODERATE (~15\u201340% of possessions, NOT >60%), opened carries show positive gap-improvement. If still over-dribbling (>60%), the residual cause is the combo still scaling by center-mouth aim (config can't fix) \u2192 apply the code change to gap-scale the combo (JAL_env.py ~L782). REVERT ent_coef after this stage. \u00a734 RESULT (combo gap-scaled + this reward shape): goal 56.2%/last-100 61% (\u2265 gate), dribble usage moderate (264/1352 \u2248 19.5%, NOT over-dribbling) \u2014 the over-dribble failure is FIXED \u2014 BUT useful dribbling did NOT emerge: 263/264 carries moved to a WORSE angle (mean gap_delta \u22120.258, only 1 useful). Root cause is the dribble-target PARAMETERIZATION, not the reward: goto_y_raw scales by field_half_height (\u00b130) so gap-improving targets (|y|<~5, near the mouth) are a ~17% slice the policy never finds by exploration. \u00a735 FIX (this run): dribble_target_y_clip=10.0 \u2014 clamps the decoded dribble target's |y| to \u226410 (JAL_env applies it to BOTH the reward-tracking target and the target handed to dribble_to()), concentrating the head's output on reachable shot-improving targets so the gap-IMPROVEMENT one-shot can actually fire. The \u00a734 (no-clamp) checkpoint is preserved as stage2c_goalie_balance_noclip_s34_complete.pt. Gate UNCHANGED; the real test is now whether opened carries show POSITIVE gap_delta (useful fraction climbs from ~0%).",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -514,7 +514,7 @@
             }
         },
         "stage3_defender": {
-            "description": "STAGE 3 — DRIBBLE PAST A DEFENDER. 1 trained attacker vs 1 scripted goal-side container defender (robot 2) + 1 scripted goalie (robot 1). Builds in-memory on the stage2c gap-shot+dribble policy (run after stage2c; to run standalone set top-level load_model to models/ppo_jal_expandable/stage2c_goalie_balance_complete.pt). The defender holds the direct ball->goal lane and mirrors the ball, so a shot straight at goal earns nothing — use_defender_lane_gate multiplies the kick bonus AND the dense aim gates by how clear the shot lane is of the defender, and defender_lane_penalty punishes kicking through it. dribble_target_quality is now defender-aware (positional_shot_quality = keeper-gap x lane-clear), so dribble_to is rewarded for moving the ball to a spot that opens an angle past BOTH the keeper and the defender; the post-dribble combo bonus then pays the dribble->shoot sequence. The defender is observed via a second opponent context slot (num_opponents=2). Ball spawns in the attacking third (x=[25,34], y=+/-10). Budget 400k. has_ball_bonus bumped 0.05→0.15 so possession is net +0.05/step (offsets step_bonus -0.1), preventing the freeze-with-ball local optimum where the policy holds still to avoid the defender_lane_penalty/opponent_near_ball risk.",
+            "description": "STAGE 3 \u2014 DRIBBLE PAST A DEFENDER. 1 trained attacker vs 1 scripted goal-side container defender (robot 2) + 1 scripted goalie (robot 1). Builds in-memory on the stage2c gap-shot+dribble policy (run after stage2c; to run standalone set top-level load_model to models/ppo_jal_expandable/stage2c_goalie_balance_complete.pt). The defender holds the direct ball->goal lane and mirrors the ball, so a shot straight at goal earns nothing \u2014 use_defender_lane_gate multiplies the kick bonus AND the dense aim gates by how clear the shot lane is of the defender, and defender_lane_penalty punishes kicking through it. dribble_target_quality is now defender-aware (positional_shot_quality = keeper-gap x lane-clear), so dribble_to is rewarded for moving the ball to a spot that opens an angle past BOTH the keeper and the defender; the post-dribble combo bonus then pays the dribble->shoot sequence. The defender is observed via a second opponent context slot (num_opponents=2). Ball spawns in the attacking third (x=[25,34], y=+/-10). Budget 400k. has_ball_bonus bumped 0.05\u21920.15 so possession is net +0.05/step (offsets step_bonus -0.1), preventing the freeze-with-ball local optimum where the policy holds still to avoid the defender_lane_penalty/opponent_near_ball risk.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -598,7 +598,7 @@
             }
         },
         "stage3_defender_v2_finetune": {
-            "description": "ACTIVE — Stage 3 v2 cone-adaptation fine-tune against the upgraded hardcoded defender. Warm-starts from the existing Stage 3 checkpoint and uses Stage 2H real-physics reward settings plus defender-aware shot quality, SSL foul detectors, a corrected 8.5-unit dribble segment limit, physical front-reception kick gating, post-carry shot urgency, repeated defense-area-touch termination, and no standalone turn primitive.",
+            "description": "DONE \u2014 Stage 3 v2 cone-adaptation fine-tune against the upgraded hardcoded defender. Warm-starts from the existing Stage 3 checkpoint and uses Stage 2H real-physics reward settings plus defender-aware shot quality, SSL foul detectors, a corrected 8.5-unit dribble segment limit, physical front-reception kick gating, post-carry shot urgency, repeated defense-area-touch termination, and no standalone turn primitive.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -711,9 +711,9 @@
             }
         },
         "stage4_2v2": {
-            "description": "STAGE 4 — 2v3. 2 RL attackers (warm-start from stage3) vs 2 HC defenders + HC goalie.",
+            "description": "STAGE 4 \u2014 2v3. 2 RL attackers (warm-start from stage3) vs 2 HC defenders + HC goalie.",
             "num_robots": 2,
-            "timesteps": 400000,
+            "timesteps": 0,
             "robot_ids": [
                 1,
                 2
@@ -806,8 +806,99 @@
                 "possession_transfer_bonus": 5.0
             }
         },
+        "stage4_hardcoded_support_2v3": {
+            "description": "ACTIVE \u2014 HYBRID FALLBACK \u2014 one Stage-3 PPO attacker (TritonBots robot 1) plus one hardcoded supporting attacker (robot 2) vs TeamB goalie + two scripted defenders. Use this when the learned Stage-4 two-attacker policy is not reliable enough: PPO keeps the solo scorer role, the scripted supporter creates receive lanes, collects passes/loose balls, and shoots or returns the ball.",
+            "num_robots": 1,
+            "timesteps": 200000,
+            "robot_ids": [
+                1
+            ],
+            "team_config": "team_config_hardcoded_support_2v1.json",
+            "num_opponents": 2,
+            "opponent_team_name": "TeamB",
+            "aux_team_policies": [
+                {
+                    "controller_type": "goalie",
+                    "team_name": "TeamB",
+                    "robot_ids": [
+                        1
+                    ],
+                    "side": "right"
+                },
+                {
+                    "controller_type": "defender",
+                    "team_name": "TeamB",
+                    "robot_ids": [
+                        2
+                    ],
+                    "side": "right"
+                },
+                {
+                    "controller_type": "hardcoded_supporter",
+                    "team_name": "TritonBots",
+                    "robot_ids": [
+                        2
+                    ],
+                    "side": "left",
+                    "main_attacker_robot_id": 1,
+                    "opponent_team_name": "TeamB",
+                    "opponent_goalie_robot_ids": [
+                        1
+                    ]
+                }
+            ],
+            "disabled_actions": [],
+            "spawn_robot_at_ball": false,
+            "random_ball_x": true,
+            "random_ball_x_range": [
+                18.0,
+                34.0
+            ],
+            "random_ball_y": true,
+            "random_ball_y_range": [
+                -12.0,
+                12.0
+            ],
+            "random_spawn_theta": true,
+            "random_spawn_theta_range_deg": [
+                -180.0,
+                180.0
+            ],
+            "invalid_action_penalty": 0.5,
+            "reward_config_overrides": {
+                "has_ball_bonus": 0.08,
+                "near_ball_bonus": 0.05,
+                "approach_weight": 1.0,
+                "step_bonus": -0.1,
+                "goal_progress_weight": 2.0,
+                "goal_progress_clip": 1.5,
+                "ball_speed_bonus_weight": 2.0,
+                "goal_reward": 70.0,
+                "alignment_weight": 3.0,
+                "alignment_has_ball_only": true,
+                "kick_aim_bonus_weight": 20.0,
+                "bad_aim_kick_penalty": 1.0,
+                "bad_aim_grad_scale": 15.0,
+                "use_goalie_aim_gate": true,
+                "goalie_gap_min_quality": 0.3,
+                "kick_into_keeper_penalty": 1.0,
+                "goalie_gap_blend_center": 0.0,
+                "dribble_target_progress_weight": 1.0,
+                "dribble_target_quality_weight": 2.0,
+                "dribble_active_bonus": 0.03,
+                "post_dribble_kick_bonus": 8.0,
+                "post_dribble_kick_combo_window": 8,
+                "post_dribble_kick_quality_scale": true,
+                "kick_near_goalie_penalty": 1.0,
+                "opponent_near_ball_penalty": -0.3,
+                "use_defender_lane_gate": true,
+                "defender_lane_block_dist": 2.6,
+                "defender_lane_penalty": 0.5,
+                "defender_lane_min_quality": 0.3
+            }
+        },
         "stage5_3v3": {
-            "description": "STAGE 5 — 3v3. 2 RL robots + 1 HC goalie vs 2 frozen Stage 4 policies + HC goalie. Multi-robot coordination: role gating, spread, support positioning. Modular for Stages 6-8 (same reward structure, more robots).",
+            "description": "STAGE 5 \u2014 3v3. 2 RL robots + 1 HC goalie vs 2 frozen Stage 4 policies + HC goalie. Multi-robot coordination: role gating, spread, support positioning. Modular for Stages 6-8 (same reward structure, more robots).",
             "num_robots": 2,
             "timesteps": 0,
             "robot_ids": [
@@ -901,7 +992,7 @@
             }
         },
         "stage2b_aim_push": {
-            "description": "DONE (§30, CONFOUNDED — warm-start shock, regressed to 44%) — STAGE 2B AIM-LEVER DIAGNOSTIC (see TRAINING.md §29, §30) — REWARD-ONLY change at the STABLE ±10 width. §28/§29 resolved the width experiment as reading (A): widening to ±15 did NOT force better aim, it degraded it (aim_quality 0.33→0.28, bad_aim 16→28%, goal 55%→35.6%). The bottleneck is aim CAPABILITY gated by the reward, not lack of demand. This run isolates ONE knob: kick_aim_bonus_weight 20→28 to amplify the gap-magnitude gradient that goal_reward=70 currently drowns (the policy clears the bad_aim threshold but does not maximize gap). Held at ±10 (rung-1 width) so the effect on aim is uncontaminated by width stress. Warm-starts from rung 1's checkpoint models/ppo_jal_expandable_wide/stage2b_goalie_dribble_complete.pt (top-level load_model). Budget 150k. Decision: if aim_quality climbs above ~0.38 at ±10, the lever works → re-attempt ±15 with it; if aim stays flat ~0.31, the lever is useless → deeper rethink (param-noise std, network capacity, gate structure). Everything else identical to rung 1.",
+            "description": "DONE (\u00a730, CONFOUNDED \u2014 warm-start shock, regressed to 44%) \u2014 STAGE 2B AIM-LEVER DIAGNOSTIC (see TRAINING.md \u00a729, \u00a730) \u2014 REWARD-ONLY change at the STABLE \u00b110 width. \u00a728/\u00a729 resolved the width experiment as reading (A): widening to \u00b115 did NOT force better aim, it degraded it (aim_quality 0.33\u21920.28, bad_aim 16\u219228%, goal 55%\u219235.6%). The bottleneck is aim CAPABILITY gated by the reward, not lack of demand. This run isolates ONE knob: kick_aim_bonus_weight 20\u219228 to amplify the gap-magnitude gradient that goal_reward=70 currently drowns (the policy clears the bad_aim threshold but does not maximize gap). Held at \u00b110 (rung-1 width) so the effect on aim is uncontaminated by width stress. Warm-starts from rung 1's checkpoint models/ppo_jal_expandable_wide/stage2b_goalie_dribble_complete.pt (top-level load_model). Budget 150k. Decision: if aim_quality climbs above ~0.38 at \u00b110, the lever works \u2192 re-attempt \u00b115 with it; if aim stays flat ~0.31, the lever is useless \u2192 deeper rethink (param-noise std, network capacity, gate structure). Everything else identical to rung 1.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -973,7 +1064,7 @@
             }
         },
         "stage2b_aim_lowent": {
-            "description": "DONE (§31 — BEST MODEL 59.5%, last-100 61%, aim hypothesis FALSIFIED: mean aim ~0.31 is a ceiling decoupled from goal rate) — STAGE 2B AIM PRECISION via LOWER ENTROPY (see TRAINING.md §30) — clean re-test of the 'exploration noise blurs fine aim' hypothesis WITHOUT a reward-scale shock. §30 showed bumping kick_aim_bonus_weight (a reward-scale change) invalidated the warm-started value function and regressed the model; param_noise_std is inference-only and does not exist in training. Training-time exploration is the policy's own Gaussian action std, pressured up by ent_coef. This run keeps ALL reward weights at rung-1 values (kick_aim_bonus_weight=20 — NO reward-scale change, so the warm-start is clean) and instead lowers the GLOBAL ent_coef in model_params (initial 0.05→0.01, final 0.005→0.002) so (a) the 0.05 initial does not re-inject entropy onto rung-1's already-sharp policy and (b) the Dθ aim head can lower its std and sharpen. Width held ±10. Warm-starts from rung 1's 55% checkpoint models/ppo_jal_expandable_wide/stage2b_goalie_dribble_complete.pt (top-level load_model). Budget 150k. Decision: if aim_quality climbs above ~0.38, exploration noise WAS blurring aim → carry low ent_coef into a ±15 re-attempt; if aim stays ~0.31, the MEAN aim is the ceiling (deeper rethink: harder goalie / network capacity / LOG_STD_MIN). WATCH for premature entropy collapse (trainer warns; entropy_tripwire). REVERT ent_coef in model_params after this run.",
+            "description": "DONE (\u00a731 \u2014 BEST MODEL 59.5%, last-100 61%, aim hypothesis FALSIFIED: mean aim ~0.31 is a ceiling decoupled from goal rate) \u2014 STAGE 2B AIM PRECISION via LOWER ENTROPY (see TRAINING.md \u00a730) \u2014 clean re-test of the 'exploration noise blurs fine aim' hypothesis WITHOUT a reward-scale shock. \u00a730 showed bumping kick_aim_bonus_weight (a reward-scale change) invalidated the warm-started value function and regressed the model; param_noise_std is inference-only and does not exist in training. Training-time exploration is the policy's own Gaussian action std, pressured up by ent_coef. This run keeps ALL reward weights at rung-1 values (kick_aim_bonus_weight=20 \u2014 NO reward-scale change, so the warm-start is clean) and instead lowers the GLOBAL ent_coef in model_params (initial 0.05\u21920.01, final 0.005\u21920.002) so (a) the 0.05 initial does not re-inject entropy onto rung-1's already-sharp policy and (b) the D\u03b8 aim head can lower its std and sharpen. Width held \u00b110. Warm-starts from rung 1's 55% checkpoint models/ppo_jal_expandable_wide/stage2b_goalie_dribble_complete.pt (top-level load_model). Budget 150k. Decision: if aim_quality climbs above ~0.38, exploration noise WAS blurring aim \u2192 carry low ent_coef into a \u00b115 re-attempt; if aim stays ~0.31, the MEAN aim is the ceiling (deeper rethink: harder goalie / network capacity / LOG_STD_MIN). WATCH for premature entropy collapse (trainer warns; entropy_tripwire). REVERT ent_coef in model_params after this run.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1045,7 +1136,7 @@
             }
         },
         "stage2b2_goalie_dribble_wide": {
-            "description": "DONE (§32, FAILED — ±15 wall is STRUCTURAL, not base-quality; 37.7%, off_target 38.8% #1, aim IMPROVED to 0.339 while goals cratered → confirms aim/goal decoupling) — STAGE 2B RUNG 2 / WIDE (re-attempt, see TRAINING.md §29, §31) — full-width ±15 generalization from the NEW best base. §29's first ±15 attempt cratered to 35.6% from rung 1's 55% base; §31 then produced a materially better, more stable base (59.5%, last-100 61%, bad_aim 6%) at ±10 by lowering ent_coef, and SETTLED that mean aim (~0.31) is a ceiling decoupled from goal rate (three levers — width §29, reward-scale §30, exploration §31 — all failed to move it). This run re-tests whether the ±15 'wall' was about BASE-MODEL QUALITY or is structural. ONE knob changes vs §31: spawn width ±10→±15. ALL reward weights held at §31/rung-1 values (kick_aim_bonus_weight=20, step_bonus −0.1, blend 0.15, targeting 4.0 / 6.0 quality-scaled) and ent_coef KEPT low (0.01/0.002 — no reward-scale shock, sharp stable policy). Warm-starts from §31's checkpoint models/ppo_jal_expandable_wide/stage2b_aim_lowent_complete.pt (top-level load_model). Budget 150k. Pre-registered gate @ eps 600–800: holds ≥~50% → the wall was base quality, continue to 2C; craters ~35% → ±15 is structural, pivot to 2C at ±10 (consolidate the working width, defer ±15). Watch for entropy collapse (entropy_tripwire).",
+            "description": "DONE (\u00a732, FAILED \u2014 \u00b115 wall is STRUCTURAL, not base-quality; 37.7%, off_target 38.8% #1, aim IMPROVED to 0.339 while goals cratered \u2192 confirms aim/goal decoupling) \u2014 STAGE 2B RUNG 2 / WIDE (re-attempt, see TRAINING.md \u00a729, \u00a731) \u2014 full-width \u00b115 generalization from the NEW best base. \u00a729's first \u00b115 attempt cratered to 35.6% from rung 1's 55% base; \u00a731 then produced a materially better, more stable base (59.5%, last-100 61%, bad_aim 6%) at \u00b110 by lowering ent_coef, and SETTLED that mean aim (~0.31) is a ceiling decoupled from goal rate (three levers \u2014 width \u00a729, reward-scale \u00a730, exploration \u00a731 \u2014 all failed to move it). This run re-tests whether the \u00b115 'wall' was about BASE-MODEL QUALITY or is structural. ONE knob changes vs \u00a731: spawn width \u00b110\u2192\u00b115. ALL reward weights held at \u00a731/rung-1 values (kick_aim_bonus_weight=20, step_bonus \u22120.1, blend 0.15, targeting 4.0 / 6.0 quality-scaled) and ent_coef KEPT low (0.01/0.002 \u2014 no reward-scale shock, sharp stable policy). Warm-starts from \u00a731's checkpoint models/ppo_jal_expandable_wide/stage2b_aim_lowent_complete.pt (top-level load_model). Budget 150k. Pre-registered gate @ eps 600\u2013800: holds \u2265~50% \u2192 the wall was base quality, continue to 2C; craters ~35% \u2192 \u00b115 is structural, pivot to 2C at \u00b110 (consolidate the working width, defer \u00b115). Watch for entropy collapse (entropy_tripwire).",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1117,7 +1208,7 @@
             }
         },
         "stage2d_lag_discover": {
-            "description": "DONE  — STAGE 2D — DISCOVER dribbling vs a reaction-LAG keeper (lag=6). Root cause from §34/§35: against a full-speed bisector keeper no reachable carry opens the angle, so dribble_target_quality≈0 → the target head gets no gradient → 3.8-step degenerate carries (infer carry-counter: 0.4 carries/ep). Fix is ENVIRONMENTAL: the keeper now steers toward where the ball was reaction_lag cycles ago (goalie.py _lagged_ball_pos, POSITION mode only — shot defense/BLOCK/CHARGE/catch stay on the true ball), so a lateral/diagonal carry TRAILS the keeper and opens a real lane. Dense dribble rewards re-opened so the policy DISCOVERS the carry: step_bonus -0.05, dribble_target_progress 1.0/clip0.5, dribble_target_quality 2.0, dribble_active_bonus 0.05, combo 3.0 gap-scaled. Keep dribble_target_y_clip=10 (concentrates target head on reachable shot-improving |y|). Warm-start models/ppo_jal_expandable_wide/stage2c_goalie_balance_complete.pt (the 66% direct shooter; set top-level load_model). Budget 200k. Gate: real carries climb ≥~1.0/ep AND mean carry length ≥~8 steps (read infer carry-counter), mean opened-carry gap_delta>0, goal rate holds ≥~60%.",
+            "description": "DONE  \u2014 STAGE 2D \u2014 DISCOVER dribbling vs a reaction-LAG keeper (lag=6). Root cause from \u00a734/\u00a735: against a full-speed bisector keeper no reachable carry opens the angle, so dribble_target_quality\u22480 \u2192 the target head gets no gradient \u2192 3.8-step degenerate carries (infer carry-counter: 0.4 carries/ep). Fix is ENVIRONMENTAL: the keeper now steers toward where the ball was reaction_lag cycles ago (goalie.py _lagged_ball_pos, POSITION mode only \u2014 shot defense/BLOCK/CHARGE/catch stay on the true ball), so a lateral/diagonal carry TRAILS the keeper and opens a real lane. Dense dribble rewards re-opened so the policy DISCOVERS the carry: step_bonus -0.05, dribble_target_progress 1.0/clip0.5, dribble_target_quality 2.0, dribble_active_bonus 0.05, combo 3.0 gap-scaled. Keep dribble_target_y_clip=10 (concentrates target head on reachable shot-improving |y|). Warm-start models/ppo_jal_expandable_wide/stage2c_goalie_balance_complete.pt (the 66% direct shooter; set top-level load_model). Budget 200k. Gate: real carries climb \u2265~1.0/ep AND mean carry length \u2265~8 steps (read infer carry-counter), mean opened-carry gap_delta>0, goal rate holds \u2265~60%.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1191,7 +1282,7 @@
             }
         },
         "stage2e_lag_sharpen": {
-            "description": "STAGE 2E — SHARPEN targeting vs a tighter keeper (lag=3). Mid fade as the keeper reacts faster: the carry must now produce a precise gap-improving target, not just any carry. step_bonus -0.1, dribble_target_progress 1.5/clip0.3, dribble_target_quality 4.0, dribble_active_bonus 0.03, combo 6.0 gap-scaled. Warm-start stage2d_lag_discover_complete.pt (update top-level load_model). Budget 200k. Gate: goal rate climbing toward ~75%, carries stay meaningful (length holds), bad_aim low.",
+            "description": "STAGE 2E \u2014 SHARPEN targeting vs a tighter keeper (lag=3). Mid fade as the keeper reacts faster: the carry must now produce a precise gap-improving target, not just any carry. step_bonus -0.1, dribble_target_progress 1.5/clip0.3, dribble_target_quality 4.0, dribble_active_bonus 0.03, combo 6.0 gap-scaled. Warm-start stage2d_lag_discover_complete.pt (update top-level load_model). Budget 200k. Gate: goal rate climbing toward ~75%, carries stay meaningful (length holds), bad_aim low.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1265,7 +1356,7 @@
             }
         },
         "stage2f_lag_selective": {
-            "description": "STAGE 2F — WEAN to SELECTIVE vs a lag-0 (perfect-tracking) keeper. The real test: with the keeper no longer trailing, dribble pays ONLY through the gap-scaled combo chain — a useless carry is net-negative. dribble pays only through the chain: step_bonus -0.15, dribble_target_progress 0.5/clip0.2, dribble_target_quality 2.0, dribble_active_bonus 0.0, combo 10.0 gap-scaled (safe to be large because it is gap-gated since §33). Warm-start stage2e_lag_sharpen_complete.pt (update top-level load_model). Budget 200k. Gate: goal rate ≥ 66% baseline, REAL carries present but MODERATE (~15-40% of possessions, not compulsive), opened carries show positive gap_delta. If over-dribbling persists at lag-0, add the counterfactual penalty (penalize dribbling when current gap quality already exceeds a good-shot threshold).",
+            "description": "STAGE 2F \u2014 WEAN to SELECTIVE vs a lag-0 (perfect-tracking) keeper. The real test: with the keeper no longer trailing, dribble pays ONLY through the gap-scaled combo chain \u2014 a useless carry is net-negative. dribble pays only through the chain: step_bonus -0.15, dribble_target_progress 0.5/clip0.2, dribble_target_quality 2.0, dribble_active_bonus 0.0, combo 10.0 gap-scaled (safe to be large because it is gap-gated since \u00a733). Warm-start stage2e_lag_sharpen_complete.pt (update top-level load_model). Budget 200k. Gate: goal rate \u2265 66% baseline, REAL carries present but MODERATE (~15-40% of possessions, not compulsive), opened carries show positive gap_delta. If over-dribbling persists at lag-0, add the counterfactual penalty (penalize dribbling when current gap quality already exceeds a good-shot threshold).",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1346,7 +1437,7 @@
             "ball_claimant_switch_margin": 0.75,
             "turn_stall_limit": 12,
             "turn_stall_displacement": 0.05,
-            "description": "DONE (timesteps=0, superseded by stage2h under the new real-robot physics). STAGE 2G — DISCOVER dribbling via GOAL-RELATIVE target reparameterization. Root cause finally pinpointed (TRAINING.md §36): the dribble target was decoded as ABSOLUTE field coords (goto_x=raw*45, goto_y=clip(raw*30,±10)), so the head's neutral output ~0 -> target (0,0)=midfield, dx=45, positional_gap_quality~0.07 << current_gap~0.315 -> EVERY carry latched a backward dead target, the quality one-shot never fired, the head got no gradient (this is why §34/§35 reward tweaks AND the 6/20 reaction-lag keeper curriculum all showed 0% useful carries across 687 carries — the keeper was never the constraint). FIX (code, JAL_env decode + RewardConfig dribble_fwd_max/dribble_lat_max): decode the dribble target RELATIVE to the ball, forward along the ball->goal-centre vector: fwd=(raw*0.5+0.5)*dribble_fwd_max (0..10, always forward), lat=raw*dribble_lat_max (±6, steer to open side), target=ball+fwd*dir+lat*perp, clamped before the goal line and |y|≤dribble_target_y_clip. Now the NEUTRAL head output is a forward carry toward goal centre = already gap-improving, so the quality one-shot fires from step 1 and the head gets a gradient. Warm-start the clean 66% shooter models/ppo_jal_expandable_wide/stage2c_goalie_balance_complete.pt (NOT the weaned 2E). Normal keeper (reaction_lag=0; lag idea abandoned/inert). Dense discover rewards: step -0.05, progress 1.0/clip0.5, quality 4.0 (now the dominant FIRING payoff), active 0.05, combo 3.0 gap-scaled. ball_y ±10, budget 200k but GATE AT ~40-50k: useful-carry fraction must climb off ~0% and mean gap_delta cross 0, goal rate hold ≥~55%. Other stages set to timesteps=0 (trainer runs every stage with timesteps>0, regardless of the description tag).",
+            "description": "DONE (timesteps=0, superseded by stage2h under the new real-robot physics). STAGE 2G \u2014 DISCOVER dribbling via GOAL-RELATIVE target reparameterization. Root cause finally pinpointed (TRAINING.md \u00a736): the dribble target was decoded as ABSOLUTE field coords (goto_x=raw*45, goto_y=clip(raw*30,\u00b110)), so the head's neutral output ~0 -> target (0,0)=midfield, dx=45, positional_gap_quality~0.07 << current_gap~0.315 -> EVERY carry latched a backward dead target, the quality one-shot never fired, the head got no gradient (this is why \u00a734/\u00a735 reward tweaks AND the 6/20 reaction-lag keeper curriculum all showed 0% useful carries across 687 carries \u2014 the keeper was never the constraint). FIX (code, JAL_env decode + RewardConfig dribble_fwd_max/dribble_lat_max): decode the dribble target RELATIVE to the ball, forward along the ball->goal-centre vector: fwd=(raw*0.5+0.5)*dribble_fwd_max (0..10, always forward), lat=raw*dribble_lat_max (\u00b16, steer to open side), target=ball+fwd*dir+lat*perp, clamped before the goal line and |y|\u2264dribble_target_y_clip. Now the NEUTRAL head output is a forward carry toward goal centre = already gap-improving, so the quality one-shot fires from step 1 and the head gets a gradient. Warm-start the clean 66% shooter models/ppo_jal_expandable_wide/stage2c_goalie_balance_complete.pt (NOT the weaned 2E). Normal keeper (reaction_lag=0; lag idea abandoned/inert). Dense discover rewards: step -0.05, progress 1.0/clip0.5, quality 4.0 (now the dominant FIRING payoff), active 0.05, combo 3.0 gap-scaled. ball_y \u00b110, budget 200k but GATE AT ~40-50k: useful-carry fraction must climb off ~0% and mean gap_delta cross 0, goal rate hold \u2265~55%. Other stages set to timesteps=0 (trainer runs every stage with timesteps>0, regardless of the description tag).",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1433,7 +1524,7 @@
             "ball_claimant_switch_margin": 0.75,
             "turn_stall_limit": 12,
             "turn_stall_displacement": 0.05,
-            "description": "DISABLED — original Stage 2H full retrain entry. Kept for history only. Superseded by stage2h_newphys_pm10_finetune, which fine-tunes from the preserved working Stage 2H checkpoint instead of relearning from Stage 2C.",
+            "description": "DISABLED \u2014 original Stage 2H full retrain entry. Kept for history only. Superseded by stage2h_newphys_pm10_finetune, which fine-tunes from the preserved working Stage 2H checkpoint instead of relearning from Stage 2C.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1530,7 +1621,7 @@
             "ball_claimant_switch_margin": 0.75,
             "turn_stall_limit": 12,
             "turn_stall_displacement": 0.05,
-            "description": "DISABLED — Stage 2H conservative fine-tune from the preserved working Stage 2H checkpoint. Purpose: adapt the already-good deterministic policy to the final kick/dribble mechanics and reward instrumentation without the Stage 2C warm-start shock seen in the failed 2026-06-23 full retrain. Same ±10 spawn distribution, same goalie, same real-robot constrained primitives, same committed kick macro / keeper-away target / retarget guard / penalty-area dribble guard / keeper-zone shaping. Short 50k budget, low LR, low entropy, tight KL. Promote only after deterministic inference beats or matches the preserved checkpoint.",
+            "description": "DISABLED \u2014 Stage 2H conservative fine-tune from the preserved working Stage 2H checkpoint. Purpose: adapt the already-good deterministic policy to the final kick/dribble mechanics and reward instrumentation without the Stage 2C warm-start shock seen in the failed 2026-06-23 full retrain. Same \u00b110 spawn distribution, same goalie, same real-robot constrained primitives, same committed kick macro / keeper-away target / retarget guard / penalty-area dribble guard / keeper-zone shaping. Short 50k budget, low LR, low entropy, tight KL. Promote only after deterministic inference beats or matches the preserved checkpoint.",
             "num_robots": 1,
             "timesteps": 0,
             "robot_ids": [
@@ -1635,8 +1726,8 @@
     "num_heads": 4,
     "max_steps": 400,
     "save_interval": 10000,
-    "save_path": "models/ppo_jal_expandable",
-    "load_model": "final_models/stage3_complete.pt",
+    "save_path": "models/ppo_jal_hybrid_support_2v1",
+    "load_model": "models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt",
     "model_params": {
         "gamma": 0.99,
         "gae_lambda": 0.95,

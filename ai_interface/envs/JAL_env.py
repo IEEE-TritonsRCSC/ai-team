@@ -88,6 +88,7 @@ class JALTeamEnv(gym.Env):
         approach_defer_epsilon: float = 0.0,
         ball_action_recovery: bool = False,
         ball_claimant_robot_ids: Optional[List[int]] = None,
+        claimant_follow_robot_ids: Optional[List[int]] = None,
         ball_claimant_switch_margin: float = 0.75,
         turn_stall_limit: int = 12,
         turn_stall_displacement: float = 0.05,
@@ -159,9 +160,37 @@ class JALTeamEnv(gym.Env):
         self.turn_stall_limit: int = max(1, int(turn_stall_limit))
         self.turn_stall_displacement: float = max(0.0, float(turn_stall_displacement))
         self.ball_claimant_id: Optional[int] = None
-        self.turn_stall_steps: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
+
+        # --- robot-agnostic claimant follow ---------------------------------
+        # When ``claimant_follow_robot_ids`` is set with a single PPO action slot,
+        # the policy is NOT pinned to one physical robot: each step the single
+        # slot is remapped to the current ball claimant (the carrier / nearest
+        # eligible robot) drawn from this pool, exploiting the weight-shared,
+        # robot-interchangeable encoder. Per-robot state is tracked over the
+        # whole pool so the active robot can switch between steps without
+        # KeyErrors, and ``_active_robot_id`` records who the last-built obs (and
+        # therefore the next decoded action) belongs to. The hardcoded supporter
+        # aux controller drives whichever pool robot is NOT the active one.
+        self.claimant_follow_robot_ids: Optional[List[int]] = (
+            [int(rid) for rid in claimant_follow_robot_ids]
+            if claimant_follow_robot_ids else None
+        )
+        self.claimant_follow_active: bool = bool(
+            self.claimant_follow_robot_ids
+        ) and self.num_robots == 1
+        if self.claimant_follow_active:
+            self._robot_pool: List[int] = list(self.claimant_follow_robot_ids)
+            # Claimant selection must range over the full pool (not the single
+            # action slot), and requires ball_action_recovery to return a value.
+            self.ball_claimant_robot_ids = list(self._robot_pool)
+            self.ball_action_recovery = True
+        else:
+            self._robot_pool = list(self.robot_ids)
+        self._active_robot_id: int = self._robot_pool[0]
+
+        self.turn_stall_steps: Dict[int, int] = {rid: 0 for rid in self._robot_pool}
         self._turn_stall_last_pose: Dict[int, Optional[Tuple[float, float]]] = {
-            rid: None for rid in self.robot_ids
+            rid: None for rid in self._robot_pool
         }
 
         # Build a RewardConfig with optional overrides from caller. Field names

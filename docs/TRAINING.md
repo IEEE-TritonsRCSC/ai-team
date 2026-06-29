@@ -4304,3 +4304,56 @@ rate. (Implemented; under test.) **If goals stay low**, the forced-pass mask its
 solo scoring — dial it back. **Resolution** (receiver catching the in-flight pass) is the next major
 lever after firing is stable: `_execute_post_pass_finish_macro` already `goto`s the receiver to the
 receive point on fire, but only 1/19 resolved — investigate pass accuracy vs. receiver arrival timing.
+
+---
+
+## 62. Training run: 20260629_204857_567378 — PPO `stage4_hardcoded_support_2v3` / hybrid fallback fine-tune (WEAK — 9% goal rate, dribble-dominant)
+
+**Start time:** 2026-06-29 20:48:57
+**Steps:** 199,829 / 200,000
+**Warm-start:** `models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt`
+
+### Results
+
+| Metric | Value |
+|---|---|
+| Total episodes | 536 |
+| Overall goal rate | 27/536 = **5.0%** |
+| Last 100 episodes goal rate | **9.0%** |
+
+**Episode outcomes (last 100):**
+- `max_steps`: 75% — policy dribbles until timeout
+- `ball_in_penalty_off_target`: 12%
+- `goal_scored`: 9%
+- `ball_out_of_bounds`: 3%
+
+**Goal rate by bucket:**
+```
+eps   1-200:  3.5%
+eps 201-400:  3.5%
+eps 401-536:  9.6%  █
+```
+
+**Aim quality:**
+- First 200 kicks: avg 0.281, bad_aim 24.5%
+- Last 200 kicks: avg 0.342, bad_aim 13.5% (improving)
+
+**Action distribution:** `dribble_to` 71–79% throughout; `kick` near 0% at ep 200 and 400 samples; `approach_ball` 10–21%; `turn` 1–16%.
+
+### Code changes (non-config)
+
+- Fixed `HardcodedSupporter._extract_pose` / `_team_poses`: GameState theta is in **degrees**, was read as radians — converted with `math.radians()` (diagnosed from prior sim-only inference where robot 2 drifted off-field).
+- Stage configured with `num_robots: 1, robot_ids: [1]` so env.step only drives robot 1 (PPO); robot 2 driven exclusively by `HardcodedSupporterCommandProvider` via aux loop.
+
+### What went wrong
+
+Dribble-dominant stall: `dribble_to` is 79% from episode 1 (the warm-start immediately defaulted to dribbling in the new context). With a defender now blocking kick lanes, `goalie_gap_min_quality: 0.3` is almost never met, so the policy dribbles indefinitely waiting for a clear lane that rarely appears. 81% of episodes hit `max_steps`. Goal rate only climbs in the last ~100 episodes (9.6%) as the policy slowly learns to shoot earlier. Aim quality IS improving (bad_aim 24.5% → 13.5%), suggesting the problem is kick-commitment timing, not aim calibration.
+
+The 200k budget was too short: the trend is strongly positive at the end (doubling from 3.5% → 9.6% in the last third) but hasn't converged.
+
+### Fix for next run
+
+Two levers, applied together:
+
+1. **Continue training** — extend to 400k total (add another 200k warm-starting from the checkpoint saved here). The trend suggests convergence is in reach; the policy just needs more time in the new context.
+2. **Lower kick threshold** — reduce `goalie_gap_min_quality` from 0.3 → 0.2 and lower `step_bonus` from -0.1 → -0.2 to penalise time-wasting harder. This tightens the EV tradeoff: at `step_bonus=-0.2`, each wasted step costs twice as much, so the expected cost of waiting for a 0.3 gap outweighs the occasional kick-quality improvement.

@@ -923,6 +923,22 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                 "Aux controller: frozen_ppo team=%s robots=%s model=%s",
                 spec_team, robot_ids, model_path,
             )
+        elif controller_type in {"hardcoded_supporter", "supporter"}:
+            from ai_interface.trainers.policy_control import HardcodedSupporterCommandProvider
+
+            aux_controllers.append(HardcodedSupporterCommandProvider(
+                team_name=spec_team,
+                robot_id=int(robot_ids[0]),
+                side=side,
+                main_attacker_robot_id=int(spec.get("main_attacker_robot_id", 1)),
+                opponent_team_name=str(spec.get("opponent_team_name", opponent_goalie_team or "TeamB")),
+                opponent_goalie_robot_ids=[int(rid) for rid in spec.get("opponent_goalie_robot_ids", [1])],
+            ))
+            _SUMMARY_LOG.info(
+                "Aux controller: hardcoded_supporter team=%s robot_id=%d main=%d opponent=%s",
+                spec_team, int(robot_ids[0]), int(spec.get("main_attacker_robot_id", 1)),
+                str(spec.get("opponent_team_name", opponent_goalie_team or "TeamB")),
+            )
         else:
             _SUMMARY_LOG.warning(
                 "aux_team_policies: unsupported controller_type=%r at inference. Skipping.",
@@ -1586,6 +1602,23 @@ def main():
                              "Override to match a second sim, e.g. 7001.")
 
     args = parser.parse_args()
+
+    if args.trainer == "ppo_jal":
+        try:
+            with open(args.config, "r") as f:
+                _infer_config = json.load(f)
+            _stage_team_config = (
+                _infer_config.get("curriculum", {})
+                .get(args.stage, {})
+                .get("team_config")
+            )
+            if _stage_team_config:
+                args.team_config = str(_stage_team_config)
+        except Exception as exc:  # noqa: BLE001
+            _SUMMARY_LOG.warning(
+                "Could not resolve stage team_config from %s stage=%s: %s",
+                args.config, args.stage, exc,
+            )
 
     # Setup networker
     team_infos = load_team_config(args.team_config)

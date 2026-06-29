@@ -37,6 +37,7 @@ from ai_interface.trainers.policy_control import (
     GoalieCommandProvider,
     DefenderCommandProvider,
     MarkerDefenderCommandProvider,
+    HardcodedSupporterCommandProvider,
 )
 from networking.networker import Networker, TeamInfo
 
@@ -483,6 +484,23 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 self.logger.info(
                     "Aux controller: frozen_ppo team=%s robots=%s model=%s",
                     team_name, robot_ids, model_path,
+                )
+                self._aux_controllers.append(ctrl)
+
+            elif controller_type in {"hardcoded_supporter", "supporter"}:
+                robot_id = int(robot_ids[0]) if robot_ids else 2
+                ctrl = HardcodedSupporterCommandProvider(
+                    team_name=team_name,
+                    robot_id=robot_id,
+                    side=str(spec.get("side", "left")),
+                    main_attacker_robot_id=int(spec.get("main_attacker_robot_id", 1)),
+                    opponent_team_name=str(spec.get("opponent_team_name", "TeamB")),
+                    opponent_goalie_robot_ids=[int(rid) for rid in spec.get("opponent_goalie_robot_ids", [1])],
+                )
+                self.logger.info(
+                    "Aux controller: hardcoded_supporter team=%s robot_id=%d main=%d opponent=%s",
+                    team_name, robot_id, int(spec.get("main_attacker_robot_id", 1)),
+                    str(spec.get("opponent_team_name", "TeamB")),
                 )
                 self._aux_controllers.append(ctrl)
 

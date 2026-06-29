@@ -302,6 +302,46 @@ class MarkerDefenderCommandProvider:
         return self._slot_list(cmd)
 
 
+class HardcodedSupporterCommandProvider:
+    """Drive one same-team hardcoded supporting attacker.
+
+    The returned command list is padded to the supporter's simulator unum. This
+    lets a PPO Stage-3 policy keep controlling robot 1 while this provider
+    controls robot 2 on the same team through the existing aux-controller loop.
+    """
+
+    def __init__(
+        self,
+        team_name: str,
+        robot_id: int,
+        side: str = "left",
+        main_attacker_robot_id: int = 1,
+        opponent_team_name: str = "TeamB",
+        opponent_goalie_robot_ids: Optional[list[int]] = None,
+    ):
+        from ai_interface.hardcoded_supporter import HardcodedSupporter
+
+        self.team_name = team_name
+        self.robot_id = int(robot_id)
+        self.num_robots = 1
+        self._supporter = HardcodedSupporter(
+            teamname=team_name,
+            unum=self.robot_id,
+            side=side,
+            main_attacker_robot_id=int(main_attacker_robot_id),
+            opponent_team_name=opponent_team_name,
+            opponent_goalie_robot_ids=opponent_goalie_robot_ids or [1],
+        )
+
+    def _slot_list(self, cmd: str) -> list:
+        return [None] * (self.robot_id - 1) + [cmd]
+
+    def predict_commands(self, game_state: GameState) -> list:
+        if game_state is None:
+            return self._slot_list("turn 0")
+        return self._slot_list(self._supporter.action(game_state))
+
+
 class ScriptedTeamCommandProvider:
     """Wrap a hard-coded AI implementation behind the TeamCommandProvider protocol."""
 
@@ -517,6 +557,25 @@ def build_aux_team_command_providers(
                 deterministic=bool(spec_data.get("deterministic", True)),
             )
             controllers[ppo_spec.team_name] = FrozenPPOJALPolicyController(ppo_spec, networker, device=device)
+            continue
+
+        if controller_type in {"hardcoded_supporter", "supporter"}:
+            required_keys = ["team_name", "robot_ids"]
+            missing = [key for key in required_keys if key not in spec_data]
+            if missing:
+                raise ValueError(f"Hardcoded supporter spec '{spec_data.get('name', '<unnamed>')}' is missing keys: {missing}")
+
+            team_name = str(spec_data["team_name"])
+            robot_ids = list(spec_data["robot_ids"] or [2])
+            robot_id = int(robot_ids[0])
+            controllers[f"{team_name}:{robot_id}:supporter"] = HardcodedSupporterCommandProvider(
+                team_name=team_name,
+                robot_id=robot_id,
+                side=str(spec_data.get("side", "left")),
+                main_attacker_robot_id=int(spec_data.get("main_attacker_robot_id", 1)),
+                opponent_team_name=str(spec_data.get("opponent_team_name", "TeamB")),
+                opponent_goalie_robot_ids=[int(rid) for rid in spec_data.get("opponent_goalie_robot_ids", [1])],
+            )
             continue
 
         required_keys = ["model_path", "team_name", "robot_ids"]
