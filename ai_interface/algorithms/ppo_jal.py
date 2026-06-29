@@ -36,7 +36,8 @@ Primitives (Categorical, live order):
     2: turn           — reads Dtheta
     3: kick           — reads nothing
     4: dribble_to     — reads (Dx, Dy) as target coordinate
-    (5–11 reserved — always disabled until a future primitive is introduced)
+    5: pass_to_teammate — reads nothing (auto-targets nearest teammate)
+    (6–11 reserved — always disabled until a future primitive is introduced)
 
 Continuous params (Gaussian, live order): Dx, Dy, Dtheta. (3–7 reserved.)
 """
@@ -70,9 +71,10 @@ PRIMITIVE_NAMES: Tuple[str, ...] = (
     "turn",
     "kick",
     "dribble_to",
+    "pass_to_teammate",
 )
-NUM_PRIMITIVES = len(PRIMITIVE_NAMES)   # 5 live (== len(PRIMITIVE_NAMES))
-NUM_PRIMITIVES_MAX = 12                 # primitive head width (5 live + 7 reserved)
+NUM_PRIMITIVES = len(PRIMITIVE_NAMES)   # 6 live (== len(PRIMITIVE_NAMES))
+NUM_PRIMITIVES_MAX = 12                 # primitive head width (6 live + 6 reserved)
 PARAM_DIM = 3                           # Dx, Dy, Dtheta (live)
 PARAM_DIM_MAX = 8                       # param head width (3 live + 5 reserved)
 
@@ -88,6 +90,7 @@ PRIMITIVE_PARAM_DIMS: Dict[str, Tuple[int, ...]] = {
     "turn": (2,),
     "kick": (),
     "dribble_to": (0, 1),
+    "pass_to_teammate": (),
 }
 
 

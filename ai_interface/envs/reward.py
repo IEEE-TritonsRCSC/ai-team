@@ -270,6 +270,12 @@ class RewardConfig:
     possession_transfer_bonus: float = 0.0
     team_goal_multiplier: float = 1.0
 
+    # ---- Stage 4+: pass_to_teammate ----
+    pass_completion_bonus: float = 0.0
+    pass_attempt_bonus: float = 0.0
+    pass_completion_window: int = 10
+    pass_into_space_bonus: float = 0.0
+
 
 @dataclass(frozen=True)
 class RewardInputs:

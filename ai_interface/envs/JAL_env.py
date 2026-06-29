@@ -19,6 +19,7 @@ import numpy as np
 from ai_interface.utils.algo_utils import estimate_ball_velocity, has_ball
 from ai_interface.utils.basic_commands import (
     goto, approach_ball, kick, dribble_to, DribbleState,
+    pass_to_teammate,
     ball_in_front_reception_cone,
     DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_ALIGN_RELEASE,
     DRIBBLE_PHASE_GRAB, DRIBBLE_PHASE_SETTLE,
@@ -47,7 +48,7 @@ from networking.data_utils import GameState, limit_turn_rate
 
 
 class JALTeamEnv(gym.Env):
-    ACTION_TYPES = ["goto", "turn", "kick", "dribble_to"]
+    ACTION_TYPES = ["goto", "turn", "kick", "dribble_to", "pass_to_teammate"]
 
     def __init__(
         self, 
@@ -272,6 +273,9 @@ class JALTeamEnv(gym.Env):
         self._prev_has_ball: Dict[int, bool] = {rid: False for rid in self.robot_ids}
         self._prev_opponent_near_ball: bool = False
         self._prev_clearance_zone_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+
+        # Stage 4+: pass tracking
+        self._pass_pending: Dict[int, Optional[Dict[str, Any]]] = {rid: None for rid in self.robot_ids}
 
         # Stage 5+: multi-robot coordination tracking
         self._prev_ball_carrier: Optional[int] = None
@@ -533,14 +537,19 @@ class JALTeamEnv(gym.Env):
                 mask[slot, 1] = 0.0  # approach_ball
                 mask[slot, 3] = 0.0  # kick
                 mask[slot, 4] = 0.0  # dribble_to
+                mask[slot, 5] = 0.0  # pass_to_teammate
                 continue
             if dist > self.kickable_dist:
                 mask[slot, 3] = 0.0
                 mask[slot, 4] = 0.0
+                mask[slot, 5] = 0.0  # pass requires ball possession
             else:
                 mask[slot, 1] = 0.0
                 if not ball_in_reception_cone:
                     mask[slot, 3] = 0.0
+                    mask[slot, 5] = 0.0  # pass requires ball in reception cone
+                elif self.num_robots < 2:
+                    mask[slot, 5] = 0.0  # no teammates to pass to
             if getattr(self, "turn_stall_steps", {}).get(rid, 0) >= self.turn_stall_limit:
                 mask[slot, 2] = 0.0
         return mask
@@ -703,6 +712,7 @@ class JALTeamEnv(gym.Env):
         self.ball_claimant_id = None
         self.turn_stall_steps = {rid: 0 for rid in self.robot_ids}
         self._turn_stall_last_pose = {rid: None for rid in self.robot_ids}
+        self._pass_pending = {rid: None for rid in self.robot_ids}
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -1336,6 +1346,88 @@ class JALTeamEnv(gym.Env):
                 info_i["carry_open_steps"] = age
                 info_i["carry_urgency_penalty"] = penalty
 
+        # ---- Pass reward: track pass attempts and completions ----
+        pass_attempt_bonus = float(
+            getattr(self.reward_config, "pass_attempt_bonus", 0.0)
+        )
+        pass_completion_bonus = float(
+            getattr(self.reward_config, "pass_completion_bonus", 0.0)
+        )
+        pass_completion_window = int(
+            getattr(self.reward_config, "pass_completion_window", 10)
+        )
+        pass_into_space_bonus = float(
+            getattr(self.reward_config, "pass_into_space_bonus", 0.0)
+        )
+        if pass_attempt_bonus > 0.0 or pass_completion_bonus > 0.0:
+            next_ball_pos_pass = (
+                getattr(next_game_state, "ball_pos", None)
+                if next_game_state is not None else None
+            )
+            next_pose_by_id: Dict[int, Any] = {}
+            if next_game_state is not None:
+                for entry in getattr(next_game_state, "robot_poses", {}).get(self.team_name, []) or []:
+                    if isinstance(entry, dict):
+                        next_pose_by_id.update(entry)
+            for info_i in per_robot_info_list:
+                rid = info_i.get("robot_id")
+                if rid is None:
+                    continue
+                if info_i.get("pass_fired"):
+                    target_rid = info_i.get("pass_target_id")
+                    if pass_attempt_bonus > 0.0:
+                        reward += pass_attempt_bonus
+                    self._pass_pending[rid] = {
+                        "target_id": target_rid,
+                        "steps_remaining": pass_completion_window,
+                        "passer_id": rid,
+                    }
+                    self.logger.info(
+                        "Pass fired: robot %d -> teammate %s",
+                        rid, target_rid,
+                    )
+            for rid in self.robot_ids:
+                pending = self._pass_pending.get(rid)
+                if pending is None:
+                    continue
+                pending["steps_remaining"] -= 1
+                target_rid = pending.get("target_id")
+                if (
+                    target_rid is not None
+                    and next_ball_pos_pass is not None
+                    and target_rid in next_pose_by_id
+                ):
+                    target_pose = next_pose_by_id[target_rid]
+                    dist_to_target = float(np.hypot(
+                        float(target_pose[0]) - float(next_ball_pos_pass[0]),
+                        float(target_pose[1]) - float(next_ball_pos_pass[1]),
+                    ))
+                    if dist_to_target <= self.kickable_dist:
+                        if pass_completion_bonus > 0.0:
+                            reward += pass_completion_bonus
+                        if pass_into_space_bonus > 0.0:
+                            opp_positions = extract_opponent_positions(
+                                getattr(next_game_state, "robot_poses", {}),
+                                self.team_name,
+                            )
+                            nearest_opp_to_receiver = min(
+                                (float(math.hypot(
+                                    float(target_pose[0]) - ox,
+                                    float(target_pose[1]) - oy,
+                                )) for ox, oy in opp_positions),
+                                default=float("inf"),
+                            )
+                            if nearest_opp_to_receiver > 5.0:
+                                reward += pass_into_space_bonus
+                        self.logger.info(
+                            "Pass completed: %d -> %d (dist=%.2f)",
+                            rid, target_rid, dist_to_target,
+                        )
+                        self._pass_pending[rid] = None
+                        continue
+                if pending["steps_remaining"] <= 0:
+                    self._pass_pending[rid] = None
+
         ssl_rule_events = self.ssl_rule_tracker.update(
             current_game_state,
             next_game_state,
@@ -1772,7 +1864,7 @@ class JALTeamEnv(gym.Env):
             commands: List of simulator command strings in robot_ids order
             action_info: Dictionary with action details (for logging/debugging)
         """
-        action_types = ["goto", "approach_ball", "turn", "kick", "dribble_to"]
+        action_types = ["goto", "approach_ball", "turn", "kick", "dribble_to", "pass_to_teammate"]
         dribble_segment_limit = float(
             getattr(self.reward_config, "dribble_segment_limit", 0.85)
         )
@@ -1927,6 +2019,8 @@ class JALTeamEnv(gym.Env):
                     kickable_tolerance=self.kickable_dist,
                 )
                 can_kick = has_ball_now and ball_in_reception_cone
+            pass_fired = False
+            pass_target_id: Optional[int] = None
             kick_aim_quality: Optional[float] = None
             kick_predicted_y_at_goal_line: Optional[float] = None
             kick_macro_continuation = False
@@ -2086,7 +2180,7 @@ class JALTeamEnv(gym.Env):
                         executed_action_type = "kick"
                         fallback_reason = "kick_macro_continuation"
             if recovery_enabled and not is_claimant and action_type in (
-                "approach_ball", "kick", "dribble_to"
+                "approach_ball", "kick", "dribble_to", "pass_to_teammate"
             ):
                 # A non-claimant must never be converted into another ball chaser.
                 action_type = "turn"
@@ -2555,6 +2649,63 @@ class JALTeamEnv(gym.Env):
                     # the next dribble_to selection latches a fresh target.
                     if dribble_st.phase == DRIBBLE_PHASE_DONE:
                         self._end_dribble_session(robot_id)
+            elif action_type == "pass_to_teammate":
+                if pose is None or ball_pos is None or game_state is None:
+                    command = "turn 0"
+                    executed_action_type = "turn"
+                elif not can_kick:
+                    command = "turn 0"
+                    executed_action_type = "turn"
+                    invalid_action_count += 1
+                else:
+                    self_pose = np.array([
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(np.deg2rad(pose[2])),
+                    ], dtype=np.float32)
+                    ball_xy = np.array(
+                        [float(ball_pos[0]), float(ball_pos[1])], dtype=np.float32
+                    )
+                    best_teammate_pose = None
+                    best_teammate_dist = float("inf")
+                    for other_rid in self.robot_ids:
+                        if other_rid == robot_id:
+                            continue
+                        other_pose = pose_by_robot_id.get(other_rid)
+                        if other_pose is None:
+                            continue
+                        d = float(np.hypot(
+                            float(other_pose[0]) - float(ball_pos[0]),
+                            float(other_pose[1]) - float(ball_pos[1]),
+                        ))
+                        if d < best_teammate_dist:
+                            best_teammate_dist = d
+                            best_teammate_pose = other_pose
+                            pass_target_id = other_rid
+                    if best_teammate_pose is None:
+                        command = "turn 0"
+                        executed_action_type = "turn"
+                    else:
+                        teammate_pose = np.array([
+                            float(best_teammate_pose[0]),
+                            float(best_teammate_pose[1]),
+                            float(np.deg2rad(best_teammate_pose[2])),
+                        ], dtype=np.float32)
+                        command = pass_to_teammate(
+                            self_pose, ball_xy, teammate_pose,
+                            kick_power=80.0, dribbling=True,
+                        )
+                        if command.startswith("kick"):
+                            pass_fired = True
+                            dribble_st.reset()
+                            self.dribble_session_active[robot_id] = False
+                            self.dribble_anchor[robot_id] = None
+                            self._reset_kick_macro(robot_id)
+                        elif command == "failed":
+                            command = "turn 0"
+                            executed_action_type = "turn"
+                        elif command.startswith("turn") or command.startswith("catch"):
+                            executed_action_type = "turn"
             elif action_type == "turn":
                 command = f"turn {turn_theta:.2f}"
             elif action_type == "approach_ball":
@@ -2659,6 +2810,8 @@ class JALTeamEnv(gym.Env):
                     "dribble_committed": dribble_committed,
                     "stop_dribble_fired": stop_dribble_fired,
                     "stop_dribble_at_limit": stop_dribble_at_limit,
+                    "pass_fired": pass_fired,
+                    "pass_target_id": pass_target_id,
                     "command": command,
                 }
             )
