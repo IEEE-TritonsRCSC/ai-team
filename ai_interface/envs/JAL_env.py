@@ -7,6 +7,7 @@ from __future__ import annotations
 # 2. Robot velocity estimation is a simple finite difference which can be noisy. We could maintain a short history of robot poses and use a more robust method like least squares to estimate velocity, similar to the ball velocity estimation.
 # 3. Past 5 planned actions per robot are intentionally deferred for now. A future update should add a fixed-size action-history encoding to the observation.
 
+from collections import Counter
 from typing import Optional, Tuple, Dict, Any, List, Sequence
 import logging
 import math
@@ -42,8 +43,17 @@ from ai_interface.envs.reward import (
     reachable_gap_delta,
 )
 from ai_interface.envs.ssl_rule_events import SSLRuleConfig, SSLRuleTracker
+from ai_interface.hardcoded_attack import HardcodedAttackCoordinator
+from ai_interface.hardcoded_supporter import HardcodedSupporter
+from ai_interface.hybrid_pass import HardcodedPassCoordinator, HybridPassConfig
 from networking.networker import Networker
 from networking.data_utils import GameState, limit_turn_rate
+
+
+HARDCODED_TERMINAL_SHOT_LABELS = {
+    "hc_attack_shot_fired",
+    "hc_shot_fired",
+}
 
 
 class JALTeamEnv(gym.Env):
@@ -89,6 +99,12 @@ class JALTeamEnv(gym.Env):
         ball_action_recovery: bool = False,
         ball_claimant_robot_ids: Optional[List[int]] = None,
         claimant_follow_robot_ids: Optional[List[int]] = None,
+        claimant_follow_solo_lane_blocked_max: float = 0.55,
+        claimant_follow_pass_lane_min: float = 0.65,
+        claimant_follow_teammate_margin: float = 0.15,
+        claimant_follow_min_pass_distance: float = 8.0,
+        claimant_follow_post_receive_cooldown_steps: int = 30,
+        hybrid_pass_max_align_steps: Optional[int] = None,
         ball_claimant_switch_margin: float = 0.75,
         turn_stall_limit: int = 12,
         turn_stall_displacement: float = 0.05,
@@ -178,6 +194,25 @@ class JALTeamEnv(gym.Env):
         self.claimant_follow_active: bool = bool(
             self.claimant_follow_robot_ids
         ) and self.num_robots == 1
+        self.claimant_follow_solo_lane_blocked_max = float(claimant_follow_solo_lane_blocked_max)
+        self.claimant_follow_pass_lane_min = float(claimant_follow_pass_lane_min)
+        self.claimant_follow_teammate_margin = float(claimant_follow_teammate_margin)
+        self.claimant_follow_min_pass_distance = float(claimant_follow_min_pass_distance)
+        self.claimant_follow_post_receive_cooldown_steps = int(
+            claimant_follow_post_receive_cooldown_steps
+        )
+        # After a pass is received, suppress re-passing until this sim count.  The
+        # stronger finish-lock fields below also keep PPO mapped to the receiver
+        # so a give-and-go re-pass cannot steal control before a finish attempt.
+        self._claimant_follow_pass_cooldown_until: int = -1
+        self._claimant_follow_finish_lock_robot_id: Optional[int] = None
+        self._claimant_follow_finish_lock_until: int = -1
+        self._claimant_follow_finish_lock_previous_passer_id: Optional[int] = None
+        self._claimant_follow_attack_lock_robot_id: Optional[int] = None
+        self._claimant_follow_attack_lock_until: int = -1
+        self._claimant_follow_attack_lock_replan_after: int = -1
+        self.claimant_follow_attack_lock_steps: int = 45
+        self.claimant_follow_attack_replan_after_steps: int = 8
         if self.claimant_follow_active:
             self._robot_pool: List[int] = list(self.claimant_follow_robot_ids)
             # Claimant selection must range over the full pool (not the single
@@ -187,6 +222,13 @@ class JALTeamEnv(gym.Env):
         else:
             self._robot_pool = list(self.robot_ids)
         self._active_robot_id: int = self._robot_pool[0]
+        self._ppo_control_active: bool = True
+        self._claimant_follow_gate_info: Dict[str, Any] = {
+            "mode": "solo_finish",
+            "active_robot_id": self._active_robot_id,
+            "ppo_control_active": True,
+        }
+        self._last_claimant_follow_debug_key: Optional[Tuple[Any, ...]] = None
 
         self.turn_stall_steps: Dict[int, int] = {rid: 0 for rid in self._robot_pool}
         self._turn_stall_last_pose: Dict[int, Optional[Tuple[float, float]]] = {
@@ -222,8 +264,7 @@ class JALTeamEnv(gym.Env):
         
         # Create a logger for this environment
         self.logger = logging.getLogger(f"JALTeamEnv[{team_name}]")
-        if self.debug:
-            self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.DEBUG)
 
         # Observation design (expandable backbone — see PPO_EXPANDABLE_PLAN.md):
         # FIXED-MAX, COUNT-AGNOSTIC obs of constant size across the whole
@@ -254,6 +295,33 @@ class JALTeamEnv(gym.Env):
             )
         # Opponent team name for filling context slots (slot 1 = opp goalie).
         self.opponent_team_name: Optional[str] = opponent_team_name
+        hybrid_pass_config = HybridPassConfig()
+        if hybrid_pass_max_align_steps is not None:
+            hybrid_pass_config.max_align_steps = int(hybrid_pass_max_align_steps)
+        self.hardcoded_pass = HardcodedPassCoordinator(
+            team_name=self.team_name,
+            opponent_team_name=self.opponent_team_name or "TeamB",
+            side="left",
+            config=hybrid_pass_config,
+        )
+        self.hardcoded_attack = HardcodedAttackCoordinator(
+            team_name=self.team_name,
+            opponent_team_name=self.opponent_team_name or "TeamB",
+            side="left",
+        )
+        # During a hardcoded_attack interlude the env only drives the carrier; the
+        # other pool robot would otherwise be forced to `turn 0` and sit still until
+        # PPO regains control (the "second attacker waits for the first" bug). Drive
+        # it as a supporter so it gets open downfield in parallel. unum /
+        # main_attacker are reassigned per step to the actual non-carrier / carrier.
+        self.hardcoded_supporter = HardcodedSupporter(
+            teamname=self.team_name,
+            unum=1,
+            side="left",
+            main_attacker_robot_id=1,
+            opponent_team_name=self.opponent_team_name or "TeamB",
+            opponent_goalie_robot_ids=[1],
+        )
         # How many opponent context slots to activate/fill (slots 1..num_opponents).
         # 1 = goalie only (stages 1-2); 2 = goalie + defender (stage 3); the
         # backbone is count-agnostic so this just toggles which context slots the
@@ -278,29 +346,29 @@ class JALTeamEnv(gym.Env):
                 slot = 1 + k
                 if slot < self.c_max:
                     self.context_active_mask[slot] = 1.0
-        self.is_dribbling = {robot_id: False for robot_id in self.robot_ids}  # Track dribble state per robot
-        self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self.robot_ids}  # Placeholder for dribble start position, can be updated in step() when dribble starts
+        self.is_dribbling = {robot_id: False for robot_id in self._robot_pool}  # Track dribble state per robot
+        self.start_dribble_pos = {robot_id: [-1.0, -1.0] for robot_id in self._robot_pool}  # Placeholder for dribble start position, can be updated in step() when dribble starts
 
         # Per-robot DribbleState for the dribble_to phase machine (basic_commands).
-        self.dribble_states: Dict[int, DribbleState] = {rid: DribbleState() for rid in self.robot_ids}
+        self.dribble_states: Dict[int, DribbleState] = {rid: DribbleState() for rid in self._robot_pool}
         # Dribble session tracking derived from DribbleState phases, used by
         # reward code and info reporting.
-        self.dribble_session_active: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        self.dribble_anchor: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
+        self.dribble_session_active: Dict[int, bool] = {rid: False for rid in self._robot_pool}
+        self.dribble_anchor: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self._robot_pool}
         # Steps since the last dribble release per robot (phase CARRY→RELEASE).
-        self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
+        self.steps_since_stop_dribble: Dict[int, Optional[int]] = {rid: None for rid in self._robot_pool}
         # dribble_to reward tracking: target chosen, prev distance, action transition.
-        self.dribble_to_target: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self.robot_ids}
-        self.prev_ball_to_dribble_target_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
-        self._prev_action_was_dribble_to: Dict[int, bool] = {rid: False for rid in self.robot_ids}
+        self.dribble_to_target: Dict[int, Optional[Tuple[float, float]]] = {rid: None for rid in self._robot_pool}
+        self.prev_ball_to_dribble_target_dist: Dict[int, Optional[float]] = {rid: None for rid in self._robot_pool}
+        self._prev_action_was_dribble_to: Dict[int, bool] = {rid: False for rid in self._robot_pool}
         # Positional_gap_quality at the spot where the current carry segment
         # opened; used to pay the achieved-gap reward when the segment closes.
-        self.dribble_carry_start_gap: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+        self.dribble_carry_start_gap: Dict[int, Optional[float]] = {rid: None for rid in self._robot_pool}
 
         # Stage 4+: own-goalie coordination tracking
-        self._prev_has_ball: Dict[int, bool] = {rid: False for rid in self.robot_ids}
+        self._prev_has_ball: Dict[int, bool] = {rid: False for rid in self._robot_pool}
         self._prev_opponent_near_ball: bool = False
-        self._prev_clearance_zone_dist: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
+        self._prev_clearance_zone_dist: Dict[int, Optional[float]] = {rid: None for rid in self._robot_pool}
 
         # Stage 5+: multi-robot coordination tracking
         self._prev_ball_carrier: Optional[int] = None
@@ -377,18 +445,19 @@ class JALTeamEnv(gym.Env):
         # kick request often needs many simulator cycles of internal alignment
         # before the primitive can fire. Keep that alignment committed across
         # policy steps so a sampled dribble_to/approach does not interrupt it.
-        self.kick_macro_active: Dict[int, bool] = {rid: False for rid in self.robot_ids}
-        self.kick_macro_target_y: Dict[int, Optional[float]] = {rid: None for rid in self.robot_ids}
-        self.kick_macro_align_steps: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
-        self.kick_macro_retarget_count: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
+        self.kick_macro_active: Dict[int, bool] = {rid: False for rid in self._robot_pool}
+        self.kick_macro_target_y: Dict[int, Optional[float]] = {rid: None for rid in self._robot_pool}
+        self.kick_macro_align_steps: Dict[int, int] = {rid: 0 for rid in self._robot_pool}
+        self.kick_macro_retarget_count: Dict[int, int] = {rid: 0 for rid in self._robot_pool}
         self.kick_macro_max_align_steps: int = 120
-        self.kick_reception_recovery_steps: Dict[int, int] = {rid: 0 for rid in self.robot_ids}
+        self.kick_reception_recovery_steps: Dict[int, int] = {rid: 0 for rid in self._robot_pool}
         self.kick_reception_recovery_lockout_steps: int = 8
-        self.dribble_carry_open_steps: Dict[int, Optional[int]] = {rid: None for rid in self.robot_ids}
+        self.dribble_carry_open_steps: Dict[int, Optional[int]] = {rid: None for rid in self._robot_pool}
 
         # Statistics
         self.total_rewards = 0.0
         self.episode_actions = []  # Track action distribution
+        self.episode_external_action_events: List[Dict[str, Any]] = []
         self._none_state_counter = 0
         
         self.logger.info(
@@ -467,6 +536,695 @@ class JALTeamEnv(gym.Env):
         self.ball_claimant_id = claimant
         return claimant
 
+    def _goal_target_ys(self) -> Tuple[float, ...]:
+        """Return safe goal-mouth y targets for lane scoring."""
+
+        goal_half_height = float(getattr(self.reward_config, "goal_half_height", 5.0))
+        safety_margin = float(getattr(self.reward_config, "goal_post_safety_margin", 0.0))
+        target_y = float(getattr(self.reward_config, "kick_keeper_away_target_y", 0.0))
+        safe_edge = max(0.0, goal_half_height - max(0.0, safety_margin))
+        target_mag = abs(target_y)
+        if target_mag <= 1e-6:
+            target_mag = min(safe_edge, goal_half_height * 0.8)
+        else:
+            target_mag = min(target_mag, safe_edge)
+        targets = [0.0]
+        if target_mag > 1e-6:
+            targets.extend([-target_mag, target_mag])
+        return tuple(float(y) for y in targets)
+
+    def _opponent_pose_maps(
+        self,
+        game_state,
+    ) -> Tuple[Dict[int, Any], List[Tuple[float, float]], Optional[Tuple[float, float, float]]]:
+        """Return opponent poses, non-goalie defender points, and goalie pose."""
+
+        opp_pose_by_id: Dict[int, Any] = {}
+        if game_state is None or self.opponent_team_name is None:
+            return opp_pose_by_id, [], None
+        for entry in getattr(game_state, "robot_poses", {}).get(self.opponent_team_name, []) or []:
+            if isinstance(entry, dict):
+                opp_pose_by_id.update(entry)
+
+        goalie_ids = set(getattr(self, "opponent_goalie_robot_ids", set()))
+        goalie_pose: Optional[Tuple[float, float, float]] = None
+        defenders: List[Tuple[float, float]] = []
+        for rid, pose in opp_pose_by_id.items():
+            if rid in goalie_ids and goalie_pose is None and len(pose) >= 3:
+                goalie_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+            elif rid not in goalie_ids and len(pose) >= 2:
+                defenders.append((float(pose[0]), float(pose[1])))
+        if goalie_pose is None:
+            goalie_pose = self._opponent_goalie_pose(game_state)
+        return opp_pose_by_id, defenders, goalie_pose
+
+    def _best_lane_quality_to_goal(
+        self,
+        point: Tuple[float, float],
+        defender_points: Sequence[Tuple[float, float]],
+    ) -> float:
+        """Best clear lane from a point to safe in-mouth targets."""
+
+        block_dist = float(getattr(self.reward_config, "defender_lane_block_dist", 2.6))
+        if not defender_points:
+            return 1.0
+        best = 0.0
+        for target_y in self._goal_target_ys():
+            target = (float(FIELD_X[1]), float(target_y))
+            lane = min(
+                lane_clear_quality(point, target, defender, block_dist)
+                for defender in defender_points
+            )
+            best = max(best, float(lane))
+        return float(best)
+
+    def _pass_lane_quality(
+        self,
+        start: Tuple[float, float],
+        target: Tuple[float, float],
+        opponent_points: Sequence[Tuple[float, float]],
+    ) -> float:
+        """Return 0..1 lane quality for a carrier-to-teammate pass."""
+
+        block_dist = float(getattr(self.reward_config, "defender_lane_block_dist", 2.6))
+        if not opponent_points:
+            return 1.0
+        return float(min(
+            lane_clear_quality(start, target, opponent, block_dist)
+            for opponent in opponent_points
+        ))
+
+    def _kick_defender_lane_clear(
+        self,
+        game_state,
+        ball_pos: Sequence[float],
+        target_y: float,
+    ) -> float:
+        """Return the clearest non-goalie-defender lane for a direct shot."""
+
+        if game_state is None or ball_pos is None or len(ball_pos) < 2:
+            return 1.0
+        _, defender_points, _ = self._opponent_pose_maps(game_state)
+        if not defender_points:
+            return 1.0
+        block_dist = float(getattr(self.reward_config, "defender_lane_block_dist", 2.6))
+        shot_target = (float(FIELD_X[1]), float(target_y))
+        ball_xy = (float(ball_pos[0]), float(ball_pos[1]))
+        return float(min(
+            lane_clear_quality(ball_xy, shot_target, defender, block_dist)
+            for defender in defender_points
+        ))
+
+    def _set_claimant_follow_mapping(
+        self,
+        active_robot_id: int,
+        *,
+        ppo_control_active: bool,
+        gate_info: Dict[str, Any],
+    ) -> None:
+        """Map the single PPO slot to a physical robot from the follow pool."""
+
+        active_robot_id = int(active_robot_id)
+        if active_robot_id not in self._robot_pool:
+            active_robot_id = self._robot_pool[0]
+        self._active_robot_id = active_robot_id
+        self.robot_ids = [active_robot_id] if self.claimant_follow_active else list(self.robot_ids)
+        self.num_robots = len(self.robot_ids)
+        self._ppo_control_active = bool(ppo_control_active)
+        self._claimant_follow_gate_info = {
+            **gate_info,
+            "active_robot_id": active_robot_id,
+            "ppo_control_active": bool(ppo_control_active),
+        }
+        logger = getattr(self, "logger", None)
+        if logger is not None and logger.isEnabledFor(logging.DEBUG):
+            debug_key = (
+                self._claimant_follow_gate_info.get("mode"),
+                self._claimant_follow_gate_info.get("active_robot_id"),
+                self._claimant_follow_gate_info.get("ppo_control_active"),
+                self._claimant_follow_gate_info.get("carrier_id"),
+                self._claimant_follow_gate_info.get("receiver_id"),
+                self._claimant_follow_gate_info.get("reason"),
+            )
+            if debug_key != getattr(self, "_last_claimant_follow_debug_key", None):
+                logger.debug(
+                    "Claimant-follow gate: mode=%s active=%s ppo_control=%s "
+                    "carrier=%s receiver=%s reason=%s carrier_lane=%s pass_lane=%s teammate_score=%s",
+                    self._claimant_follow_gate_info.get("mode"),
+                    self._claimant_follow_gate_info.get("active_robot_id"),
+                    self._claimant_follow_gate_info.get("ppo_control_active"),
+                    self._claimant_follow_gate_info.get("carrier_id"),
+                    self._claimant_follow_gate_info.get("receiver_id"),
+                    self._claimant_follow_gate_info.get("reason"),
+                    self._claimant_follow_gate_info.get("carrier_lane"),
+                    self._claimant_follow_gate_info.get("pass_lane"),
+                    self._claimant_follow_gate_info.get("teammate_score"),
+                )
+                self._last_claimant_follow_debug_key = debug_key
+
+    def _controlled_team_robot_ids(self) -> List[int]:
+        """Robot IDs that belong to this env's controlled attacker group."""
+
+        if getattr(self, "claimant_follow_active", False):
+            return list(getattr(self, "_robot_pool", self.robot_ids))
+        return list(self.robot_ids)
+
+    def _claimant_follow_carrier_ready_to_pass(
+        self,
+        carrier_pose: Any,
+        ball: Tuple[float, float],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Return whether hardcoded pass mode can physically take over.
+
+        The hybrid gate is strategic, but the hardcoded pass controller still
+        needs a real carrier possession/contact state before PPO is paused. If
+        the lane geometry says "pass" while the carrier is still recovering the
+        ball, keep PPO in control so it can approach/dribble instead of freezing
+        both attackers in a hardcoded interlude.
+        """
+
+        if carrier_pose is None or ball is None:
+            return False, {
+                "carrier_pass_ready": False,
+                "carrier_ball_dist": None,
+                "carrier_ball_in_reception_cone": False,
+            }
+
+        carrier_ball_dist = float(math.hypot(
+            float(carrier_pose[0]) - float(ball[0]),
+            float(carrier_pose[1]) - float(ball[1]),
+        ))
+        usable_tolerance = float(getattr(self, "kickable_dist", 0.0)) + 0.25
+        in_reception_cone = ball_in_front_reception_cone(
+            (
+                float(carrier_pose[0]),
+                float(carrier_pose[1]),
+                float(np.deg2rad(carrier_pose[2])),
+            ),
+            ball,
+            kickable_tolerance=float(getattr(self, "kickable_dist", 0.0)),
+        )
+        ready = carrier_ball_dist <= usable_tolerance
+        return ready, {
+            "carrier_pass_ready": bool(ready),
+            "carrier_ball_dist": carrier_ball_dist,
+            "carrier_ball_in_reception_cone": bool(in_reception_cone),
+        }
+
+    def _claimant_follow_start_finish_lock(
+        self,
+        *,
+        receiver_id: Optional[int],
+        passer_id: Optional[int],
+        game_count: int,
+    ) -> None:
+        """Keep PPO on the pass receiver long enough to attempt the solo finish."""
+
+        if receiver_id is None:
+            self._claimant_follow_finish_lock_robot_id = None
+            self._claimant_follow_finish_lock_previous_passer_id = None
+            self._claimant_follow_finish_lock_until = -1
+            return
+        receiver_id = int(receiver_id)
+        if receiver_id not in getattr(self, "_robot_pool", []):
+            return
+        duration = max(0, int(self.claimant_follow_post_receive_cooldown_steps))
+        self._claimant_follow_finish_lock_robot_id = receiver_id
+        self._claimant_follow_finish_lock_previous_passer_id = (
+            int(passer_id) if passer_id is not None else None
+        )
+        self._claimant_follow_finish_lock_until = int(game_count) + duration
+        self.ball_claimant_id = receiver_id
+
+    def _claimant_follow_clear_finish_lock(self) -> None:
+        """Clear the post-receive finish lock."""
+
+        self._claimant_follow_finish_lock_robot_id = None
+        self._claimant_follow_finish_lock_previous_passer_id = None
+        self._claimant_follow_finish_lock_until = -1
+
+    def _claimant_follow_start_attack_lock(self, robot_id: int, game_count: int) -> None:
+        """Protect a short hardcoded-attack physical macro from frame flicker."""
+
+        self._claimant_follow_attack_lock_robot_id = int(robot_id)
+        self._claimant_follow_attack_lock_until = int(game_count) + int(self.claimant_follow_attack_lock_steps)
+        self._claimant_follow_attack_lock_replan_after = (
+            int(game_count) + int(self.claimant_follow_attack_replan_after_steps)
+        )
+
+    def _claimant_follow_clear_attack_lock(self) -> None:
+        """Clear the hardcoded-attack macro lock."""
+
+        self._claimant_follow_attack_lock_robot_id = None
+        self._claimant_follow_attack_lock_until = -1
+        self._claimant_follow_attack_lock_replan_after = -1
+
+    def _claimant_follow_attack_lock_active(self, game_count: int, pose_by_robot_id: Dict[int, Any]) -> bool:
+        """Return true when a hardcoded-attack owner should remain protected."""
+
+        owner = self._claimant_follow_attack_lock_robot_id
+        if owner is None:
+            return False
+        if int(game_count) >= int(self._claimant_follow_attack_lock_until):
+            self._claimant_follow_clear_attack_lock()
+            return False
+        if int(owner) not in pose_by_robot_id:
+            self._claimant_follow_clear_attack_lock()
+            return False
+        return True
+
+    def _hardcoded_shot_terminal_tracking(self, outcome: str) -> Dict[str, Any]:
+        """Attribute the episode terminal outcome to hardcoded fired-shot events."""
+
+        fired_events = [
+            dict(event)
+            for event in self.episode_external_action_events
+            if str(event.get("label", "")) in HARDCODED_TERMINAL_SHOT_LABELS
+        ]
+        outcomes_by_label: Dict[str, Dict[str, int]] = {}
+        for event in fired_events:
+            label = str(event.get("label", "hardcoded_shot"))
+            label_counts = outcomes_by_label.setdefault(label, {})
+            label_counts[outcome] = int(label_counts.get(outcome, 0)) + 1
+
+        last = fired_events[-1] if fired_events else None
+        last_summary = None
+        if last is not None:
+            last_summary = {
+                "label": str(last.get("label", "")),
+                "robot_id": last.get("robot_id"),
+                "target": last.get("target"),
+                "quality": last.get("quality"),
+                "env_step": last.get("env_step"),
+                "sim_count": last.get("sim_count"),
+                "outcome": outcome,
+                "age_steps": (
+                    int(self.current_step) - int(last["env_step"])
+                    if last.get("env_step") is not None else None
+                ),
+            }
+
+        return {
+            "total_fired": len(fired_events),
+            "outcomes_by_label": outcomes_by_label,
+            "last_fired": last_summary,
+        }
+
+    def _claimant_follow_finish_lock_info(
+        self,
+        game_state,
+        pose_by_robot_id: Dict[int, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Return gate info if the post-pass receiver should still finish."""
+
+        owner = self._claimant_follow_finish_lock_robot_id
+        if owner is None:
+            return None
+        game_count = int(getattr(game_state, "count", 0) or 0)
+        if game_count >= self._claimant_follow_finish_lock_until:
+            self._claimant_follow_clear_finish_lock()
+            return None
+        if owner not in pose_by_robot_id:
+            self._claimant_follow_clear_finish_lock()
+            return None
+
+        ball = getattr(game_state, "ball_pos", None)
+        owner_ball_dist = None
+        if ball is not None and len(ball) >= 2:
+            owner_pose = pose_by_robot_id[owner]
+            owner_ball_dist = float(math.hypot(
+                float(owner_pose[0]) - float(ball[0]),
+                float(owner_pose[1]) - float(ball[1]),
+            ))
+            other_dists = [
+                float(math.hypot(
+                    float(pose_by_robot_id[rid][0]) - float(ball[0]),
+                    float(pose_by_robot_id[rid][1]) - float(ball[1]),
+                ))
+                for rid in getattr(self, "_robot_pool", [])
+                if rid != owner and rid in pose_by_robot_id
+            ]
+            # If the receiver clearly lost the ball to its teammate, release the
+            # lock so recovery/claimant logic can take over instead of forcing a
+            # far-away robot to chase forever.
+            if (
+                owner_ball_dist > float(getattr(self, "kickable_dist", 1.115)) + 6.0
+                and other_dists
+                and min(other_dists) + 1.5 < owner_ball_dist
+            ):
+                self._claimant_follow_clear_finish_lock()
+                return None
+
+        readiness = self.hardcoded_attack.stage3_readiness(
+            robot_id=int(owner),
+            pose_by_robot_id=pose_by_robot_id,
+            game_state=game_state,
+            kickable_dist=float(getattr(self, "kickable_dist", 1.115)),
+        )
+        base_info = {
+            "carrier_id": int(owner),
+            "receiver_id": int(owner),
+            "previous_passer_id": self._claimant_follow_finish_lock_previous_passer_id,
+            "finish_lock_until": self._claimant_follow_finish_lock_until,
+            "finish_lock_remaining": max(0, self._claimant_follow_finish_lock_until - game_count),
+            "finish_lock_ball_dist": owner_ball_dist,
+            "stage3_ready": bool(readiness.ready),
+            "stage3_ready_reason": readiness.reason,
+            "stage3_shot_quality": readiness.shot_quality,
+            "stage3_in_x": readiness.in_stage3_x,
+            "stage3_in_y": readiness.in_stage3_y,
+            "stage3_in_reception_cone": readiness.in_reception_cone,
+        }
+        if readiness.ready:
+            return {
+                "mode": "solo_finish",
+                "reason": "post_receive_finish_lock",
+                **base_info,
+            }
+        return {
+            "mode": "hardcoded_attack",
+            "reason": "post_receive_not_stage3_ready",
+            **base_info,
+        }
+
+    def _update_claimant_follow_mapping(
+        self,
+        game_state,
+        pose_by_robot_id: Optional[Dict[int, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Choose whether PPO controls the carrier or hardcoded pass mode takes over."""
+
+        if not getattr(self, "claimant_follow_active", False):
+            info = {
+                "mode": "solo_finish",
+                "active_robot_id": self.robot_ids[0] if self.robot_ids else None,
+                "ppo_control_active": True,
+            }
+            self._claimant_follow_gate_info = info
+            self._ppo_control_active = True
+            return info
+
+        if game_state is None or getattr(game_state, "ball_pos", None) is None:
+            self._set_claimant_follow_mapping(
+                self._active_robot_id,
+                ppo_control_active=True,
+                gate_info={"mode": "solo_finish", "reason": "missing_state"},
+            )
+            return self._claimant_follow_gate_info
+
+        if pose_by_robot_id is None:
+            pose_by_robot_id = {}
+            for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []) or []:
+                if isinstance(entry, dict):
+                    pose_by_robot_id.update(entry)
+
+        if getattr(self, "hardcoded_pass", None) is not None and self.hardcoded_pass.active():
+            self._claimant_follow_clear_attack_lock()
+            status = self.hardcoded_pass.status(
+                game_state,
+                kickable_dist=float(getattr(self, "kickable_dist", 1.115)),
+            )
+            terminal = self.hardcoded_pass.consume_terminal()
+            if terminal is not None:
+                received = bool(terminal.get("received", False))
+                if received:
+                    game_count = int(getattr(game_state, "count", 0) or 0)
+                    self._claimant_follow_pass_cooldown_until = (
+                        game_count + self.claimant_follow_post_receive_cooldown_steps
+                    )
+                    self._claimant_follow_start_finish_lock(
+                        receiver_id=terminal.get("receiver_id"),
+                        passer_id=terminal.get("carrier_id"),
+                        game_count=game_count,
+                    )
+                next_active = int(
+                    terminal.get("receiver_id")
+                    if received
+                    else terminal.get("carrier_id", self._active_robot_id)
+                )
+                if next_active not in pose_by_robot_id:
+                    claimant = self._ball_claimant(game_state, pose_by_robot_id)
+                    next_active = int(claimant) if claimant is not None else self._active_robot_id
+                if received:
+                    finish_info = self._claimant_follow_finish_lock_info(game_state, pose_by_robot_id)
+                    if finish_info is not None:
+                        finish_info = {
+                            **finish_info,
+                            "pass_terminal_reason": "hardcoded_pass_received",
+                        }
+                        self._set_claimant_follow_mapping(
+                            int(finish_info["carrier_id"]),
+                            ppo_control_active=str(finish_info.get("mode")) != "hardcoded_attack",
+                            gate_info=finish_info,
+                        )
+                    else:
+                        self._set_claimant_follow_mapping(
+                            next_active,
+                            ppo_control_active=True,
+                            gate_info={
+                                "mode": "solo_finish",
+                                "reason": "hardcoded_pass_received",
+                                "carrier_id": terminal.get("carrier_id"),
+                                "receiver_id": terminal.get("receiver_id"),
+                            },
+                        )
+                else:
+                    self._set_claimant_follow_mapping(
+                        next_active,
+                        ppo_control_active=True,
+                        gate_info={
+                            "mode": "solo_finish",
+                            "reason": f"hardcoded_pass_{terminal.get('reason', 'ended')}",
+                            "carrier_id": terminal.get("carrier_id"),
+                            "receiver_id": terminal.get("receiver_id"),
+                        },
+                    )
+                return self._claimant_follow_gate_info
+
+            receiver_id = int(status.get("receiver_id", self._active_robot_id))
+            self._set_claimant_follow_mapping(
+                receiver_id,
+                ppo_control_active=False,
+                gate_info={
+                    "mode": "hardcoded_pass",
+                    "reason": "pass_lifecycle_active",
+                    "carrier_id": status.get("carrier_id"),
+                    "receiver_id": status.get("receiver_id"),
+                    "pass_phase": status.get("phase"),
+                    "pass_target": status.get("target"),
+                    "pass_stable_frames": status.get("stable_frames", 0),
+                },
+            )
+            return self._claimant_follow_gate_info
+
+        game_count = int(getattr(game_state, "count", 0) or 0)
+        finish_lock_info = self._claimant_follow_finish_lock_info(game_state, pose_by_robot_id)
+        if finish_lock_info is not None:
+            self._set_claimant_follow_mapping(
+                int(finish_lock_info["carrier_id"]),
+                ppo_control_active=str(finish_lock_info.get("mode")) != "hardcoded_attack",
+                gate_info=finish_lock_info,
+            )
+            return self._claimant_follow_gate_info
+
+        attack_lock_active = self._claimant_follow_attack_lock_active(game_count, pose_by_robot_id)
+        carrier_id = (
+            int(self._claimant_follow_attack_lock_robot_id)
+            if attack_lock_active and self._claimant_follow_attack_lock_robot_id is not None
+            else self._ball_claimant(game_state, pose_by_robot_id)
+        )
+        if carrier_id is None or carrier_id not in pose_by_robot_id:
+            carrier_id = self._active_robot_id if self._active_robot_id in pose_by_robot_id else None
+        if carrier_id is None:
+            for rid in self._robot_pool:
+                if rid in pose_by_robot_id:
+                    carrier_id = rid
+                    break
+        if carrier_id is None:
+            self._set_claimant_follow_mapping(
+                self._active_robot_id,
+                ppo_control_active=True,
+                gate_info={"mode": "solo_finish", "reason": "no_pool_pose"},
+            )
+            return self._claimant_follow_gate_info
+
+        ball = (float(game_state.ball_pos[0]), float(game_state.ball_pos[1]))
+        carrier_pose = pose_by_robot_id[carrier_id]
+        carrier_point = (float(carrier_pose[0]), float(carrier_pose[1]))
+        carrier_ready_to_pass, carrier_readiness_info = self._claimant_follow_carrier_ready_to_pass(
+            carrier_pose,
+            ball,
+        )
+        _, defender_points, goalie_pose = self._opponent_pose_maps(game_state)
+        goalie_y = float(goalie_pose[1]) if goalie_pose is not None else 0.0
+        goal_half_height = float(getattr(self.reward_config, "goal_half_height", 5.0))
+        lane_block_dist = float(getattr(self.reward_config, "defender_lane_block_dist", 2.6))
+        carrier_lane = self._best_lane_quality_to_goal(ball, defender_points)
+        carrier_shot = positional_shot_quality(
+            ball,
+            goalie_y,
+            defender_points[0] if defender_points else None,
+            goal_half_height,
+            lane_block_dist,
+            float(getattr(self.reward_config, "goal_post_safety_margin", 0.0)),
+            float(getattr(self.reward_config, "kick_keeper_away_target_y", 0.0)),
+        )
+        carrier_score = 0.65 * carrier_lane + 0.35 * carrier_shot
+
+        best_teammate: Optional[int] = None
+        best_teammate_info: Dict[str, Any] = {}
+        opponent_points = list(defender_points)
+        if goalie_pose is not None:
+            opponent_points.append((float(goalie_pose[0]), float(goalie_pose[1])))
+
+        for teammate_id in self._robot_pool:
+            if teammate_id == carrier_id or teammate_id not in pose_by_robot_id:
+                continue
+            teammate_pose = pose_by_robot_id[teammate_id]
+            teammate_point = (float(teammate_pose[0]), float(teammate_pose[1]))
+            pass_target = self.hardcoded_pass.attacking_receive_target(teammate_point, ball, game_state)
+            receiver_target_dist = float(math.hypot(
+                pass_target[0] - teammate_point[0],
+                pass_target[1] - teammate_point[1],
+            ))
+            if not self.hardcoded_pass.is_attacking_receive_target(pass_target):
+                continue
+            if receiver_target_dist > 10.0:
+                continue
+            pass_dist = float(math.hypot(pass_target[0] - ball[0], pass_target[1] - ball[1]))
+            if pass_dist < self.claimant_follow_min_pass_distance:
+                continue
+            teammate_lane = self._best_lane_quality_to_goal(pass_target, defender_points)
+            teammate_shot = positional_shot_quality(
+                pass_target,
+                goalie_y,
+                defender_points[0] if defender_points else None,
+                goal_half_height,
+                lane_block_dist,
+                float(getattr(self.reward_config, "goal_post_safety_margin", 0.0)),
+                float(getattr(self.reward_config, "kick_keeper_away_target_y", 0.0)),
+            )
+            teammate_score = 0.65 * teammate_lane + 0.35 * teammate_shot
+            pass_lane = self._pass_lane_quality(ball, pass_target, opponent_points)
+            candidate_info = {
+                "teammate_id": teammate_id,
+                "teammate_lane": teammate_lane,
+                "teammate_shot": teammate_shot,
+                "teammate_score": teammate_score,
+                "pass_lane": pass_lane,
+                "pass_distance": pass_dist,
+                "pass_target": pass_target,
+                "receiver_target_dist": receiver_target_dist,
+            }
+            if best_teammate is None or teammate_score > float(best_teammate_info.get("teammate_score", -1.0)):
+                best_teammate = teammate_id
+                best_teammate_info = candidate_info
+
+        # Hysteresis: just after a reception the carrier is the new finisher and
+        # often sits in a worse position than its teammate, so an unguarded
+        # re-evaluation would immediately pass the ball back (give-and-go
+        # ping-pong). Hold PPO on the carrier until the cooldown expires.
+        post_receive_cooldown = game_count < self._claimant_follow_pass_cooldown_until
+        stage3_readiness = self.hardcoded_attack.stage3_readiness(
+            robot_id=int(carrier_id),
+            pose_by_robot_id=pose_by_robot_id,
+            game_state=game_state,
+            kickable_dist=float(getattr(self, "kickable_dist", 1.115)),
+        )
+
+        pass_mode = (
+            best_teammate is not None
+            and carrier_ready_to_pass
+            and not post_receive_cooldown
+            and float(best_teammate_info.get("pass_lane", 0.0)) >= self.claimant_follow_pass_lane_min
+            and float(best_teammate_info.get("teammate_score", 0.0)) >= carrier_score + self.claimant_follow_teammate_margin
+        )
+        attack_lock_can_replan = (
+            not attack_lock_active
+            or game_count >= int(getattr(self, "_claimant_follow_attack_lock_replan_after", -1))
+        )
+        if pass_mode:
+            if not attack_lock_can_replan:
+                pass_mode = False
+        if pass_mode:
+            self._claimant_follow_clear_attack_lock()
+            self._set_claimant_follow_mapping(
+                int(best_teammate),
+                ppo_control_active=False,
+                gate_info={
+                    "mode": "hardcoded_pass",
+                    "reason": "attack_lock_replan_pass" if attack_lock_active else "better_attacking_pass",
+                    "carrier_id": int(carrier_id),
+                    "receiver_id": int(best_teammate),
+                    "carrier_lane": carrier_lane,
+                    "carrier_shot": carrier_shot,
+                    "carrier_score": carrier_score,
+                    **carrier_readiness_info,
+                    **best_teammate_info,
+                },
+            )
+        elif not stage3_readiness.ready:
+            reason = "carrier_not_stage3_ready"
+            if attack_lock_active:
+                reason = "hardcoded_attack_lock_active"
+            if post_receive_cooldown:
+                reason = "post_receive_cooldown_stage"
+            if not carrier_ready_to_pass:
+                reason = "loose_ball_recover"
+            self._claimant_follow_start_attack_lock(int(carrier_id), game_count)
+            self._set_claimant_follow_mapping(
+                int(carrier_id),
+                ppo_control_active=False,
+                gate_info={
+                    "mode": "hardcoded_attack",
+                    "reason": reason,
+                    "carrier_id": int(carrier_id),
+                    "carrier_lane": carrier_lane,
+                    "carrier_shot": carrier_shot,
+                    "carrier_score": carrier_score,
+                    "stage3_ready": False,
+                    "stage3_ready_reason": stage3_readiness.reason,
+                    "stage3_shot_quality": stage3_readiness.shot_quality,
+                    "stage3_in_x": stage3_readiness.in_stage3_x,
+                    "stage3_in_y": stage3_readiness.in_stage3_y,
+                    "stage3_in_reception_cone": stage3_readiness.in_reception_cone,
+                    "loose_ball_recover": bool(not carrier_ready_to_pass),
+                    **carrier_readiness_info,
+                    **best_teammate_info,
+                },
+            )
+        else:
+            if stage3_readiness.ready:
+                self._claimant_follow_clear_attack_lock()
+            reason = "no_teammate"
+            if best_teammate is not None:
+                if post_receive_cooldown:
+                    reason = "post_receive_cooldown"
+                elif not carrier_ready_to_pass:
+                    reason = "carrier_not_ready_to_pass"
+                elif float(best_teammate_info.get("pass_lane", 0.0)) < self.claimant_follow_pass_lane_min:
+                    reason = "pass_lane_blocked"
+                else:
+                    reason = "teammate_not_better"
+            self._set_claimant_follow_mapping(
+                int(carrier_id),
+                ppo_control_active=True,
+                gate_info={
+                    "mode": "solo_finish",
+                    "reason": reason,
+                    "carrier_id": int(carrier_id),
+                    "carrier_lane": carrier_lane,
+                    "carrier_shot": carrier_shot,
+                    "carrier_score": carrier_score,
+                    "stage3_ready": bool(stage3_readiness.ready),
+                    "stage3_ready_reason": stage3_readiness.reason,
+                    "stage3_shot_quality": stage3_readiness.shot_quality,
+                    **carrier_readiness_info,
+                    **best_teammate_info,
+                },
+            )
+        return self._claimant_follow_gate_info
+
     def get_primitive_valid_mask(
         self,
         game_state=None,
@@ -493,8 +1251,16 @@ class JALTeamEnv(gym.Env):
         for entry in getattr(game_state, "robot_poses", {}).get(self.team_name, []) or []:
             if isinstance(entry, dict):
                 pose_by_robot_id.update(entry)
+        if getattr(self, "claimant_follow_active", False):
+            self._update_claimant_follow_mapping(game_state, pose_by_robot_id)
         ball_pos = getattr(game_state, "ball_pos", None)
         claimant = self._ball_claimant(game_state, pose_by_robot_id)
+        if getattr(self, "claimant_follow_active", False) and not getattr(self, "_ppo_control_active", True):
+            # The sampled action is ignored by _action_to_commands() during a
+            # hardcoded-pass interlude and the trainer skips this transition.
+            # Leave every slot sampleable so inactive PPO rows never collapse to
+            # all-zero after the reserved primitives are masked by PPOJALAgent.
+            return mask
         for slot, rid in enumerate(self.robot_ids):
             if slot >= self.a_max or rid not in pose_by_robot_id or ball_pos is None:
                 continue
@@ -611,6 +1377,13 @@ class JALTeamEnv(gym.Env):
         
         super().reset(seed=seed)
 
+        # Clear the give-and-go re-pass cooldown: sim ``count`` resets with the
+        # engine, so a stale deadline from the previous episode must not suppress
+        # passing at the start of this one.
+        self._claimant_follow_pass_cooldown_until = -1
+        self._claimant_follow_clear_finish_lock()
+        self._claimant_follow_clear_attack_lock()
+
         # Curriculum ball position: start ball near the goal in early episodes
         # so random kicks have a real chance of scoring (gives the model the
         # sparse goal_reward signal it would otherwise never see). Gradually
@@ -682,8 +1455,22 @@ class JALTeamEnv(gym.Env):
                     robot_x = float(default_pose[0])
                     robot_y = float(default_pose[1])
                 robot_pose = (robot_x, robot_y, spawn_theta_deg)
-                # Keep all other players at their default poses; only override the first.
                 player_poses_override = [(first_obj_name, robot_pose)] + list(default_poses[1:])
+                if (
+                    self.spawn_robot_at_ball
+                    and getattr(self, "claimant_follow_active", False)
+                    and len(default_poses) >= 2
+                ):
+                    support_obj_name, _support_default_pose = default_poses[1]
+                    perp_x, perp_y = -goal_dir_y, goal_dir_x
+                    lateral_sign = -1.0 if by >= 0.0 else 1.0
+                    support_back = offset + 4.5
+                    support_lat = 6.0
+                    support_x = bx - support_back * goal_dir_x + lateral_sign * support_lat * perp_x
+                    support_y = by - support_back * goal_dir_y + lateral_sign * support_lat * perp_y
+                    support_x = float(np.clip(support_x, FIELD_X[0] + 2.0, FIELD_X[1] - 8.0))
+                    support_y = float(np.clip(support_y, FIELD_Y[0] + 2.0, FIELD_Y[1] - 2.0))
+                    player_poses_override[1] = (support_obj_name, (support_x, support_y, spawn_theta_deg))
 
         self.networker.reset_sim(ball_pos=ball_pos, player_poses_override=player_poses_override)
         if ball_pos != (0.0, 0.0):
@@ -695,6 +1482,7 @@ class JALTeamEnv(gym.Env):
         self.episode_num += 1
         self.total_rewards = 0.0
         self.episode_actions = []
+        self.episode_external_action_events = []
         self._none_state_counter = 0
         
         # Clear ball history so velocity starts fresh each episode
@@ -711,27 +1499,36 @@ class JALTeamEnv(gym.Env):
         self._frozen_state_counter = 0
         self._last_rewarded_kick_state = {}
         self._last_kick_probe_by_id = {}
-        self.kick_macro_active = {rid: False for rid in self.robot_ids}
-        self.kick_macro_target_y = {rid: None for rid in self.robot_ids}
-        self.kick_macro_align_steps = {rid: 0 for rid in self.robot_ids}
-        self.kick_macro_retarget_count = {rid: 0 for rid in self.robot_ids}
-        self.kick_reception_recovery_steps = {rid: 0 for rid in self.robot_ids}
+        self.kick_macro_active = {rid: False for rid in self._robot_pool}
+        self.kick_macro_target_y = {rid: None for rid in self._robot_pool}
+        self.kick_macro_align_steps = {rid: 0 for rid in self._robot_pool}
+        self.kick_macro_retarget_count = {rid: 0 for rid in self._robot_pool}
+        self.kick_reception_recovery_steps = {rid: 0 for rid in self._robot_pool}
         self.ssl_rule_tracker.reset()
+        self.hardcoded_pass.reset()
+        self.hardcoded_attack.reset()
 
         # Clear dribble_to phase machine and session tracking state
-        for rid in self.robot_ids:
+        for rid in self._robot_pool:
             self.dribble_states[rid].reset()
-        self.dribble_session_active = {rid: False for rid in self.robot_ids}
-        self.dribble_anchor = {rid: None for rid in self.robot_ids}
-        self.steps_since_stop_dribble = {rid: None for rid in self.robot_ids}
-        self.dribble_to_target = {rid: None for rid in self.robot_ids}
-        self.prev_ball_to_dribble_target_dist = {rid: None for rid in self.robot_ids}
-        self._prev_action_was_dribble_to = {rid: False for rid in self.robot_ids}
-        self.dribble_carry_start_gap = {rid: None for rid in self.robot_ids}
-        self.dribble_carry_open_steps = {rid: None for rid in self.robot_ids}
+        self.dribble_session_active = {rid: False for rid in self._robot_pool}
+        self.dribble_anchor = {rid: None for rid in self._robot_pool}
+        self.steps_since_stop_dribble = {rid: None for rid in self._robot_pool}
+        self.dribble_to_target = {rid: None for rid in self._robot_pool}
+        self.prev_ball_to_dribble_target_dist = {rid: None for rid in self._robot_pool}
+        self._prev_action_was_dribble_to = {rid: False for rid in self._robot_pool}
+        self.dribble_carry_start_gap = {rid: None for rid in self._robot_pool}
+        self.dribble_carry_open_steps = {rid: None for rid in self._robot_pool}
         self.ball_claimant_id = None
-        self.turn_stall_steps = {rid: 0 for rid in self.robot_ids}
-        self._turn_stall_last_pose = {rid: None for rid in self.robot_ids}
+        self.turn_stall_steps = {rid: 0 for rid in self._robot_pool}
+        self._turn_stall_last_pose = {rid: None for rid in self._robot_pool}
+        if self.claimant_follow_active:
+            self._set_claimant_follow_mapping(
+                self._robot_pool[0],
+                ppo_control_active=True,
+                gate_info={"mode": "solo_finish", "reason": "reset"},
+            )
+            self._last_claimant_follow_debug_key = None
 
         # Get initial game state from simulator
         game_state = self._get_game_state(
@@ -759,6 +1556,9 @@ class JALTeamEnv(gym.Env):
             "step": self.current_step,
             "agent_active_mask": self.agent_active_mask.copy(),
             "context_active_mask": self.context_active_mask.copy(),
+            "active_robot_id": int(getattr(self, "_active_robot_id", self.robot_ids[0])),
+            "ppo_control_active": bool(getattr(self, "_ppo_control_active", True)),
+            "claimant_follow": dict(getattr(self, "_claimant_follow_gate_info", {})),
         }
 
         if self.debug:
@@ -830,6 +1630,18 @@ class JALTeamEnv(gym.Env):
 
         # Track action distribution for debugging
         self.episode_actions.append(action_info["action_type"])
+
+        # A post-pass receiver finish lock exists only to give the receiver a
+        # real solo-finishing window. Once that receiver fires a kick, normal
+        # claimant/pass logic can resume on the next observation.
+        for info_i in action_info.get("per_robot", []):
+            if (
+                info_i.get("kick_fired")
+                and self._claimant_follow_finish_lock_robot_id is not None
+                and int(info_i.get("robot_id", -1)) == int(self._claimant_follow_finish_lock_robot_id)
+            ):
+                self._claimant_follow_clear_finish_lock()
+                break
 
         # Send commands to simulator
         self._send_commands(commands)
@@ -1369,7 +2181,7 @@ class JALTeamEnv(gym.Env):
             current_game_state,
             next_game_state,
             self.team_name,
-            self.robot_ids,
+            self._controlled_team_robot_ids(),
         )
         for event in ssl_rule_events:
             reward += float(event.penalty)
@@ -1445,10 +2257,20 @@ class JALTeamEnv(gym.Env):
                     self.episode_num, total, dist,
                 )
             end_reason = term_reason if terminated else "max_steps"
+            hardcoded_shot_terminal = self._hardcoded_shot_terminal_tracking(end_reason)
             self.logger.info(
                 "Episode %d ended — reason=%s  steps=%d  total_reward=%.2f",
                 self.episode_num, end_reason, self.current_step, self.total_rewards,
             )
+            if int(hardcoded_shot_terminal.get("total_fired", 0)) > 0:
+                self.logger.info(
+                    "Hardcoded shot terminal tracking: outcome=%s total_fired=%d "
+                    "by_label=%s last=%s",
+                    end_reason,
+                    int(hardcoded_shot_terminal.get("total_fired", 0)),
+                    hardcoded_shot_terminal.get("outcomes_by_label", {}),
+                    hardcoded_shot_terminal.get("last_fired"),
+                )
             if self._last_kick_probe_by_id:
                 for probe in self._last_kick_probe_by_id.values():
                     self.logger.info(
@@ -1503,8 +2325,59 @@ class JALTeamEnv(gym.Env):
             if (terminated or truncated) else {},
             "agent_active_mask": self.agent_active_mask.copy(),
             "context_active_mask": self.context_active_mask.copy(),
+            "active_robot_id": int(getattr(self, "_active_robot_id", self.robot_ids[0])),
+            "ppo_control_active": bool(getattr(self, "_ppo_control_active", True)),
+            "claimant_follow": dict(getattr(self, "_claimant_follow_gate_info", {})),
+            "external_action_counts": (
+                dict(Counter(
+                    str(event.get("label", "external_action"))
+                    for event in self.episode_external_action_events
+                ))
+                if (terminated or truncated) else {}
+            ),
+            "hardcoded_shot_terminal": (
+                self._hardcoded_shot_terminal_tracking(
+                    term_reason if terminated else ("max_steps" if truncated else "")
+                )
+                if (terminated or truncated) else {}
+            ),
+            "external_action_events_tail": (
+                list(self.episode_external_action_events[-20:])
+                if (terminated or truncated) else []
+            ),
         }
         return obs, reward, terminated, truncated, info
+
+    def record_external_action(
+        self,
+        label: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Add one scripted-controller event to episode diagnostics.
+
+        Auxiliary controllers run outside ``step()`` but still shape the play.
+        Recording their compact labels here makes the existing episode action
+        distribution show hardcoded pass/receive/shot activity alongside PPO
+        primitives without changing simulator commands or rewards.
+        """
+
+        label = str(label or "external_action")
+        self.episode_actions.append(label)
+        event = {
+            "label": label,
+            "episode_num": int(getattr(self, "episode_num", 0)),
+            "env_step": int(getattr(self, "current_step", 0)),
+        }
+        if details:
+            event.update(dict(details))
+        if event.get("sim_count") is None:
+            cached_state = getattr(self, "_cached_game_state", None)
+            event["sim_count"] = (
+                int(getattr(cached_state, "count", 0) or 0)
+                if cached_state is not None else None
+            )
+        self.episode_external_action_events.append(event)
+        self.logger.debug("External action event: %s details=%s", label, event)
     
     
     def _get_game_state(self, retries: int = 0, sleep_s: float = 0.0) -> Optional[GameState]:
@@ -1646,6 +2519,9 @@ class JALTeamEnv(gym.Env):
             for entry in team_pose_entries:
                 if isinstance(entry, dict):
                     pose_by_robot_id.update(entry)
+
+            if getattr(self, "claimant_follow_active", False):
+                self._update_claimant_follow_mapping(game_state, pose_by_robot_id)
 
             # Fixed-max, count-agnostic, analytically-normalized observation.
             # Build a zero vector and fill the live dims of each block; reserved
@@ -1907,6 +2783,106 @@ class JALTeamEnv(gym.Env):
         ball_pos = game_state.ball_pos if game_state is not None else None
         claimant_id = self._ball_claimant(game_state, pose_by_robot_id)
 
+        if (
+            getattr(self, "claimant_follow_active", False)
+            and not bool(getattr(self, "_ppo_control_active", True))
+        ):
+            gate_info = dict(getattr(self, "_claimant_follow_gate_info", {}))
+            interlude_mode = str(gate_info.get("mode", "hardcoded_pass"))
+            if interlude_mode == "hardcoded_attack":
+                interlude_commands, interlude_events, interlude_info = self.hardcoded_attack.execute(
+                    game_state,
+                    gate_info,
+                    kickable_dist=float(getattr(self, "kickable_dist", 1.115)),
+                )
+            else:
+                interlude_commands, interlude_events, interlude_info = self.hardcoded_pass.execute(
+                    game_state,
+                    gate_info,
+                    kickable_dist=float(getattr(self, "kickable_dist", 1.115)),
+                )
+            positional_len = max(int(rid) for rid in getattr(self, "_robot_pool", self.robot_ids))
+            commands = [None] * positional_len
+            per_robot_info = []
+            event_by_robot: Dict[int, Dict[str, Any]] = {}
+            for event in interlude_events:
+                label = str(event.get("label", "") or "")
+                robot_id = event.get("robot_id")
+                if label:
+                    self.record_external_action(label, event)
+                    if (
+                        interlude_mode == "hardcoded_attack"
+                        and label == "hc_attack_shot_fired"
+                        and self._claimant_follow_finish_lock_robot_id is not None
+                        and robot_id is not None
+                        and int(robot_id) == int(self._claimant_follow_finish_lock_robot_id)
+                    ):
+                        self._claimant_follow_clear_finish_lock()
+                if robot_id is not None:
+                    event_by_robot[int(robot_id)] = dict(event)
+
+            interlude_carrier_id = interlude_info.get("carrier_id")
+            for rid in getattr(self, "_robot_pool", self.robot_ids):
+                rid = int(rid)
+                if rid in interlude_commands:
+                    cmd = interlude_commands[rid]
+                elif (
+                    interlude_mode == "hardcoded_attack"
+                    and game_state is not None
+                    and interlude_carrier_id is not None
+                    and rid != int(interlude_carrier_id)
+                ):
+                    # Non-carrier robot: run the supporter so it gets open downfield
+                    # instead of standing still through the whole attack interlude.
+                    self.hardcoded_supporter.unum = rid
+                    self.hardcoded_supporter.main_attacker_robot_id = int(interlude_carrier_id)
+                    cmd = self.hardcoded_supporter.action(game_state)
+                    support_event = dict(getattr(self.hardcoded_supporter, "last_event", {}) or {})
+                    support_label = str(support_event.get("label", "") or "")
+                    if support_label:
+                        self.record_external_action(support_label, support_event)
+                        event_by_robot[rid] = support_event
+                else:
+                    cmd = "turn 0"
+                if rid > 0:
+                    commands[rid - 1] = limit_turn_rate(cmd)
+                event = event_by_robot.get(rid, {})
+                label = str(event.get("label", interlude_mode))
+                per_robot_info.append({
+                    "robot_id": rid,
+                    "action_type": label,
+                    "requested_action_type": interlude_mode,
+                    "raw_action_type": interlude_mode,
+                    "raw_action_idx": None,
+                    "action_idx": None,
+                    "ball_claimant_id": claimant_id,
+                    "is_ball_claimant": claimant_id == rid,
+                    "robot_ball_dist": None,
+                    "fallback_reason": interlude_info.get("reason"),
+                    "command": commands[rid - 1] if rid > 0 else cmd,
+                    "hardcoded_pass": dict(interlude_info) if interlude_mode == "hardcoded_pass" else None,
+                    "hardcoded_attack": dict(interlude_info) if interlude_mode == "hardcoded_attack" else None,
+                    "target": event.get("target"),
+                    "blocked_target": event.get("blocked_target"),
+                    "lane_clear": event.get("lane_clear"),
+                    "nearest_blocker": event.get("nearest_blocker"),
+                })
+
+            primary_label = (
+                interlude_mode
+                if not interlude_events
+                else str(interlude_events[0].get("label", interlude_mode))
+            )
+            return commands, {
+                "action_type": primary_label,
+                "per_robot": per_robot_info,
+                "invalid_action_count": 0,
+                "claimant_follow": dict(getattr(self, "_claimant_follow_gate_info", {})),
+                "ppo_control_active": False,
+                "hardcoded_pass": dict(interlude_info) if interlude_mode == "hardcoded_pass" else None,
+                "hardcoded_attack": dict(interlude_info) if interlude_mode == "hardcoded_attack" else None,
+            }
+
         for i, robot_id in enumerate(self.robot_ids):
             decoded = per_robot_decoded[i]
             action_idx = decoded["action_idx"]
@@ -1937,6 +2913,7 @@ class JALTeamEnv(gym.Env):
             kick_fired = False
             kick_blocked_bad_aim = False
             kick_blocked_bad_reception = False
+            kick_blocked_defender_lane = False
             kick_tie_break_applied = False
             approach_defer_applied = False
             fallback_reason: Optional[str] = None
@@ -1962,9 +2939,15 @@ class JALTeamEnv(gym.Env):
             kick_target_y: Optional[float] = self.kick_macro_target_y.get(robot_id)
             kick_target_angle: Optional[float] = None
             kick_target_heading_error: Optional[float] = None
+            kick_defender_lane_clear: Optional[float] = None
             kick_retarget_applied = False
             kick_retarget_quality_before: Optional[float] = None
             kick_reception_recovery_set = False
+            ppo_control_active = bool(getattr(self, "_ppo_control_active", True))
+            hardcoded_interlude_hold = bool(
+                getattr(self, "claimant_follow_active", False)
+                and not ppo_control_active
+            )
 
             # ---- dribble_to session tracking (derived from DribbleState) ----
             dribble_st = self.dribble_states.get(robot_id)
@@ -2022,6 +3005,13 @@ class JALTeamEnv(gym.Env):
                         requested_action_type = action_type
                         executed_action_type = action_type
                         kick_tie_break_applied = raw_action_type != "kick"
+
+            if hardcoded_interlude_hold:
+                action_type = "turn"
+                action_idx = 2
+                turn_theta = 0.0
+                executed_action_type = "hardcoded_interlude_hold"
+                fallback_reason = "claimant_follow_hardcoded_pass"
 
             # In approach+turn+kick stages, the approach primitive is useful
             # until possession is reached. Once the robot already has the ball,
@@ -2372,11 +3362,20 @@ class JALTeamEnv(gym.Env):
                             math.cos(kick_target_angle - float(self_pose[2])),
                         )
                     )
+                    kick_defender_lane_clear = self._kick_defender_lane_clear(
+                        game_state, ball_xy, float(kick_target_y)
+                    )
+                    if kick_defender_lane_clear < 0.70:
+                        kick_blocked_defender_lane = True
                     command = kick(
                         self_pose, ball_xy, kick_target_angle,
                         kick_power=100.0, dribbling=True,
                     )
-                    fire_ok = can_kick and not kick_blocked_bad_aim
+                    fire_ok = (
+                        can_kick
+                        and not kick_blocked_bad_aim
+                        and not kick_blocked_defender_lane
+                    )
                     kick_blocked_bad_reception = not ball_in_reception_cone
                     if command.startswith("kick") and fire_ok:
                         kick_fired = True
@@ -2479,11 +3478,85 @@ class JALTeamEnv(gym.Env):
                             else:
                                 command = "turn 0"
                                 fallback_reason = "kick_blocked_bad_reception"
+                        elif kick_blocked_defender_lane:
+                            self._reset_kick_macro(robot_id)
+                            if (
+                                kick_blocked_defender_lane
+                                and pose is not None
+                                and game_state is not None
+                                and ball_pos is not None
+                            ):
+                                dribble_st.committed = True
+                                if dribble_st.target is None:
+                                    dribble_st.target = (dribble_goto_x, dribble_goto_y)
+                                self._force_dribble_reacquire(dribble_st)
+                                target_xy = np.array(
+                                    dribble_st.target
+                                    if dribble_st.target is not None
+                                    else (dribble_goto_x, dribble_goto_y),
+                                    dtype=np.float32,
+                                )
+                                command = dribble_to(
+                                    self_pose=self_pose,
+                                    ball_pose=ball_xy,
+                                    target=target_xy,
+                                    game_state=game_state,
+                                    state=dribble_st,
+                                    segment_limit=dribble_segment_limit,
+                                )
+                                reported_dribble_phase = dribble_st.phase
+                                reported_catch_attempts = dribble_st.catch_attempts
+                                reported_verify_steps = dribble_st.verify_steps
+                                reported_align_steps = dribble_st.align_steps
+                                reported_verify_robot_moved = dribble_st.last_verify_robot_moved
+                                reported_verify_ball_moved = dribble_st.last_verify_ball_moved
+                                reported_verify_offset_change = dribble_st.last_verify_offset_change
+                                reported_target_heading_error = dribble_st.last_target_heading_error
+                                reported_dribble_target = dribble_st.target
+                                if command == "done":
+                                    command = "turn 0"
+                                carrying_phases = (DRIBBLE_PHASE_CARRY, DRIBBLE_PHASE_ALIGN_RELEASE)
+                                is_carrying = dribble_st.phase in carrying_phases
+                                was_carrying = prev_dribble_phase in carrying_phases
+                                carry_started = (
+                                    prev_dribble_phase != DRIBBLE_PHASE_CARRY
+                                    and dribble_st.phase == DRIBBLE_PHASE_CARRY
+                                )
+                                self.dribble_session_active[robot_id] = is_carrying
+                                if (
+                                    dribble_st.segment_start is not None
+                                    and self.dribble_anchor.get(robot_id) is None
+                                ):
+                                    self.dribble_anchor[robot_id] = dribble_st.segment_start
+                                carry_closed = (
+                                    was_carrying
+                                    and dribble_st.phase in (DRIBBLE_PHASE_RELEASE, DRIBBLE_PHASE_DONE)
+                                )
+                                if carry_closed:
+                                    stop_dribble_fired = True
+                                    stop_dribble_at_limit = (
+                                        dribble_st.phase == DRIBBLE_PHASE_RELEASE
+                                        and dribble_st.release_at_limit
+                                    )
+                                    self.dribble_anchor[robot_id] = None
+                                if not is_carrying and not was_carrying:
+                                    self.dribble_anchor[robot_id] = None
+                                if dribble_st.target is not None:
+                                    self.dribble_to_target[robot_id] = dribble_st.target
+                                if dribble_st.phase == DRIBBLE_PHASE_DONE:
+                                    self._end_dribble_session(robot_id)
+                                fallback_reason = "kick_blocked_defender_lane_to_dribble"
+                                executed_action_type = "dribble_to"
+                            else:
+                                command = "turn 0"
+                                fallback_reason = "kick_blocked_defender_lane" if kick_blocked_defender_lane else fallback_reason
                         elif command.startswith("kick"):
                             command = "turn 0"
                             self._reset_kick_macro(robot_id)
                         if fallback_reason != "kick_blocked_bad_reception_to_dribble":
                             executed_action_type = "turn"
+                        if fallback_reason == "kick_blocked_defender_lane_to_dribble":
+                            executed_action_type = "dribble_to"
                         if bool(self.kick_macro_active.get(robot_id, False)):
                             self.kick_macro_align_steps[robot_id] = (
                                 self.kick_macro_align_steps.get(robot_id, 0) + 1
@@ -2595,11 +3668,54 @@ class JALTeamEnv(gym.Env):
                         float(pose[1]),
                         float(np.deg2rad(pose[2])),
                     ], dtype=np.float32)
-                    command = approach_ball(
-                        self_pose=self_pose,
-                        game_state=game_state,
-                        margin=self.kickable_dist,
-                    )
+                    # Lead a moving loose ball to its predicted intercept rather
+                    # than chasing where it currently IS: aiming at the live
+                    # position makes the robot trail a rolling ball for many
+                    # cycles (regain p90 ~118 steps in trace). Walk the decaying
+                    # ball flight forward and aim at the earliest point the robot
+                    # can cut off; falls back to the plain approach when the ball
+                    # is (near-)stationary or history is too short.
+                    aim_xy = None
+                    ball_xy = getattr(game_state, "ball_pos", None)
+                    if ball_xy is not None and len(self.ball_pos_history) >= 2:
+                        bvel = estimate_ball_velocity(
+                            np.stack(self.ball_pos_history), alpha=BALL_DECAY
+                        )
+                        bvx, bvy = float(bvel[0]), float(bvel[1])
+                        if math.hypot(bvx, bvy) >= 0.08:
+                            robot_speed = 0.9  # env units/step at full dash (approx)
+                            px, py = float(ball_xy[0]), float(ball_xy[1])
+                            rx, ry = float(self_pose[0]), float(self_pose[1])
+                            for h in range(1, 17):
+                                px += bvx
+                                py += bvy
+                                bvx *= BALL_DECAY
+                                bvy *= BALL_DECAY
+                                if math.hypot(px - rx, py - ry) <= h * robot_speed:
+                                    break
+                            aim_xy = (px, py)
+                    if aim_xy is not None:
+                        command = goto(
+                            self_pose=self_pose,
+                            x=float(aim_xy[0]),
+                            y=float(aim_xy[1]),
+                            game_state=game_state,
+                            margin=self.kickable_dist,
+                            obstacle_avoidance=False,
+                        )
+                    else:
+                        command = approach_ball(
+                            self_pose=self_pose,
+                            game_state=game_state,
+                            margin=self.kickable_dist,
+                            # Detour around robots (esp. the defender sitting
+                            # between attacker and ball) instead of charging
+                            # through it; goto's proximity speed cap then keeps
+                            # the closing speed under the SSL crash threshold.
+                            obstacle_avoidance=True,
+                            avoid_ball=False,
+                            avoid_players=True,
+                        )
                     if command == "done":
                         command = "turn 0"
             else:
@@ -2668,6 +3784,8 @@ class JALTeamEnv(gym.Env):
                     "kick_retarget_quality_before": kick_retarget_quality_before,
                     "kick_blocked_bad_aim": kick_blocked_bad_aim,
                     "kick_blocked_bad_reception": kick_blocked_bad_reception,
+                    "kick_defender_lane_clear": kick_defender_lane_clear,
+                    "kick_blocked_defender_lane": kick_blocked_defender_lane,
                     "kick_aim_quality": kick_aim_quality,
                     "kick_predicted_y_at_goal_line": kick_predicted_y_at_goal_line,
                     "invalid_action_requested": invalid_action_requested,
@@ -2701,6 +3819,8 @@ class JALTeamEnv(gym.Env):
             "action_type": "multi" if self.num_robots > 1 else per_robot_info[0]["action_type"],
             "per_robot": per_robot_info,
             "invalid_action_count": invalid_action_count,
+            "claimant_follow": dict(getattr(self, "_claimant_follow_gate_info", {})),
+            "ppo_control_active": bool(getattr(self, "_ppo_control_active", True)),
         }
 
         return commands, action_info
@@ -3442,6 +4562,7 @@ class JALTeamEnv(gym.Env):
         # to last step for too long means the frame isn't advancing (stale
         # sim connection, or a genuinely wedged ball). See _FROZEN_STATE_STEPS.
         if prev_game_state is not None:
+            controlled_robot_ids = set(self._controlled_team_robot_ids())
             prev_ball_pos_fs = getattr(prev_game_state, "ball_pos", None)
             ball_frozen = (
                 prev_ball_pos_fs is not None
@@ -3462,7 +4583,7 @@ class JALTeamEnv(gym.Env):
                 any_robot_checked = False
                 for robot in team_robots_fs:
                     for unum, pose in robot.items():
-                        if int(unum) not in self.robot_ids:
+                        if int(unum) not in controlled_robot_ids:
                             continue
                         prev_pose_fs = prev_pose_by_unum_fs.get(int(unum))
                         if prev_pose_fs is None:
@@ -3484,6 +4605,17 @@ class JALTeamEnv(gym.Env):
             else:
                 self._frozen_state_counter = 0
             if self._frozen_state_counter >= self._FROZEN_STATE_STEPS:
+                self.logger.debug(
+                    "Frozen-state terminal: checked_robot_ids=%s active_robot_id=%s "
+                    "ppo_control=%s gate=%s ball=(%.3f, %.3f) playmode=%s",
+                    sorted(controlled_robot_ids),
+                    getattr(self, "_active_robot_id", None),
+                    getattr(self, "_ppo_control_active", None),
+                    dict(getattr(self, "_claimant_follow_gate_info", {})),
+                    bx,
+                    by,
+                    getattr(game_state, "playmode", None),
+                )
                 return True, "frozen_state_stale_sim"
 
         # Ball stopped far from the robot: if the ball has come to rest (low
@@ -3544,7 +4676,7 @@ class JALTeamEnv(gym.Env):
 
         for robot in team_robots:
             for unum, pose in robot.items():
-                if int(unum) in self.robot_ids:
+                if int(unum) in set(self._controlled_team_robot_ids()):
                     rx, ry = float(pose[0]), float(pose[1])
                     if abs(rx) > FIELD_X[1] or abs(ry) > FIELD_Y[1]:
                         return True, "robot_out_of_bounds"
@@ -3570,7 +4702,33 @@ class JALTeamEnv(gym.Env):
         locomotion_actions = {"goto", "approach_ball", "dribble_to"}
         return any(a not in self.disabled_actions for a in locomotion_actions)
 
-    def _send_commands(self, commands: List[str]):
+    def _commands_for_current_robot_ids(self, commands: List[Optional[str]]) -> List[Optional[str]]:
+        """Pad compact per-slot commands to simulator unum positions when needed.
+
+        Most stages use ``robot_ids == [1, ..., n]``, so a compact command list
+        already maps index 0 to unum 1. Claimant-follow mode intentionally
+        remaps the single PPO slot between physical robots, e.g. ``robot_ids =
+        [2]``. The simulator command list is still positional by unum, so that
+        one command must become ``[None, cmd]``; otherwise it is delivered to
+        robot 1 and can overwrite the hardcoded support/pass command.
+        """
+
+        if not commands:
+            return []
+        robot_ids = [int(rid) for rid in getattr(self, "robot_ids", [])]
+        if len(commands) != len(robot_ids):
+            return list(commands)
+        if robot_ids == list(range(1, len(commands) + 1)):
+            return list(commands)
+
+        padded: List[Optional[str]] = [None] * max(robot_ids)
+        for robot_id, cmd in zip(robot_ids, commands):
+            if robot_id <= 0:
+                continue
+            padded[robot_id - 1] = cmd
+        return padded
+
+    def _send_commands(self, commands: List[Optional[str]]):
         """
         Send commands to simulator via networker.
         
@@ -3581,7 +4739,8 @@ class JALTeamEnv(gym.Env):
             if not commands:
                 return
 
-            serialized_commands = self._preprocess_commands_for_send(commands)
+            positional_commands = self._commands_for_current_robot_ids(commands)
+            serialized_commands = self._preprocess_commands_for_send(positional_commands)
 
             if self.debug:
                 self.logger.debug(f"Sending {len(serialized_commands)} commands: {serialized_commands}")
@@ -3592,15 +4751,18 @@ class JALTeamEnv(gym.Env):
         except Exception as e:
             self.logger.error(f"Error sending commands: {e}")
 
-    def _preprocess_commands_for_send(self, commands: List[str]) -> List[str]:
+    def _preprocess_commands_for_send(self, commands: List[Optional[str]]) -> List[Optional[str]]:
         """
         Validate/normalize command strings before sending to simulator.
 
         Accepted final formats include: "dash p a", "turn a", "kick p a", "catch", "drop".
         """
         valid_prefixes = ("dash ", "turn ", "kick ", "catch", "drop")
-        out: List[str] = []
+        out: List[Optional[str]] = []
         for cmd in commands:
+            if cmd is None:
+                out.append(None)
+                continue
             clean_cmd = cmd.strip()
             if clean_cmd.startswith(valid_prefixes):
                 out.append(clean_cmd)

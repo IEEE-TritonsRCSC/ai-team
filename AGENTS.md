@@ -1,146 +1,109 @@
 # AGENTS.md
 
-This is the **Codex-facing adapter** for this repository. Codex (OpenAI Codex CLI)
-loads `AGENTS.md` automatically; Claude Code loads `CLAUDE.md`. To avoid drift, the
-**single source of project knowledge is [CLAUDE.md](CLAUDE.md)** — read it first. This
-file only adds the Codex-specific glue and a compact project map; it does **not**
-duplicate the long simulator / environment / curriculum sections.
+This file provides guidance to CODEX when working with code in this repository.
 
-> **Sync contract:** whenever `CLAUDE.md` changes, or a skill is added/edited under
-> `.claude/skills/`, mirror it for Codex (this file, `.agents/skills/`) and append any
-> durable fact to [MEMORY.md](MEMORY.md). See the "Codex adapter & sync contract"
-> section in `CLAUDE.md`.
+## graphify
 
-## Read these first (in order)
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
 
-1. **[CLAUDE.md](CLAUDE.md)** — full project knowledge: Python env, the 4 entry points,
-   the two simulator backends, architecture, curriculum mechanics, tests, conventions.
-2. **[MEMORY.md](MEMORY.md)** — accumulated, hard-won project facts (failure modes already
-   diagnosed, what *not* to re-try). This is the checked-in, project-scoped memory layer
-   that Codex reads (Codex's own `~/.codex/memories/` is global, not project-aware).
-3. **`graphify-out/`** — knowledge graph. See the graphify section below.
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- Don't run for any questions about the embedded or external simulator source code.
 
-## graphify (use it for codebase questions)
+## Python environment
 
-This project has a knowledge graph at `graphify-out/`. The `graphify` CLI is installed at
-`~/.local/bin/graphify` (on PATH). Use it instead of blind grepping:
-
-- For codebase questions, first run `graphify query "<question>"` when
-  `graphify-out/graph.json` exists. It returns a scoped subgraph, usually much smaller than
-  raw grep output or `graphify-out/GRAPH_REPORT.md`.
-- Use `graphify path "<A>" "<B>"` for relationships between two things, and
-  `graphify explain "<concept>"` for a focused concept.
-- If `graphify-out/wiki/index.md` exists, use it for broad navigation instead of raw source
-  browsing. Read `graphify-out/GRAPH_REPORT.md` only for broad architecture review or when
-  query/path/explain don't surface enough.
-- **After modifying code, run `graphify update .`** to keep the graph current (AST-only, no
-  API cost).
-- **Don't** run graphify for questions about the embedded or external simulator source code.
-
-> Sandbox note: the `graphify` binary lives outside the workspace (`~/.local/bin/`) and writes
-> its index into `graphify-out/` inside the workspace. Under `sandbox_mode = "workspace-write"`
-> Codex may prompt before running it — approve it; it only reads the repo and writes
-> `graphify-out/`.
-
-## Critical rules (do not violate)
-
-- **Python:** run **all** training/inference/tests with the `rcai` conda env —
-  `/opt/anaconda3/envs/rcai/bin/python`. Bare `python3`/base conda lack `gymnasium`+`torch`.
-- **Simulator backends differ:** `sim-embedded` (in-process, has local engine patches) vs
-  external `rcssserver` (`sim-only`/`sim-mixed`/`field-*`). `server.conf` overrides reach
-  only the external one; the catch-glue dribble exists only in embedded. Watch
-  train(embedded)/infer(external) mismatches. (Full detail in CLAUDE.md.)
-- **Curriculum gotcha:** the curriculum trainer runs **every** stage with `timesteps > 0`,
-  in sorted order — not just the one tagged `ACTIVE`. To run a single stage, set
-  `timesteps: 0` on all others. New `model_params` keys must be added to the trainer's
-  hparam whitelist or they're silently dropped.
-- **Centralized JAL only** — do not refactor toward MAPPO/decentralized.
-- **Do not commit** training logs, game logs, model checkpoints, or other non-code
-  artifacts unless explicitly told. Commit only when asked. Add files by name (never
-  `git add .`). Never `git push --force`.
-
-## Project map
-
-```
-ai-team/
-├── train.py / launch_train.py        # single / multi-sim TRAINING entry points
-├── infer.py / launch_infer.py        # single / multi-sim INFERENCE entry points
-├── launch_sims.py                    # bare simulators, no AI attached
-├── configs/                          # *.json — ppo_jal_curriculum_config.json is active
-├── ai_interface/
-│   ├── trainers/                     # rollout/update loop + curriculum (BaseTrainer)
-│   │   └── ppo_jal_curriculum_trainer.py   # active line of work
-│   ├── algorithms/                   # networks/update rules (AlgorithmBase)
-│   │   └── ppo_jal.py                # centralized Joint Action Learner (PPOJALAgent)
-│   ├── envs/                         # Gymnasium envs
-│   │   ├── JAL_env.py                # main env (JALTeamEnv) — reused by infer.py
-│   │   ├── reward.py                 # RewardConfig + evaluate_reward
-│   │   └── stage4_support.py         # Stage-4 support-target classification
-│   ├── utils/basic_commands.py       # action primitives (goto/approach_ball/kick/...)
-│   ├── goalie.py                     # scripted keeper
-│   └── trainers/policy_control.py    # scripted opponent/keeper providers
-├── networking/                       # networker.py, socket_utils.py (both sim backends),
-│                                     #   data_utils.py (GameState world model)
-├── scripts/parse_training_log.py     # training-log summarizer (see log-training skill)
-├── docs/                             # TRAINING.md, CHANGES.md, design notes
-├── tests/                            # pytest suite
-├── graphify-out/                     # knowledge graph (query/path/explain/update)
-├── CLAUDE.md / AGENTS.md / MEMORY.md  # Claude / Codex adapters + project memory
-├── .claude/  (skills, agents, settings)   # Claude Code config
-├── .agents/skills/                   # skills mirrored for Codex (see below)
-└── .codex/   (config.toml, agents/)  # Codex config + agents
-```
-
-Control flow at training time:
-**launcher → `train.py` → Trainer → Algorithm (policy) + Env → Networker → Simulator.**
-
-## Common commands
+Run **all** training/inference/tests with the `rcai` conda env — bare `python3`/base conda lack `gymnasium` + `torch`:
 
 ```bash
-# Train one stage (embedded) — set timesteps:0 on all other curriculum stages first
+/opt/anaconda3/envs/rcai/bin/python <script.py> ...
+```
+
+## Entry points
+
+There are four scripts. The `launch_*` wrappers spawn external `rcssserver` instances and then run the underlying script as a subprocess (inheriting the launcher's `--python`); `train.py`/`infer.py` can also be run directly, and only they support the in-process `sim-embedded` backend.
+
+### `train.py` — single training process
+Drives one trainer against one simulator. Key args: `--trainer` (e.g. `ppo_jal_curriculum`, `td3_jal_her`, `discrete_ppo`), `--config <configs/*.json>`, `--env` (`sim-only` | `sim-embedded` | `sim-mixed` | `field-*`), `--timesteps`, `--load_model`, `--save_path`, `--log_dir` (default `train_logs`), `--num_envs`, `--sim_player_port`.
+
+```bash
 /opt/anaconda3/envs/rcai/bin/python train.py \
   --trainer ppo_jal_curriculum --config configs/ppo_jal_curriculum_config.json \
   --env sim-embedded --timesteps 200000
-
-# Inference (env-resident behavior applies automatically). Keep param noise > 0.
-/opt/anaconda3/envs/rcai/bin/python infer.py \
-  --model_path <ckpt>.pt --trainer ppo_jal \
-  --config configs/ppo_jal_curriculum_config.json \
-  --env sim-embedded --stage <stage> --steps 3000
-
-# Tests
-/opt/anaconda3/envs/rcai/bin/python -m pytest tests/
-
-# Summarize the latest training run (then append to docs/TRAINING.md)
-/opt/anaconda3/envs/rcai/bin/python scripts/parse_training_log.py
 ```
 
-> PPO JAL inference must **not** run deterministic-mean (bang-bang turn stall): keep
-> `--ppo_param_noise_std > 0` (0.3 default) and prefer `--ppo_stochastic`.
+### `launch_train.py` — multi-sim training launcher
+Spawns N external `rcssserver` (+ optional `rcssmonitor`) instances and a `train.py` per env. Args use **dashes**: `--num-envs`, `--base-port` (default 6000), `--port-stride` (10), `--env` (default `sim-embedded` — which skips external sim startup), `--trainer`, `--monitor`, `--sim-cmd`/`--sim-port-flag`.
 
-## Skills (Codex)
+```bash
+/opt/anaconda3/envs/rcai/bin/python launch_train.py \
+  --num-envs 2 --sim-cmd rcssserver --sim-port-flag "server::port=" --trainer ppo_jal_curriculum
+```
 
-Project skills are mirrored from `.claude/skills/` into **`.agents/skills/`** (Codex reads
-skills from `.agents/skills/`, **not** `.codex/skills/`). Each keeps its `SKILL.md` and
-supporting files together:
+### `infer.py` — single inference/eval process
+Loads a checkpoint and drives `JALTeamEnv.step()` (so all env-resident behavior applies at inference automatically). Requires `--model_path` (a **flag**, not positional); key args: `--trainer` (default **`ppo_jal`**), `--config` (default `configs/td3_jal_her_config.json` — pass `configs/ppo_jal_curriculum_config.json` for PPO JAL stages or `--stage` lookups raise `KeyError`), `--stage` (selects env settings from the curriculum config), `--env` (supports `sim-embedded`), `--steps`, `--ppo_param_noise_std` (default **0.3**), `--ppo_stochastic`, `--debug_infer` (writes `step_trace.jsonl`). Writes `infer_logs/<run>/` with `infer_log.log` + `summary.json`.
 
-- **`log-training`** — after a run finishes/stops, run `scripts/parse_training_log.py`,
-  fill in the three narrative sections, append to `docs/TRAINING.md`.
-- **`save-plan`** — archive the most recent executed plan into `plans/` with a dated,
-  stage-labelled filename (`save_plan.sh`).
+```bash
+/opt/anaconda3/envs/rcai/bin/python infer.py \
+  --model_path models/ppo_jal_expandable_wide/stage2g_dribble_param_complete.pt \
+  --trainer ppo_jal --config configs/ppo_jal_curriculum_config.json \
+  --env sim-embedded --stage stage2g_dribble_param --steps 3000
+```
 
-## Agents (Codex)
+### `launch_infer.py` — multi-sim inference launcher
+Spawns external `rcssserver` + monitor (monitor on by default) and an `infer.py` per env. Defaults: `--trainer ppo_jal`, `--config configs/ppo_jal_curriculum_config.json`, `--stage stage2_0_baseline`, `--env sim-only`, `--steps 3000`. Does **not** expose `sim-embedded`. `--ppo_param_noise_std` defaults to `None` and is only forwarded if set, so infer.py's `0.3` applies.
 
-Claude agents (`.claude/agents/*.md`) convert to Codex agents (`.codex/agents/*.toml`)
-with the agent body becoming `developer_instructions`. There are currently no project
-agents to convert; `.codex/agents/README.md` documents the convention for when one is added.
+```bash
+/opt/anaconda3/envs/rcai/bin/python launch_infer.py \
+  models/ppo_jal_expandable_wide/<ckpt>.pt --stage <stage> --env sim-only --steps 3000
+```
 
-## Memory in Codex (how it works here)
+> PPO JAL inference must **not** run deterministic-mean (causes a bang-bang turn stall). Keep `--ppo_param_noise_std` > 0 (0.3 default). The checkpoint path picks the model; `--stage` picks the env config — they must be consistent.
 
-- Codex's built-in memories are **global** (`~/.codex/memories/`), system-generated, and
-  **cannot read a project file**. They're enabled in `.codex/config.toml`
-  (`[features] memories = true`) as a cross-session recall layer.
-- The **project-scoped** memory that Codex actually reads is the checked-in
-  **[MEMORY.md](MEMORY.md)**, wired in via `project_doc_fallback_filenames` in
-  `.codex/config.toml`. Treat `MEMORY.md` (+ `CLAUDE.md`) as the authoritative,
-  always-applied rules; treat global memories as helpful local recall only.
+### `launch_sims.py` — bare simulators only
+`python launch_sims.py --env <N> --monitor` launches N `rcssserver` (+ N `rcssmonitor`) with no AI attached.
+
+## Two simulator backends (critical distinction)
+
+- **embedded** (`--env sim-embedded`): `rcssserver_embedded` via `EmbeddedSimulatorBackend` in `networking/socket_utils.py`, run synchronously **in-process**. This is the default for training. It has **local engine patches** (e.g. field-player `catch`/dribble glue, native `drop`) that the stock server does not. `server.conf` overrides do **not** reach it.
+- **external** (`--env sim-only`/`sim-mixed`/`field-*`): the stock `rcssserver` UDP binary (the `launch_*` path). `server.conf` overrides apply here. The embedded-only engine patches do **not** exist here, so behavior that depends on them (notably the `catch`-based dribble) will not reproduce. Watch for train(embedded)/infer(external) mismatches.
+
+## Architecture
+
+The control flow at training time is: **launcher → `train.py` → Trainer → Algorithm (policy) + Env → Networker → Simulator**.
+
+- **Trainers** (`ai_interface/trainers/`, subclass `base_trainer.py:BaseTrainer`) own the rollout/update loop and curriculum. The active line of work is `ppo_jal_curriculum_trainer.py:PPOJALCurriculumTrainer`. Each `--trainer` choice maps to one file here.
+- **Algorithms** (`ai_interface/algorithms/`, subclass `base.py:AlgorithmBase`) are the networks/update rules. `ppo_jal.py:PPOJALAgent` is the centralized **Joint Action Learner**: one team-level policy emits, per robot, a **discrete primitive** (goto / approach_ball / turn / kick / dribble_to) + **continuous params** (Dx, Dy, Dθ). The expandable backbone uses **one weight-shared per-robot encoder** (robots interchangeable; the goalie is hardcoded, not RL). This is intentionally centralized — do not refactor toward MAPPO/decentralized.
+- **Environments** (`ai_interface/envs/`) are Gymnasium envs. `JAL_env.py:JALTeamEnv` is the main one; it decodes the hybrid action into sim commands, runs reward, and exposes `dribble_session_active` / carry telemetry. `infer.py` reuses this exact env, so env-resident changes affect both training and inference.
+- **Reward** lives in `reward.py` (`RewardConfig` + `evaluate_reward`); per-stage `reward_config_overrides` in the curriculum config tune it without code changes.
+- **Action primitives** are in `ai_interface/utils/basic_commands.py` (`goto`, `approach_ball`, `kick`, `shoot`, `dribble_to`). These emit raw rcssserver command strings (`dash`/`turn`/`kick`/`catch`).
+- **Opponent/scripted control**: `ai_interface/goalie.py` + `trainers/policy_control.py` (`GoalieCommandProvider`, `ScriptedTeamCommandProvider`) drive the scripted keeper, stepped each cycle before `env.step`.
+- **Networking** (`networking/`): `networker.py` coordinates teams; `socket_utils.py` holds both sim backends; `data_utils.py` defines `GameState` (the parsed world model passed everywhere).
+
+### Curriculum config mechanics (important gotcha)
+The curriculum trainer runs **every stage that has `timesteps > 0`**, in sorted order — not just one. The `"ACTIVE"` tag in a stage description only labels the `log-training` parser, **not** the trainer. To run a single stage, set `timesteps: 0` on all others. New `model_params` keys must also be added to the trainer's hparam whitelist or they're silently dropped. Top-level `load_model` sets the warm-start checkpoint.
+
+## Tests
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/            # all
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_stage2_env.py -k <name>   # single
+```
+
+## Training log workflow
+
+After a run finishes or is stopped, summarize and append to `docs/TRAINING.md`:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python scripts/parse_training_log.py [train_logs/<run>]
+```
+
+It auto-detects the latest run (or takes a path), extracts goal rate / action distribution / aim / outcomes / config diff, and emits a Markdown block to fill in (use the `log-training` skill for the full workflow). `docs/` (CHANGES.md, PARALLEL_TRAINING.md, PPO_EXPANDABLE_*.md, DRIBBLE_TO.md) holds design notes.
+
+## Repo conventions
+
+- Do not commit/push training logs, game logs, model checkpoints, or other non-code artifacts unless explicitly told to.
+- Do not push changes under `robocup_downloads/` or `tests/`.
+- Commit only when explicitly asked.

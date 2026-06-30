@@ -53,8 +53,13 @@ DEFENDER_REACH_PER_STEP = 0.45
 
 SHARED_CONTACT_LIMIT = 5
 RECOVER_CYCLES = 7
-CLEAR_HOLD_CYCLE_LIMIT = 8
-CLEAR_CARRY_LIMIT = 0.75
+# The defender catch-glues the ball then rotates (capped at ~2 deg/cycle) to aim a
+# clear. 8 cycles / 0.75 units was far too tight: it could not point upfield before
+# the limit hit, so it released early. Give the geometric turn time to swing roughly
+# toward the clear target before the forced release (which is now a kick, not a drop).
+CLEAR_HOLD_CYCLE_LIMIT = 24
+CLEAR_CARRY_LIMIT = 1.4
+LOOSE_CLEAR_RADIUS = KICKABLE + 1.25
 FIELD_MARGIN = 2.0
 
 
@@ -482,20 +487,45 @@ class Defender(Player):
         target = safe_clear_target(self_xy, ball_pos, self.side, _opponents(self.teamname, game_state))
         target_angle = math.atan2(target[1] - self_pose_rad[1], target[0] - self_pose_rad[0])
         angle_diff = normalize_angle(target_angle - self_pose_rad[2])
+        dist_to_ball = _dist(self_xy, ball_pos)
+
+        if dist_to_ball > KICKABLE:
+            ux, uy = _unit_from_to(ball_pos, target)
+            stand_off = PLAYER_SIZE + BALL_SIZE + 0.2
+            contact_x = ball_pos[0] - ux * stand_off
+            contact_y = ball_pos[1] - uy * stand_off
+            contact = clamp_legal_defender_target((contact_x, contact_y), self.side)
+            return basic_commands.goto(
+                self_pose_rad,
+                contact[0],
+                contact[1],
+                game_state,
+                margin=0.18,
+                theta=math.atan2(ball_pos[1] - self_pose_rad[1], ball_pos[0] - self_pose_rad[0]),
+                speed=PRESS_CONTACT_SPEED,
+                obstacle_avoidance=True,
+                include_ball_obstacle=False,
+                include_player_obstacles=True,
+            )
+
+        if not basic_commands.ball_in_front_reception_cone(self_pose_rad, ball_pos):
+            cmd = self.dribble(self_pose_rad, ball_pos, kickable_tolerance=KICKABLE + 0.25)
+            return cmd if cmd != "failed" else f"turn {normalize_angle(math.atan2(ball_pos[1] - self_pose_rad[1], ball_pos[0] - self_pose_rad[0]) - self_pose_rad[2])}"
 
         carried = _dist(ball_pos, self._clear_anchor)
         if self.dribbling and (
             self._clear_hold_cycles >= CLEAR_HOLD_CYCLE_LIMIT or carried >= CLEAR_CARRY_LIMIT
         ):
-            if abs(angle_diff) <= math.radians(25.0):
-                self.dribbling = False
-                self._clear_anchor = None
-                self._clear_hold_cycles = 0
-                return "kick 70 0"
             self.dribbling = False
             self._clear_anchor = None
             self._clear_hold_cycles = 0
-            return "drop"
+            # Forced release: boot the ball forward. NEVER `drop` it here — a drop
+            # releases the glued ball at our own feet, where the pressing attacker
+            # is, which hands them possession. The geometric turn above has already
+            # swung the body roughly toward the upfield clear target, so a forward
+            # kick clears it away from our goal (stronger when better aligned).
+            power = 70 if abs(angle_diff) <= math.radians(25.0) else 85
+            return f"kick {power} 0"
 
         cmd = self.kick(target_angle, self_pose_rad, ball_pos, kick_power=85)
         if cmd.startswith("kick"):
@@ -531,7 +561,7 @@ class Defender(Player):
             return self._recover(self_pose_rad, ball_xy, game_state)
 
         if (
-            def_to_ball <= KICKABLE
+            def_to_ball <= LOOSE_CLEAR_RADIUS
             and not is_inside_own_defense_area(self_xy, self.side)
             and not is_inside_own_defense_area(ball_xy, self.side)
         ):

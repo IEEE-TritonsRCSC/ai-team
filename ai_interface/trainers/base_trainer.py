@@ -70,13 +70,19 @@ class BaseTrainer(abc.ABC):
         
         self.log_file = self.run_dir / "train_log.log"
         
-        # Configure logging
+        file_handler = logging.FileHandler(self.log_file)
+        file_handler.setLevel(logging.DEBUG)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+
+        # Configure logging. Keep DEBUG diagnostics in train_log.log without
+        # printing them to the terminal during long training runs.
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(self.log_file),
-                logging.StreamHandler()  # Also log to console
+                file_handler,
+                stream_handler,
             ]
         )
         self.logger = logging.getLogger(__name__)

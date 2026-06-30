@@ -4,6 +4,651 @@ All changes made to fix training issues, improve the environment, and implement 
 
 ---
 
+## 2026-06-30 — Defender clears the ball instead of dropping it to the attacker
+
+Watching inference, the defender sometimes "handed" the ball to the attacker right after catching it.
+Root cause in `ai_interface/defender.py` `_clear()`: the defender catch-glues the ball, then rotates
+to aim the clear, but body rotation is capped at ~2°/cycle (MAXMOMENT). With `CLEAR_HOLD_CYCLE_LIMIT =
+8` (and the orbiting glued ball quickly tripping `CLEAR_CARRY_LIMIT = 0.75`), it could not swing toward
+the upfield clear target in time, so it fell through to **`drop`** — which releases the glued ball *at
+the defender's own feet*, exactly where the pressing attacker is. Free possession to the attacker.
+
+**Fix:**
+
+- Replaced the `drop` fallback with a forward clear kick (`kick 70/85 0`). A drop is never the right
+  release under pressure; a forward kick boots the ball away from our goal (the geometric turn has
+  already swung the body roughly toward the upfield clear target by then). Kept units-safe — only
+  `kick <power> 0` (direction 0), since the command pipeline does no rad/deg conversion and the rest of
+  the codebase only ever kicks straight ahead.
+- `CLEAR_HOLD_CYCLE_LIMIT` `8 → 24` and `CLEAR_CARRY_LIMIT` `0.75 → 1.4` so the geometric turn has time
+  to point upfield before the forced release (cleaner clears; the glued ball orbiting the body no
+  longer trips the carry limit after a few degrees of rotation).
+
+**Validation:** `45 passed` (supporter + marker-defender, incl. `test_clear_when_ball_at_feet`).
+6000-step `sim-embedded` smoke (24 eps): goal_rate **29.2%**, `hc_clearout_move=10%` (defender now
+clears away), no `drop`. The attacker still scores via its own play rather than off defender gifts.
+
+---
+
+## 2026-06-30 — Supporter active during attack interlude + snappier opponent intercept
+
+Two play-quality fixes from watching inference:
+
+**1. The second attacker (supporter) sat still until the first attacker got the ball.** Root cause was
+*not* `goto` — it was the claimant-follow interlude. While the gate is in `hardcoded_attack` mode
+(robot 1 soloing toward the ball, PPO not in control), two things idled robot 2: (a) the env's
+interlude loop drives only the carrier and defaulted every other pool robot to `turn 0`
+([JAL_env.py](ai_interface/envs/JAL_env.py) ~L2810), and (b) `HardcodedSupporterCommandProvider`
+suspends itself for `mode in {hardcoded_pass, hardcoded_attack}`. So robot 2 only began moving once
+PPO regained control (`solo_finish`) — i.e. after robot 1 had the ball. Trace: first `hc_support_move`
+at env_step ~54.
+
+- Fix: the env now owns a `HardcodedSupporter` (`self.hardcoded_supporter`) and, during a
+  `hardcoded_attack` interlude, drives the **non-carrier** pool robot with it instead of `turn 0`
+  (records the `hc_support_move` event too). The aux provider stays suspended during the interlude,
+  so there is no double-driving — the env supporter drives robot 2 during the attack interlude, the
+  aux provider drives it during PPO control. Same `HardcodedSupporter` logic in both, and this path
+  is shared by training and inference (`JALTeamEnv` is reused), so both get the fix.
+  `hardcoded_pass` is unchanged (it already drives the receiver as robot 2 — suspension still required
+  there to avoid a conflict).
+- Verified: 1200-step `sim-embedded` smoke now shows the supporter emitting `hc_support_move` from
+  **env_step 1** in every episode (was 54).
+
+**2. The defender felt slow to intercept.** The crash/push speed-cap (now enforced on the defender's
+full-speed INTERCEPT, which previously bypassed it) started decelerating from `5·PLAYER_SIZE` (4.5
+units) out, which throttled the press too early.
+
+- Fix: `PROXIMITY_SLOW_DIST` `5.0 → 3.8·PLAYER_SIZE`. The defender (and anything closing on an
+  opponent) now holds full speed until ~3.4 units and only decelerates over the final ~1.6 units. The
+  ramp + `0.10` floor still keep the contact closing speed low, so the anti-bang behavior holds.
+- Verified: opponent-ahead speed profile is now `100` until 3.42u, then `74 (3u) → 43 (2.5u) → 10
+  (contact)`.
+
+**Validation:** `45 passed` (supporter + marker-defender). `py_compile` clean on `JAL_env.py` and
+`basic_commands.py`. Both smoke runs clean, no exceptions.
+
+---
+
+## 2026-06-30 — Proximity cap correction: teammate vs opponent, no freeze, no supporter pin
+
+The previous "hard crash/push stop" change (floor `0.0`, full stop at contact, applied equally to
+teammates over a wide 4.5-unit / 150° cone) over-corrected and produced two regressions visible in
+inference:
+
+- **Robots froze.** A `0.0` floor means a dash heading at a robot inside the cone is zeroed at
+  contact, so two robots whose targets pass through each other deadlock to a permanent stop.
+- **The second attacker (supporter) waited for the first.** With the wide-cone full stop applied to
+  *teammates*, the main attacker sitting a few units ahead pinned the supporter in place; it only
+  started moving once the main attacker advanced toward the ball and cleared its forward cone. Trace
+  evidence: a supporter episode opened `turn0 turn0 dash20 dash2 dash2 dash3 dash5 …` (crawling on
+  the cap) instead of running its support route.
+
+**Fix (`ai_interface/utils/basic_commands.py`, `_robot_proximity_speed_factor`):** the cap now
+distinguishes the mover's own team from opponents (found by matching `self_pose` in
+`game_state.robot_poses`):
+
+- **Opponents — strict** (the SSL crash/push rule): `PROXIMITY_SLOW_DIST = 5·PLAYER_SIZE`, floor
+  `PROXIMITY_MIN_SPEED_FACTOR = 0.10`. Ramps 95→~9 as it closes; the defender's full-speed intercept
+  still cannot bang in.
+- **Teammates — gentle**: `PROXIMITY_TEAMMATE_SLOW_DIST = 2.6·PLAYER_SIZE` (only bites in genuine
+  close quarters), floor `PROXIMITY_TEAMMATE_MIN_FACTOR = 0.45`. A supporter eases past the attacker
+  instead of being throttled/pinned, but still won't barge it.
+- **Floors are non-zero on both paths**, so two robots can always creep and never deadlock to a
+  freeze.
+
+**Validation:** `45 passed` (supporter + marker-defender suites). Primitive check: teammate ahead →
+`95` until 2.34u then 42.75 at contact (never pinned); opponent ahead → `95 → 9.5` ramp; contact
+still creeps `>0` (no freeze). 1200-step `sim-embedded` smoke: the supporter now dashes at 95 from
+step 1 of every episode (was crawling), run clean, no exceptions.
+
+---
+
+## 2026-06-30 — Hard crash/push stop and straight-in loose-ball approach
+
+Sim-only inspection showed two movement problems the earlier proximity cap did not cover:
+
+- The defender and the carrier still banged into each other — the defender when chasing/intercepting
+  a ball the attacker held, and the attacker when both went for a loose ball. The proximity speed cap
+  added earlier was gated behind `obstacle_avoidance`, but the defender's **full-speed INTERCEPT**
+  path (`defender.py` `_move_to(..., full_speed=True)`) calls `goto(obstacle_avoidance=False)`, so the
+  cap was bypassed entirely and the robot charged in at speed 100. The cap's 0.18 floor also let
+  robots keep *creeping* into contact (a Pushing-rule violation) instead of stopping.
+- The attacker visibly **vibrated back and forth** just before reaching a contested loose ball. Cause
+  was the `goto` detour: it recomputes a left/right waypoint around the blocking defender every cycle,
+  and near the ball the two sides are an almost-exact tie, so floating-point noise flipped the chosen
+  side frame to frame.
+
+**Fixes (`ai_interface/utils/basic_commands.py`):**
+
+- Crash/push cap is now enforced on **every** player-aware dash, independent of `obstacle_avoidance`,
+  via a new `goto(crash_speed_cap=True)` parameter (gated on `include_player_obstacles`). So even the
+  defender's full-speed intercept now decelerates as it closes on a robot. SSL Crashing (8.4.2) and
+  Pushing (8.4.1) are thus hard code constraints on all pursuit, not just detour-planned moves.
+- `PROXIMITY_MIN_SPEED_FACTOR` 0.18 → **0.0**: the dash ramps to a full stop exactly at contact
+  (`2·PLAYER_SIZE`), so robots no longer crawl into / push through each other. Turning and kicking are
+  unaffected, so a robot at the contact standoff can still contest the ball (~kickable) without barging.
+- New `DETOUR_SKIP_DIST = 3·PLAYER_SIZE`: on the **final approach** (target nearer than this) `goto`
+  skips detour planning and goes straight in, letting the crash cap decelerate it instead of
+  side-stepping. This removes the close-range side-flip vibration when reacquiring a loose ball.
+- `_select_detour` now takes the robot `heading` and biases a near-tie toward the side the robot is
+  already turned toward, so medium-range detours don't flip either.
+
+**Keeper exemption (`ai_interface/goalie.py`):** `_goto` passes `crash_speed_cap=False` — the keeper
+must dive freely across a crowded mouth and is never slowed by an attacker in front of it. (The
+defender's intercept deliberately keeps the default `True` so it is capped.)
+
+**Validation:**
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/utils/basic_commands.py ai_interface/goalie.py ai_interface/defender.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py tests/test_marker_defender.py
+```
+
+Result: `45 passed`. Direct primitive check confirmed: full-speed dash toward a robot ramps
+`100 → 81 (4u) → 7 (2u) → 0 (contact)`, the keeper stays at 100 with `crash_speed_cap=False`, and the
+detour side holds steady (no flip) as the robot creeps forward. An 800-step `sim-embedded` smoke ran
+clean (3 eps, attacker carries 12× and scores, no exceptions).
+
+---
+
+## 2026-06-30 — Loose-ball recovery gate, active defender clear, and attacker-side spawns
+
+Follow-up sim-only inspection showed three related problems:
+
+- When the ball was beside the attacker or had just been lost, the hybrid gate could still hand
+  control to the Stage-3 PPO finisher even though the state was not Stage-3-ready. That made the
+  robot vibrate or wait instead of immediately reacquiring the ball.
+- The scripted defender entered `CLEAR` only when the ball was already kickable. If the ball was
+  beside/behind the defender, `kick()` returned `failed` and `_clear()` collapsed to `turn 0`, so
+  the defender waited for the attacker rather than collecting and clearing the loose ball.
+- The active Stage 4 hybrid config spawned the ball in the attacking half while leaving the attacker
+  at its default pose. This often produced starts where the ball was closer to the defender than to
+  the attacking robot, which is not the Stage-3-like handoff condition we want.
+
+**Fixes:**
+
+- `ai_interface/envs/JAL_env.py`
+  - Changed claimant-follow mapping so any non-Stage-3-ready carrier state uses `hardcoded_attack`,
+    not `solo_finish`.
+  - Specifically tags loose-ball cases with `reason="loose_ball_recover"` and
+    `loose_ball_recover=true`, keeping PPO out until possession/reception-cone conditions are
+    valid for the Stage-3 finisher.
+
+- `ai_interface/defender.py`
+  - Added `LOOSE_CLEAR_RADIUS`, so the defender actively handles nearby loose balls before they are
+    perfectly kickable.
+  - `_clear()` now moves to a legal contact point if the ball is just outside kick range.
+  - If the ball is kickable but outside the front reception cone, the defender turns/catches first
+    instead of returning `turn 0`.
+
+- `configs/ppo_jal_curriculum_config.json`
+  - Updated active `stage4_hardcoded_support_2v2` spawn settings:
+    - `spawn_robot_at_ball=true`;
+    - `spawn_offset_behind_ball=1.25`;
+    - `spawn_theta_relative_to_goal=true`;
+    - `random_spawn_theta_range_deg=[-45, 45]`.
+  - This keeps the initial ball close to the attacking side and gives the hybrid controller a
+    possession-like start instead of a defender-side scramble.
+
+- `ai_interface/envs/JAL_env.py`
+  - When claimant-follow mode is active and `spawn_robot_at_ball=true`, reset now also places the
+    second attacker near the ball with a lateral support offset instead of leaving it at the distant
+    default pose.
+
+- `tests/test_hardcoded_supporter.py`
+  - Updated the claimant-follow loose-ball test to require `hardcoded_attack` recovery.
+  - Added defender regressions for side-ball collection and near-loose-ball clear movement.
+
+**Validation:**
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/defender.py ai_interface/envs/JAL_env.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m json.tool configs/ppo_jal_curriculum_config.json
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`28 passed`).
+
+---
+
+## 2026-06-30 — Hardcoded attack catch-glue shot macro and stricter blocker veto
+
+Follow-up sim-only inference (`infer_logs/20260630_202532_env0_stage4_hardcoded_support_2v2_complete`)
+showed the previous fix was not sufficient. The run completed only 6 episodes, so it is not a stable
+performance estimate, but it reproduced the two visible issues:
+
+- Completed outcomes: `1/6 goals = 16.7%`, with `2` goalie catches, `2` off-target penalty-area
+  endings, and `1` max-step.
+- The stuck/slow-looking close-ball behavior was not `approach_ball`; episode 1 switched into
+  `hc_attack_shot_align` for 22 steps before firing. That means the hardcoded attack bridge was
+  rotating toward a shot target before explicitly catch-gluing the ball.
+- The rebound/off-target issue was also in the hardcoded attack bridge: every terminal tracked shot
+  was `hc_attack_shot_fired`.
+
+**Fixes:**
+
+- `ai_interface/hardcoded_attack.py`
+  - Added per-robot `caught_for_kick` state, mirroring the already-working hardcoded pass macro.
+  - `_kick_or_settle()` now does:
+    1. face/catch the ball with `dribble()` until it emits `catch 0`;
+    2. once caught, rotate the glued ball+robot assembly toward the target;
+    3. fire only when the glued ball is still in the reception cone and heading error is within `5°`.
+  - This prevents the robot from spinning toward the goal while the ball is merely touching the mouth.
+  - Tightened direct-shot lane constraints:
+    - `shoot_min_lane_clear: 0.70 -> 0.95`;
+    - added wider `shot_lane_block_dist=4.5` env units for hardcoded fired shots.
+  - Added `advance_min_lane_clear=0.85`; blocked long advance lanes now stage with a controlled
+    dribble move instead of kicking into the defender.
+  - Hardcoded attack events now include `lane_clear`, `nearest_blocker`, and `blocked_target` where
+    relevant.
+
+- `ai_interface/envs/JAL_env.py` and `infer.py`
+  - Propagate hardcoded lane diagnostics into `step_trace.jsonl`:
+    - `hardcoded_lane_clear`;
+    - `hardcoded_nearest_blocker`;
+    - `hardcoded_blocked_target`;
+    - existing PPO kick traces also now include `kick_defender_lane_clear` and
+      `kick_blocked_defender_lane`.
+
+- `tests/test_hardcoded_supporter.py`
+  - Added regressions that hardcoded attack catches before direct-shot alignment.
+  - Added regression that a blocked advance lane stages instead of firing a kick.
+
+**Validation:**
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/hardcoded_attack.py ai_interface/envs/JAL_env.py infer.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`26 passed`).
+
+---
+
+## 2026-06-30 — Ball-facing approach and defender-lane shot veto
+
+Latest sim-only debug inference exposed two concrete failure modes:
+
+- In early episodes, the attacker reached the ball but stayed on `turn 0` even though the ball was
+  outside the front reception cone. Trace rows showed `approach_ball` at about `1.65` env units from
+  the ball with a ball-heading error around `116°`, so the robot was close enough for `goto()` to
+  report done but was not physically facing the ball to grab it.
+- The attacker repeatedly fired hardcoded shots through a defender lane. The 50k inference before
+  that was not performing well: `14/97 goals = 14.4%`, with `33` max-step endings, `27` goalie
+  catches, and `16` off-target penalty-area endings. The new hardcoded terminal-shot counters showed
+  many `hc_attack_shot_fired` events ending as goalie catches, off-targets, or max-step stalls after
+  defender/traffic rebounds.
+
+**Fixes:**
+
+- `ai_interface/utils/basic_commands.py`
+  - `approach_ball()` now defaults its final heading target to the live ball bearing.
+  - When the robot is already inside the approach margin, `goto()` therefore turns toward the ball
+    instead of returning `done` and being converted to `turn 0`.
+
+- `ai_interface/hardcoded_attack.py`
+  - Added `shoot_min_lane_clear=0.70`.
+  - Direct hardcoded attack shots now require both normal shot quality and a clear non-goalie
+    defender lane before emitting `hc_attack_shot_*`.
+
+- `ai_interface/hardcoded_supporter.py`
+  - Added the same `shoot_min_lane_clear=0.70` guard for supporter finish shots.
+  - If the lane is defender-covered, the supporter chooses return-pass/staging behavior instead of
+    shooting into the blocker.
+
+- `ai_interface/envs/JAL_env.py`
+  - Added `_kick_defender_lane_clear()` for PPO/environment-owned kicks.
+  - PPO kick macros now log `kick_defender_lane_clear` and `kick_blocked_defender_lane`.
+  - A kick whose target lane is below `0.70` is vetoed before firing. When possible, the env falls
+    back into a controlled `dribble_to` reposition step instead of kicking the ball into the defender.
+
+- `tests/test_hardcoded_supporter.py`
+  - Added regressions for close-ball approach turning, hardcoded direct-shot lane rejection, and
+    PPO defender-lane detection.
+
+**Validation:**
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/utils/basic_commands.py ai_interface/hardcoded_attack.py ai_interface/hardcoded_supporter.py ai_interface/envs/JAL_env.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`24 passed`).
+
+---
+
+## 2026-06-30 — Terminal outcome tracking for hardcoded shots
+
+The hardcoded bridge could emit many shot labels such as `hc_attack_shot_fired`, but the previous
+diagnostics did not attribute the final episode result to those shots. This made conversion opaque:
+we could see that hardcoded shots happened, but not whether they ended as goals, off-target shots,
+goalie catches, or max-step stalls.
+
+**Fixes:**
+
+- `ai_interface/envs/JAL_env.py`
+  - Added hardcoded terminal-shot classification for `hc_attack_shot_fired` and `hc_shot_fired`.
+  - `record_external_action()` now stamps external events with `episode_num`, `env_step`, and
+    best-effort `sim_count`.
+  - At episode end, the env logs `Hardcoded shot terminal tracking` with:
+    - total hardcoded fired shots in the episode;
+    - counts by `label -> terminal outcome`;
+    - the last hardcoded fired shot before termination, including target, quality, age, and outcome.
+  - Terminal info now exposes `info["hardcoded_shot_terminal"]` for downstream inference/training
+    diagnostics.
+
+- `infer.py`
+  - Aggregates `info["hardcoded_shot_terminal"]` across the run.
+  - `summary.json` now includes:
+    - `hardcoded_shot_terminal.all_fired_events`, e.g. `hc_attack_shot_fired->goal_scored`;
+    - `hardcoded_shot_terminal.last_fired_per_episode`, which avoids over-counting episodes with
+      multiple hardcoded shots and gives the most relevant conversion view.
+  - Final inference logs print `[ALL] hardcoded shot terminal outcomes` when any hardcoded shot fires.
+
+---
+
+## 2026-06-30 — Hardcoded 2v2 pass/attack gate tightened after 12% inference regression
+
+Latest 50k-step embedded inference for `stage4_hardcoded_support_2v2_complete` regressed to
+**11/92 goals = 12.0%**. The hardcoded bridge was active, but it was being used from bad field
+positions: fired hardcoded pass targets had mean `x=-4.72` and hardcoded attack staging targets had
+mean `x=-6.98`, so the bridge was trying to build final scoring actions from our own half. PPO kicks
+also fell (`85 → 55`) and bad aim rose (`29.4% → 38.2%`), confirming that the hardcoded layer was
+stealing too many possessions before the Stage-3 finisher had a clean scoring state.
+
+**Fixes:**
+
+- `ai_interface/hybrid_pass.py`
+  - Added an explicit attacking receive envelope for final scoring passes:
+    `x >= 25`, `x <= 34`, `|y| <= 10` for the left-side attack.
+  - `_clamp_receive_target()` now clamps to that attacking band instead of only applying field and
+    max-x bounds. This prevents final pass targets in negative x / own-half positions.
+  - Added `attacking_receive_target()` and `is_attacking_receive_target()` so the gate and pass
+    lifecycle share the exact same target geometry.
+  - `HardcodedPassCoordinator.start()` now prefers the gate-selected `pass_target` when present,
+    keeping carrier aim and receiver movement consistent through the pass macro.
+
+- `ai_interface/envs/JAL_env.py`
+  - The claimant-follow gate now scores the teammate at the **concrete attacking pass target**, not
+    at the teammate's raw current pose.
+  - Pass candidates are rejected when the receiver is more than `10` env units from the attacking
+    target, so a teammate sitting deep in our half cannot create a fake final pass by being clamped
+    to `x=25`.
+  - Added a short hardcoded-attack lock (`45` steps, replan allowed after `8`) to prevent
+    frame-by-frame flicker while a physical macro is grabbing/aligning/carrying. The lock still
+    permits a deliberate switch to hardcoded pass after the protected window if the teammate target
+    is clearly better.
+  - Reset/active-pass paths clear the attack lock so stale ownership cannot leak across episodes or
+    pass lifecycles.
+
+- `ai_interface/hardcoded_attack.py`
+  - Added a near-Stage-3 bridge band: short staging carries are now reserved for possessions already
+    near the attacking envelope (`x≈17..36`, `|y|<=16`).
+  - Deep or wide possessions use `hc_attack_advance_*`: a direct controlled advance kick toward the
+    Stage-3 envelope instead of repeated short dribble segments from negative x.
+  - Direct hardcoded shots require a minimum attacking x (`x>=22`) so the bridge stops taking
+    speculative long shots from poor field positions.
+
+**Validation:**
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: focused hardcoded-supporter suite passed (`21 passed`). New tests cover attacking receive
+target clamps, rejection of deep teammates as final-pass targets, and deep hardcoded attack using
+advance instead of staging.
+
+---
+
+## 2026-06-30 — Post-receive finish lock + safer hardcoded pass gate
+
+Latest embedded inference after the catch-glue pass fix proved the pass mechanics were alive but the
+team behavior regressed: `hc_pass_fired=149`, `hardcoded_pass_received=86`, but goals fell to **8.0%**
+and kicks fell to **74** versus the passing-disabled fine-tuned baseline's **15.2%** and **273** kicks.
+The completed passes were not becoming finish attempts. Episodes with multiple received passes often
+timed out, while goal episodes were mostly not pass-assisted. The failure was control logic, not more
+reward shaping: after a pass receive, the gate could immediately re-evaluate geometry and enter
+another hardcoded pass instead of letting the receiver use the Stage-3 solo finisher.
+
+**Fixes:**
+
+- Added a real post-receive finish lock in `ai_interface/envs/JAL_env.py`.
+  - On `hardcoded_pass_received`, PPO is mapped to the receiver and `ball_claimant_id` is pinned to
+    that receiver.
+  - The lock suppresses hardcoded pass entry and keeps the receiver as the active PPO robot until it
+    fires a kick, loses the ball clearly to the teammate, expires, or the episode resets.
+  - The old `_claimant_follow_pass_cooldown_until` only blocked `pass_mode`; it did **not** force
+    receiver control. The new lock fixes the pass-ping-pong path directly.
+  - Gate diagnostics now surface `reason=post_receive_finish_lock`, remaining lock steps, previous
+    passer id, and receiver-ball distance.
+
+- Tightened the active 2v2 pass gate in `configs/ppo_jal_curriculum_config.json`.
+  - `claimant_follow_solo_lane_blocked_max`: `0.55 → 0.35` so passing happens only when the solo
+    lane is genuinely blocked.
+  - `claimant_follow_pass_lane_min`: `0.75 → 0.85` so the hardcoded pass lane must be cleaner.
+  - `claimant_follow_teammate_margin`: `0.35 → 0.45` so the receiver must be meaningfully better
+    than the carrier.
+  - `claimant_follow_post_receive_cooldown_steps`: `30 → 120`; this now also controls the finish
+    lock window, giving the receiver up to 12 seconds of PPO finish/recovery time.
+
+- Narrowed hardcoded receive geometry in `ai_interface/hardcoded_supporter.py` and
+  `ai_interface/hybrid_pass.py`.
+  - `SupporterConfig.max_receive_y_abs`: `22 → 14` to stop receive/pass targets near the touchline.
+  - Support candidate lateral offsets now use `±10/±6/±3` instead of `±12/±8/±4`.
+  - Fallback support lateral offset narrowed from `8` to `6`.
+  - `HardcodedPassCoordinator` now clamps both the receiver's initial pass target and defender-offset
+    lead target through the same receive band; lead passes can no longer re-expand to `y≈20-24`.
+
+**Why this is mathematically consistent with the inference:**
+
+- Latest pass target analysis: 149 fired passes had mean `abs(y)=11.49`, with **49** targets at
+  `abs(y)>18` and **47** at `abs(y)>20`. Since the goal mouth is centered and only about `±5` env
+  units high, these wide receives produce poor continuation angles and many
+  `ball_in_penalty_off_target` endings. Capping receive `|y|` at 14 keeps the supporter wide enough
+  to avoid the defender but not so wide that finish geometry is destroyed.
+- A 120-step finish window is 12 seconds (`0.1s/step`). That is deliberately larger than one align
+  cycle under the 2°/step turn cap: a worst-case 180° finish turn needs about 90 steps before the kick
+  fires, so the old 30-step cooldown could expire before the receiver had any realistic shot chance.
+
+**Validation:**
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py ai_interface/hybrid_pass.py ai_interface/hardcoded_supporter.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m json.tool configs/ppo_jal_curriculum_config.json
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: focused hardcoded-supporter suite passed (`16 passed`). `graphify update .` was run after the
+code changes.
+
+---
+
+## 2026-06-30 — Collision constraints + catch-glue pass align + lead pass (code, with passing re-enabled)
+
+Re-enabled the hardcoded pass overlay for the 2v2 stage (`claimant_follow_solo_lane_blocked_max:
+0.0 → 0.55`, the env default) and made three code changes so passing actually works under SSL rules.
+
+**1. SSL collision constraints (code, not reward).** SSL rules 8.4.2 (Crashing: closing speed on
+the line between two robots > 1.5 m/s = foul) and 8.4.1 (Pushing) are enforced at the
+movement-primitive layer rather than penalized in reward:
+- `basic_commands.goto` gained a **robot-proximity speed cap** (`_robot_proximity_speed_factor`):
+  when a dash heads *toward* another robot within `PROXIMITY_SLOW_DIST` (5·PLAYER_SIZE), speed ramps
+  down to a floor (0.18×) at contact. Applies to opponents (the SSL rule) **and** teammates (a
+  supporter must not barge the attacker — not an SSL foul but it wrecks our own play). Gated on
+  `obstacle_avoidance and include_player_obstacles`.
+- The RL attacker's `approach_ball` at `JAL_env.py` now passes `obstacle_avoidance=True` — it was
+  charging straight through the defender to reach the ball (avoidance defaulted off).
+
+**2. Catch-glue pass align (root-cause fix for hc_pass_fired≈0%).** The carrier's pass-align
+previously issued a bare `turn`, which spun the body off the **un-glued** ball; it fell out of the
+mouth, the kick gate failed, and passes almost never fired (smoke: 2328 requested / **0 fired**).
+`_carrier_pass_command` now mirrors the dribble GRAB: `dribble()` to face+`catch 0` (glue), a sticky
+`HybridPassState.carrier_caught` flag, a geometric full-error `turn` to aim while the glued ball
+revolves in the mouth, then a real `kick` on alignment. Smoke: **0 → ~30 fires per 6k steps.** A
+re-grab spin bug (a premature "glue slipped" reset re-entered GRAB on the glued, orbiting ball and
+spun forever) was removed — `carrier_caught` is sticky until the recover branch (ball gone) resets it.
+
+**3. Lead pass around a blocked defender.** `_lead_target_around_defender` (called once in `start()`):
+if an opponent sits on the ball→receiver lane (between them, within `2·PLAYER_SIZE+0.6`), the pass
+target is shifted perpendicular away from the blocker by the clearance needed (bounded 2–5 units),
+and the receiver follows the shifted target via `_receive_pose`. Lane clear → target unchanged.
+Limitation: computed once at pass start (not re-evaluated as the defender moves) to keep the
+carrier's aim target stable.
+
+All three smoke-tested in `sim-embedded`; runs clean, attacker still carries the ball, passes fire,
+goals still score. Real eval is the user's full inference run.
+
+---
+
+## 2026-06-30 — Stage renamed to 2v2 + passing-disabled solo-finisher fine-tune (SUCCESS)
+
+Renamed the hybrid stage `stage4_hardcoded_support_2v3` → **`stage4_hardcoded_support_2v2`** in
+`configs/ppo_jal_curriculum_config.json` (the live matchup is 2v2: 1 RL attacker + 1 hardcoded
+supporter vs goalie + 1 defender). Set top-level `load_model` →
+`final_models/stage3_complete.pt` and `save_path` → `models/ppo_jal_hybrid_support_2v2`.
+
+With the hardcoded pass system disabled (`claimant_follow_solo_lane_blocked_max: 0.0`), the frozen
+Stage-3 solo finisher dribbled until timeout and barely shot (11.0% goals, **37 kicks**, 48%
+`max_steps`, aim 0.18). Fine-tuning that checkpoint for 200k steps in the 2v2 env (reward overrides
+unchanged) fixed it: **15.2% goals (12/79), 273 kicks (7.4×), aim 0.33, bad-aim 46%→18%, timeouts
+48%→35%, reward −201→−135.** Training goal rate climbed 4.5%→7.0%→14.0%. No code changes — config
+only. See `docs/TRAINING.md` §67. The fine-tune scores by firing more well-aimed 10–15m shots, not
+by working the ball closer.
+
+---
+
+## 2026-06-30 — Hybrid pass gate tuning: align-timeout fix + selective pass entry
+
+### Problem
+
+Inference analysis of the `stage4_hardcoded_support_2v3_complete` checkpoint revealed two issues in
+the hardcoded pass coordinator (`ai_interface/hybrid_pass.py`):
+
+1. **~50% align_timeout**: `max_align_steps=48` was too small. With the server body-rotation cap of
+   2°/cycle (MAXMOMENT=±2, 20°/s @ 0.1 s/step), worst-case 180° correction needs
+   `ceil((180−5)/2) = 88` cycles. The old value only covered ~96°, causing ~half of all pass
+   attempts to time out before the carrier could face the pass lane.
+
+2. **Pass monopolising possession**: The permissive gate (`solo_lane_blocked_max=0.55`,
+   `pass_lane_min=0.65`, `teammate_margin=0.15`) triggered too eagerly. The hardcoded pass lifecycle
+   consumed ~45% of sim steps (carrier aligning + receiver holding), starving the PPO solo-finisher
+   which scores ~50% in its native stage. With passes firing every 4-5 steps on average, the solo
+   finisher got ~3 kick opportunities per 6,000 steps instead of the ~33 it should get.
+
+### Fix
+
+**[ai_interface/hybrid_pass.py](../ai_interface/hybrid_pass.py)**:
+- `max_align_steps: 48 → 110` — covers full 180° worst-case body rotation (88 cycles) plus margin
+  for ball drift and minor re-approach. Verified mechanically: align_timeout fell from 33 → 5
+  across 68 pass attempts.
+
+**[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py)**:
+- Added `claimant_follow_post_receive_cooldown_steps` constructor param (default 30).
+- After a `received` terminal, suppress re-pass for 30 sim steps so the new carrier (just received
+  the ball) gets at least one PPO solo-finish attempt before the gate can trigger again.
+- `_claimant_follow_pass_cooldown_until` tracked in state; reset to -1 on episode reset.
+- Added `hybrid_pass_max_align_steps` constructor param, forwarded to `HybridPassConfig` at init.
+
+**[ai_interface/trainers/ppo_jal_curriculum_trainer.py](../ai_interface/trainers/ppo_jal_curriculum_trainer.py)**:
+- Plumbed `claimant_follow_post_receive_cooldown_steps` and `hybrid_pass_max_align_steps` from
+  stage config via `_stage_or_top`.
+
+**[infer.py](../infer.py)**:
+- Same two params read from `stage_config` and forwarded to `JALTeamEnv`.
+
+**[configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json)**
+(`stage4_hardcoded_support_2v3`):
+- `claimant_follow_solo_lane_blocked_max: 0.55 → 0.40` — carrier must be genuinely blocked before
+  passing is considered.
+- `claimant_follow_pass_lane_min: 0.65 → 0.75` — pass lane must be clearly safe.
+- `claimant_follow_teammate_margin: 0.15 → 0.35` — teammate must be substantially better placed
+  than the carrier before the gate engages.
+- `claimant_follow_post_receive_cooldown_steps: 30` (new).
+- `hybrid_pass_max_align_steps: 110` (new).
+
+### Effect
+
+Probe comparison (stage3 solo-finisher checkpoint, `stage4_hardcoded_support_2v3`):
+
+| metric (per 1k steps)       | permissive gate | selective gate |
+|-----------------------------|-----------------|----------------|
+| PPO solo kicks              | 0.5             | 2.75 (+5.5×)   |
+| total shots (kick+hc_shot)  | 1.2             | 3.0 (+2.5×)    |
+| hc passes fired             | 4.8             | 4.25 (−12%)    |
+| avg_reward                  | −123.9          | −101.2         |
+| pass align_timeout share    | ~50%            | ~16%           |
+
+Passing now only fires when the carrier is genuinely blocked and a teammate is substantially better
+placed. The PPO solo-finisher gets the ball and shoots 2.5–5× more often.
+
+### Validation
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -c "import json; json.load(open('configs/ppo_jal_curriculum_config.json')); print('JSON valid')"
+# JSON valid
+```
+
+---
+
+## 2026-06-29 — Robot-agnostic solo-finish gate for 2v1 hybrid PPO
+
+### Problem
+
+The 2v1 hardcoded-support hybrid was still too brittle because the PPO scorer was pinned to
+TritonBots robot 1. When robot 2 received or won the ball, it could not become the learned
+Stage-3-style finisher. The opposite failure also existed: if the carrier's goal lane was blocked,
+the PPO policy still tried to solo-dribble instead of handing that possession to the hardcoded
+passing logic.
+
+### Fix
+
+Added a robot-agnostic claimant-follow mode in
+[ai_interface/envs/JAL_env.py](../ai_interface/envs/JAL_env.py):
+- `claimant_follow_robot_ids` defines the physical attacker pool, currently `[1, 2]`.
+- The single PPO action slot is remapped each step to the robot that should be the solo finisher.
+- A geometric gate chooses the mode:
+  - `solo_finish`: PPO controls the current carrier when its lane is not blocked, or no useful pass
+    exists.
+  - `hardcoded_pass`: if the carrier's goal lane is blocked, the teammate has a better continuation
+    lane, and the pass lane is open, PPO is held out and the hardcoded controller drives the carrier
+    to pass.
+- Per-robot dribble/kick/reward state is now allocated over the full follow pool so robot 1/2 swaps
+  do not lose macro state or hit missing dictionary keys.
+- `env.step()` now reports `active_robot_id`, `ppo_control_active`, and `claimant_follow` gate
+  details for debug inference and training logs.
+
+Updated the hardcoded supporter plumbing in
+[ai_interface/trainers/policy_control.py](../ai_interface/trainers/policy_control.py),
+[ai_interface/trainers/ppo_jal_curriculum_trainer.py](../ai_interface/trainers/ppo_jal_curriculum_trainer.py),
+and [infer.py](../infer.py):
+- `HardcodedSupporterCommandProvider` can now control the non-active robot from a pool instead of a
+  fixed robot id.
+- Trainer and inference loops call `set_active_robot_id()` before sending aux commands, so the
+  hardcoded side always owns the robot PPO is not currently driving.
+- The curriculum trainer stores PPO transitions only when `ppo_control_active=true`; hardcoded-pass
+  interlude rewards are accumulated into the next PPO-controlled transition, so PPO is trained only
+  on solo-finish decisions.
+
+Updated [configs/ppo_jal_curriculum_config.json](../configs/ppo_jal_curriculum_config.json):
+- enabled `claimant_follow_robot_ids: [1, 2]` on `stage4_hardcoded_support_2v3`;
+- added gate thresholds for blocked solo lane, open pass lane, teammate improvement margin, and
+  minimum pass distance;
+- set the hardcoded supporter `robot_pool_ids` to `[1, 2]`;
+- changed `load_model` to the latest local hybrid checkpoint
+  `models/ppo_jal_hybrid_support_2v1/stage4_hardcoded_support_2v3_complete.pt`.
+
+Added gate tests in [tests/test_hardcoded_supporter.py](../tests/test_hardcoded_supporter.py):
+- clear carrier lane keeps PPO on the carrier;
+- blocked carrier lane with an open teammate switches to hardcoded-pass mode and maps PPO to the
+  receiver as a non-trainable interlude.
+- regression coverage for the startup crash where hardcoded-pass mode zeroed all live primitives
+  for inactive PPO rows, causing `primitive_valid_mask disabled every primitive for a slot`.
+  Hardcoded-pass mode now leaves the runtime primitive mask sampleable because the sampled action is
+  ignored and not stored during the interlude.
+
+---
+
 ## 2026-06-29 — Hybrid supporter inference triage (theta units bug + frozen-scorer OOD)
 
 Diagnosed the two failed hybrid inference runs (`stage4_hardcoded_support_2v3`,
@@ -4319,3 +4964,288 @@ Smoke: 401 episodes, no Traceback/NaN; carry_urgency firing per math
   ("Carry urgency penalty -0.03 (rid=1 age=34 grace=25 total=0.27/2.25)");
   Fix A "Forcing embedded engine rebuild" fired 4× and the run continued.
 ```
+
+### Changes — Fix C: claimant-follow stale-sim false positives + debug logging
+
+The first robot-agnostic hybrid smoke (`20260629_233341_053084`) was stopped at 6,711 / 200,000
+steps because `frozen_state_stale_sim` dominated outcomes: 37 / 52 episodes (71.2%). The pattern was
+not consistent with a true embedded-sim freeze: many exits were short episodes dominated by
+`hardcoded_interlude_hold`, for example ep24 ended after 43 steps with `hardcoded_interlude_hold=76%`.
+
+Root cause: claimant-follow remaps the single PPO slot to one physical attacker each step by mutating
+`self.robot_ids = [active_robot_id]`. During a hardcoded-pass interlude the active PPO robot is
+intentionally held (`turn 0`) while the auxiliary hardcoded provider drives the other attacker. The
+frozen-state detector only checked `self.robot_ids`, so it could decide the sim was stale by observing
+only the held PPO slot and ball, ignoring the other controlled attacker.
+
+Fixes:
+
+- Added `JALTeamEnv._controlled_team_robot_ids()`. It returns the full `_robot_pool` (`[1, 2]`) when
+  claimant-follow is active, otherwise the normal `robot_ids`.
+- Updated frozen-state detection to check the full controlled pool in claimant-follow mode.
+- Updated robot out-of-bounds / teleport checks to use the same controlled pool.
+- Updated `SSLRuleTracker.update(...)` to receive the controlled pool, so supporter collisions and
+  touches are not missed when the PPO slot is remapped.
+- Added DEBUG-only claimant-follow gate logs whenever mode / active robot / carrier / receiver changes.
+- Added DEBUG-only frozen-terminal logs showing checked robot IDs, active robot, PPO-control state,
+  gate info, ball position, and playmode.
+- Changed `BaseTrainer` logging so `train_log.log` receives DEBUG records while the terminal remains
+  INFO-only. This preserves detailed stage-4 diagnostics without flooding the console.
+- Added regression coverage in `tests/test_hardcoded_supporter.py` for the full controlled-pool helper.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py ai_interface/trainers/base_trainer.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`8 passed`).
+
+### Changes — Fix D: claimant-follow command routing to physical robot IDs
+
+The follow-up smoke (`20260629_234305_835646`) still ended mostly with
+`frozen_state_stale_sim`: 80 / 110 episodes (72.7%). The new DEBUG logs showed almost every stale
+terminal occurred in `mode=hardcoded_pass`, `ppo_control=false`, with `active_robot_id=2`.
+
+Root cause: the previous fix made the frozen detector check both controlled attackers, but it did not
+fix command delivery. In claimant-follow mode the env mutates `self.robot_ids` to the single physical
+robot currently mapped to the PPO slot, for example `[2]`. `_action_to_commands()` therefore returned
+a compact one-command list such as `["turn 0"]`. The simulator command path is positional by uniform
+number: list index 0 commands robot 1, list index 1 commands robot 2. So when PPO was mapped to robot
+2 during a hardcoded-pass interlude, the env's intended receiver hold command was sent to robot 1
+instead. That could overwrite the auxiliary hardcoded carrier command, leaving both the ball and the
+pass carrier effectively stalled until the stale detector ended the episode.
+
+Fixes:
+
+- Added `JALTeamEnv._commands_for_current_robot_ids(...)`.
+- `_send_commands(...)` now pads compact env commands to simulator unum positions when
+  `robot_ids` is non-contiguous or dynamically remapped. Example: `robot_ids=[2]` plus `["turn 0"]`
+  becomes `[None, "turn 0"]`.
+- `_preprocess_commands_for_send(...)` now preserves `None` gaps instead of converting them to
+  `turn 0`, allowing the simulator sender to leave non-owned robots untouched.
+- Added regression coverage that active PPO robot 2 serializes as `[None, "turn 0"]`, not
+  `["turn 0"]`.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`9 passed`).
+
+### Changes — Fix E: possession-gated hardcoded-pass takeover
+
+The next embedded smoke (`20260630_001040_645855`) proved command routing was fixed but exposed a
+higher-level gate bug. Stale endings were still 47 / 59 episodes (79.7%), and the DEBUG lines showed
+they occurred in `mode=hardcoded_pass`, `ppo_control=false`, with `active_robot_id=2`. The hybrid gate
+was switching to hardcoded-pass mode from geometry alone: carrier lane blocked, teammate lane better,
+pass lane open. It did not require the carrier to actually have usable contact with the ball.
+
+Problem this solves:
+
+- If the carrier was still far from the ball, entering hardcoded-pass mode paused PPO recovery.
+- The PPO slot was held while the auxiliary hardcoded logic did not necessarily recover the loose
+  ball.
+- Ball and controlled attackers could stay nearly static until `frozen_state_stale_sim`.
+
+Fixes:
+
+- Added `JALTeamEnv._claimant_follow_carrier_ready_to_pass(...)`.
+- `_update_claimant_follow_mapping(...)` now enters `hardcoded_pass` only when the carrier is within
+  `kickable_dist + 0.25` env units of the ball. This matches the hardcoded supporter's existing
+  `_has_usable_ball(...)` tolerance.
+- If the geometric pass gate is favorable but the carrier is not physically ready, PPO remains in
+  `solo_finish`/recovery mode and the gate reason becomes `carrier_not_ready_to_pass`.
+- Gate diagnostics now include:
+  - `carrier_pass_ready`
+  - `carrier_ball_dist`
+  - `carrier_ball_in_reception_cone`
+- The gate does not require front-cone alignment. That is intentional: once the carrier has usable
+  ball contact, the hardcoded pass helper can settle/reorient before kicking.
+- Added regression coverage:
+  - blocked lane + carrier at ball still switches to `hardcoded_pass`;
+  - blocked lane + carrier far from ball stays PPO-controlled.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`10 passed`).
+
+Embedded smoke result after the fix (`20260630_001519_500935`):
+
+- stale endings: 47 / 59 (79.7%) -> 0 / 15 (0.0%);
+- goal rate: 2 / 15 (13.3%);
+- max-steps: 10 / 15 (66.7%);
+- action mix: `approach_ball=23%`, `dribble_to=70%`, `kick=3%`, `turn=2%`.
+
+The stale-freeze issue is fixed for the smoke. The remaining issue is performance/tactics: most
+episodes still time out, and the gate can flicker near contested ball contact. Next likely fix is
+hardcoded-pass hysteresis/timeout plus pass-event diagnostics, not more stale-sim handling.
+
+### Changes — Fix F: hardcoded pass lifecycle diagnostics
+
+Problem this solves:
+
+- `hardcoded_interlude_hold` proved that PPO was being paused for hardcoded control, but it did not
+  prove that a pass was actually fired, received, or converted into a shot.
+- During the improving Stage 4 hybrid run, goals often contained some hardcoded interlude time, but
+  the logs could not distinguish pass-assisted goals from solo finishes after gate flicker.
+- We need this diagnostic data without interrupting the active training run.
+
+Fixes:
+
+- Added passive event classification to `HardcodedSupporter`:
+  - `hc_support_move`
+  - `hc_receive_intercept`
+  - `hc_clearout_move`
+  - `hc_pass_settle`
+  - `hc_pass_align`
+  - `hc_pass_fired`
+  - `hc_shot_settle`
+  - `hc_shot_align`
+  - `hc_shot_fired`
+  - `hc_staging_settle`
+  - `hc_staging_align`
+  - `hc_staging_fired`
+- `HardcodedSupporterCommandProvider.last_event()` exposes the latest event label and details
+  (`robot_id`, `main_attacker_robot_id`, target, quality, power, command, ball).
+- Added `JALTeamEnv.record_external_action(...)`, which appends scripted-controller labels into
+  the existing per-episode `action distribution` log. This means future episode lines can include
+  hardcoded percentages like `hc_pass_fired=...%` and `hc_shot_fired=...%`.
+- Terminal `info` now includes `external_action_counts` and an `external_action_events_tail`, so
+  debug inference can summarize pass/shot lifecycle without scraping text logs.
+- PPO curriculum training now records auxiliary hardcoded events into both:
+  - the env episode action distribution;
+  - the trainer rolling action summary.
+- PPO inference now records the same auxiliary events into window/all action summaries and emits
+  per-episode hardcoded action counts at DEBUG level.
+
+This is instrumentation only. It does not change simulator commands, reward, masks, or control
+decisions. The active training process that was already running will not pick this up; the next
+training/inference process will.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/hardcoded_supporter.py ai_interface/trainers/policy_control.py ai_interface/trainers/ppo_jal_curriculum_trainer.py ai_interface/envs/JAL_env.py infer.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`11 passed`).
+
+### Changes — Fix G: env-owned hardcoded pass lifecycle
+
+Problem this solves:
+
+- The claimant-follow gate entered `hardcoded_pass`, but the same-team hardcoded supporter was still
+  running the generic `_finish_or_return()` behavior. That routine shoots first and only returns a
+  pass if the shot is poor, so forced-pass phases often produced `hc_shot_*`, `hc_support_move`, or
+  `hardcoded_interlude_hold` instead of actual `hc_pass_*` events.
+- Aux same-team commands were sent before `env.step()`, then the env sent the PPO command batch
+  afterward. During hardcoded pass interludes, this made command ownership ambiguous and could
+  overwrite the wrong robot.
+- The receiver could be near the ball but still not get PPO finishing control, because there was no
+  explicit stable-possession handoff after the pass.
+- Receive/recover movement needed robot obstacle avoidance, but treating the ball as an obstacle
+  makes the receiver detour around the ball it must collect.
+
+Fixes:
+
+- Added `ai_interface/hybrid_pass.py` with `HardcodedPassCoordinator`.
+  - Owns the full lifecycle: `prepare/fire -> receive -> stable handoff -> miss/intercept/timeout`.
+  - Emits carrier labels: `hc_pass_recover`, `hc_pass_settle`, `hc_pass_align`,
+    `hc_pass_fired`, `hc_pass_clearout`.
+  - Emits receiver labels: `hc_receive_hold`, `hc_receive_line`,
+    `hc_receive_reposition`, `hc_receive_settle`.
+  - Chooses pass power from a decaying-ball model using `BALL_DECAY=0.94` and the
+    `4 m/s = 4 env units/step` ball-speed cap.
+- Integrated the coordinator into `JALTeamEnv`.
+  - While a hardcoded pass lifecycle is active, the env emits a positional command batch for both
+    attackers, so carrier and receiver act in the same simulator cycle.
+  - PPO transitions remain skipped during the interlude via the existing
+    `ppo_control_active=false` path.
+  - PPO is handed to the receiver only after stable front-cone possession for multiple frames.
+  - Miss, intercept, missing-pose, or timeout returns control to PPO recovery/solo-finish mode.
+- Suspended `HardcodedSupporterCommandProvider` while env-owned hardcoded pass is active.
+  - Prevents pre-step same-team aux commands from fighting the env pass coordinator.
+  - Prevents misleading `hc_support_move` counts during a pass lifecycle.
+- Extended `goto()` / `approach_ball()` obstacle controls.
+  - Movement can avoid players while ignoring the ball obstacle.
+  - The pass settle and receive paths use robot avoidance without detouring around the ball.
+- Added `docs/PASS_TO.md` documenting the complete hardcoded pass implementation.
+- Added regression coverage:
+  - hardcoded pass interlude emits `hc_pass_*` and `hc_receive_*`, not `hc_shot_*`;
+  - successful receive maps PPO to the receiving robot;
+  - `goto()` can avoid player obstacles without treating the ball as an obstacle.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/hybrid_pass.py ai_interface/envs/JAL_env.py ai_interface/utils/basic_commands.py ai_interface/trainers/policy_control.py infer.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`14 passed`).
+
+### Changes — Fix H: Stage-3-gated hardcoded attack bridge
+
+Problem this solves:
+
+- The hybrid 2v2 setup was handing the pass receiver to the Stage-3 PPO finisher immediately after
+  a stable receive, even when the ball was outside the exact Stage-3 training envelope
+  (`x=[25,34]`, `|y|<=10`).
+- Latest inference showed many hardcoded passes were received in midfield or wide lanes
+  (`target_x < 25` or `|target_y| > 10`), after which PPO wandered, over-dribbled, or aimed badly.
+  That is not surprising: the Stage-3 model was trained as a close-range solo finisher against a
+  defender + goalie, not as a full-field receiver/attacker.
+- The old strategic pass gate still behaved like "pass only when the carrier lane is blocked",
+  instead of "pass whenever the teammate option is materially better and the pass lane is open."
+
+Fixes:
+
+- Added `ai_interface/hardcoded_attack.py` with `HardcodedAttackCoordinator`.
+  - Checks whether the current carrier state is truly Stage-3-ready before PPO takes over:
+    `25 <= ball_x <= 34`, `|ball_y| <= 10`, controlled/kickable ball in the front reception cone,
+    and minimum shot quality.
+  - If not Stage-3-ready, the hardcoded bridge owns the carrier instead of PPO.
+  - If a high-quality hardcoded shot is available, it shoots through the same physical front-cone
+    checks.
+  - Otherwise it stages the ball using short controlled moves: forward `{4,6,8}` and lateral
+    `{-4,0,+4}`, with each candidate vector capped to the `8.5` env-unit SSL dribble safety limit.
+  - Candidate staging points are scored by shot quality, Stage-3-envelope progress, lane clearance,
+    goalward progress, and center bias.
+- Integrated the bridge into `JALTeamEnv`.
+  - Post-pass finish lock now chooses:
+    - `solo_finish`/PPO only when Stage-3-ready;
+    - `hardcoded_attack` when the receiver has the ball but is outside Stage-3 conditions.
+  - Normal carrier mapping now also uses `hardcoded_attack` when a controlled carrier is outside
+    Stage-3 conditions and no better hardcoded pass is active.
+  - Hardcoded pass gating no longer requires the carrier shot lane to be below a fixed blocked-lane
+    threshold; it passes when the teammate option is better by the configured margin and the pass
+    lane is clear.
+  - `hardcoded_attack` events are recorded into the existing action distribution/debug pipeline
+    (`hc_attack_recover`, `hc_attack_stage`, `hc_attack_shot_*`, `hc_attack_clearout`).
+- Updated `HardcodedSupporterCommandProvider` suspension so the aux supporter does not fight the
+  env-owned hardcoded attack interlude.
+- Added regression tests for:
+  - outside-Stage-3 post-receive states using `hardcoded_attack`;
+  - inside-Stage-3 post-receive states handing to PPO;
+  - short staging targets staying under the dribble cap;
+  - the existing pass/receive handoff still working under the new Stage-3 gate.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/hardcoded_attack.py ai_interface/envs/JAL_env.py ai_interface/trainers/policy_control.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`19 passed`).

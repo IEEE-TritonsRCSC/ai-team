@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -40,7 +40,7 @@ class SupporterConfig:
     field_margin: float = 2.0
     min_pass_distance: float = 8.0
     max_receive_x_abs: float = 34.0
-    max_receive_y_abs: float = 22.0
+    max_receive_y_abs: float = 14.0
     lane_block_dist: float = 2.6
     opponent_keepout: float = 3.0
     teammate_keepout: float = 5.0
@@ -49,6 +49,7 @@ class SupporterConfig:
     receive_intercept_radius: float = 5.0
     support_hysteresis_steps: int = 10
     shoot_min_quality: float = 0.33
+    shoot_min_lane_clear: float = 0.70
     return_pass_min_quality: float = 0.58
     clearout_after_touch_steps: int = 18
     pass_power: float = 65.0
@@ -207,14 +208,17 @@ class HardcodedSupporter(Player):
         self._latched_support: Point | None = None
         self._latched_until_count: int = -1
         self._last_touch_count: int = -10_000
+        self.last_event: Dict[str, Any] = {"label": "hc_support_init"}
 
     def action(self, game_state: GameState) -> str:
         """Return one simulator command for the current world state."""
 
         if game_state is None or getattr(game_state, "ball_pos", None) is None:
+            self._set_event("hc_support_no_state")
             return "turn 0"
         self_pose = _extract_pose(game_state, self.teamname, self.unum)
         if self_pose is None:
+            self._set_event("hc_support_no_pose")
             return "turn 0"
 
         ball = (float(game_state.ball_pos[0]), float(game_state.ball_pos[1]))
@@ -234,13 +238,34 @@ class HardcodedSupporter(Player):
 
         intercept = self._receive_intercept(self_pose, ball)
         if intercept is not None:
-            return self._move_to_receive_pose(self_pose, intercept, ball, game_state)
+            cmd = self._move_to_receive_pose(self_pose, intercept, ball, game_state)
+            self._set_event(
+                "hc_receive_intercept",
+                target=intercept,
+                command=cmd,
+                ball=ball,
+            )
+            return cmd
 
         if self._recently_touched(game_state):
             target = self._clearout_target(ball, main_pose)
+            label = "hc_clearout_move"
         else:
             target = self._support_target(self_pose, ball, main_pose, opponent_poses, goalie_poses, game_state)
-        return self._move_to_receive_pose(self_pose, target, ball, game_state)
+            label = "hc_support_move"
+        cmd = self._move_to_receive_pose(self_pose, target, ball, game_state)
+        self._set_event(label, target=target, command=cmd, ball=ball)
+        return cmd
+
+    def _set_event(self, label: str, **details: Any) -> None:
+        """Store a compact diagnostic for the last hardcoded-supporter command."""
+
+        self.last_event = {
+            "label": str(label),
+            "robot_id": int(self.unum),
+            "main_attacker_robot_id": int(self.main_attacker_robot_id),
+            **details,
+        }
 
     def _update_ball_history(self, count: int, ball: Point) -> None:
         """Track recent ball samples once per simulator cycle."""
@@ -271,16 +296,34 @@ class HardcodedSupporter(Player):
         """Shoot if possible, otherwise return the ball to the learned attacker."""
 
         shot_target, shot_quality = self._best_shot(ball, opponent_poses, goalie_poses)
-        if shot_quality >= self.config.shoot_min_quality:
-            return self._kick_or_settle(self_pose, ball, shot_target, self.config.shoot_power, game_state)
+        shot_lane = lane_clear_quality(
+            ball,
+            shot_target,
+            opponent_poses,
+            block_dist=self.config.lane_block_dist,
+        )
+        if shot_quality >= self.config.shoot_min_quality and shot_lane >= self.config.shoot_min_lane_clear:
+            return self._kick_or_settle(
+                self_pose, ball, shot_target, self.config.shoot_power, game_state,
+                label_prefix="hc_shot",
+                quality=shot_quality,
+            )
 
         if main_pose is not None:
             lane_q = lane_clear_quality(ball, main_pose, opponent_poses, block_dist=self.config.lane_block_dist)
             if lane_q >= self.config.return_pass_min_quality and distance(ball, main_pose) >= self.config.min_pass_distance:
-                return self._kick_or_settle(self_pose, ball, main_pose[:2], self.config.pass_power, game_state)
+                return self._kick_or_settle(
+                    self_pose, ball, main_pose[:2], self.config.pass_power, game_state,
+                    label_prefix="hc_pass",
+                    quality=lane_q,
+                )
 
         staging = self._local_staging_point(ball, opponent_poses, goalie_poses)
-        return self._kick_or_settle(self_pose, ball, staging, 35.0, game_state)
+        return self._kick_or_settle(
+            self_pose, ball, staging, 35.0, game_state,
+            label_prefix="hc_staging",
+            quality=shot_quality,
+        )
 
     def _kick_or_settle(
         self,
@@ -289,16 +332,27 @@ class HardcodedSupporter(Player):
         target: Sequence[float],
         power: float,
         game_state: GameState,
+        *,
+        label_prefix: str,
+        quality: float,
     ) -> str:
         """Kick through the physical front cone, or move to a legal contact pose."""
 
         target_angle = math.atan2(float(target[1]) - self_pose[1], float(target[0]) - self_pose[0])
         cmd = self.kick(target_angle, self_pose, ball, kick_power=int(round(power)))
         if cmd != "failed":
+            self._set_event(
+                f"{label_prefix}_fired" if cmd.startswith("kick") else f"{label_prefix}_align",
+                target=(float(target[0]), float(target[1])),
+                quality=float(quality),
+                power=float(power),
+                command=cmd,
+                ball=ball,
+            )
             return cmd
 
         contact = self._contact_pose_for_target(ball, target)
-        return self.goto(
+        cmd = self.goto(
             contact[0],
             contact[1],
             self_pose,
@@ -308,6 +362,16 @@ class HardcodedSupporter(Player):
             speed=self.config.settle_speed,
             detour_margin=1.0,
         )
+        self._set_event(
+            f"{label_prefix}_settle",
+            target=(float(target[0]), float(target[1])),
+            contact_pose=contact,
+            quality=float(quality),
+            power=float(power),
+            command=cmd,
+            ball=ball,
+        )
+        return cmd
 
     def _contact_pose_for_target(self, ball: Point, target: Sequence[float]) -> Pose:
         """Return a pose behind the ball relative to the target direction."""
@@ -387,7 +451,7 @@ class HardcodedSupporter(Player):
         best_point = self._fallback_support(ball)
 
         for forward in (8.0, 12.0, 16.0, 20.0):
-            for lateral in (-12.0, -8.0, -4.0, 4.0, 8.0, 12.0):
+            for lateral in (-10.0, -6.0, -3.0, 3.0, 6.0, 10.0):
                 point = (ball[0] + sign * forward, ball[1] + lateral)
                 point = self._clamp_support_point(point)
                 if not legal_support_point(point, self.side, self.config):
@@ -474,7 +538,7 @@ class HardcodedSupporter(Player):
         """Return a safe fallback support point when no candidate scores well."""
 
         sign = 1.0 if self.side == "left" else -1.0
-        lateral = -8.0 if ball[1] > 0.0 else 8.0
+        lateral = -6.0 if ball[1] > 0.0 else 6.0
         return self._clamp_support_point((ball[0] + sign * 12.0, ball[1] + lateral))
 
     def _clamp_support_point(self, point: Point) -> Point:

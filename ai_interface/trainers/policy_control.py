@@ -318,25 +318,63 @@ class HardcodedSupporterCommandProvider:
         main_attacker_robot_id: int = 1,
         opponent_team_name: str = "TeamB",
         opponent_goalie_robot_ids: Optional[list[int]] = None,
+        robot_pool_ids: Optional[list[int]] = None,
     ):
         from ai_interface.hardcoded_supporter import HardcodedSupporter
 
         self.team_name = team_name
+        self.robot_pool_ids = [int(rid) for rid in (robot_pool_ids or [])]
+        if not self.robot_pool_ids:
+            self.robot_pool_ids = sorted({int(robot_id), int(main_attacker_robot_id)})
         self.robot_id = int(robot_id)
+        self.main_attacker_robot_id = int(main_attacker_robot_id)
         self.num_robots = 1
         self._supporter = HardcodedSupporter(
             teamname=team_name,
             unum=self.robot_id,
             side=side,
-            main_attacker_robot_id=int(main_attacker_robot_id),
+            main_attacker_robot_id=self.main_attacker_robot_id,
             opponent_team_name=opponent_team_name,
             opponent_goalie_robot_ids=opponent_goalie_robot_ids or [1],
+        )
+        self._suspended = False
+
+    def set_active_robot_id(self, active_robot_id: Optional[int]) -> None:
+        """Control the non-active robot when the single PPO slot follows a pool."""
+
+        if active_robot_id is None or len(self.robot_pool_ids) < 2:
+            return
+        active = int(active_robot_id)
+        candidates = [rid for rid in self.robot_pool_ids if rid != active]
+        if not candidates:
+            return
+        self.robot_id = int(candidates[0])
+        self.main_attacker_robot_id = active
+        self._supporter.unum = self.robot_id
+        self._supporter.main_attacker_robot_id = self.main_attacker_robot_id
+
+    def set_claimant_follow_info(self, info: Optional[dict]) -> None:
+        """Suspend aux support while the env-owned hardcoded pass interlude runs."""
+
+        info = dict(info or {})
+        self._suspended = (
+            str(info.get("mode", "")) in {"hardcoded_pass", "hardcoded_attack"}
+            and not bool(info.get("ppo_control_active", True))
         )
 
     def _slot_list(self, cmd: str) -> list:
         return [None] * (self.robot_id - 1) + [cmd]
 
+    def last_event(self) -> dict:
+        """Return diagnostics for the last hardcoded-supporter command."""
+
+        if self._suspended:
+            return {}
+        return dict(getattr(self._supporter, "last_event", {}) or {})
+
     def predict_commands(self, game_state: GameState) -> list:
+        if self._suspended:
+            return [None] * max(self.robot_pool_ids or [self.robot_id])
         if game_state is None:
             return self._slot_list("turn 0")
         return self._slot_list(self._supporter.action(game_state))
@@ -575,6 +613,7 @@ def build_aux_team_command_providers(
                 main_attacker_robot_id=int(spec_data.get("main_attacker_robot_id", 1)),
                 opponent_team_name=str(spec_data.get("opponent_team_name", "TeamB")),
                 opponent_goalie_robot_ids=[int(rid) for rid in spec_data.get("opponent_goalie_robot_ids", [1])],
+                robot_pool_ids=[int(rid) for rid in spec_data.get("robot_pool_ids", [])],
             )
             continue
 

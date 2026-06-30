@@ -12,6 +12,93 @@ from constants.field_constants import *
 from .algo_utils import normalize_angle
 
 
+# --- Robot-proximity speed cap (SSL crashing/pushing avoidance) ------------
+# SSL rules 8.4.2 (Crashing) and 8.4.1 (Pushing) penalize a robot that closes on
+# another robot too fast. Rather than penalize it in the reward, we enforce it as
+# a hard code constraint at the movement-primitive layer: when a goto/approach is
+# heading *toward* another robot that is close, scale the dash speed down so the
+# closing speed stays low. The cap is enforced on EVERY dash that targets another
+# robot's vicinity, independent of path-detour obstacle avoidance, so even
+# full-speed pursuit (defender intercept) cannot crash. Only the keeper opts out
+# (it must be free to dive across a crowded mouth). All distances are in
+# field/position units (PLAYER_SIZE = 0.9).
+#
+# OPPONENTS get the strict cap (the SSL rule): slow from a long way out, ramping
+# almost to a stop at contact. TEAMMATES get a gentle cap that only bites in
+# genuine close quarters with a high floor — enough that a supporter never *barges*
+# the attacker, but NOT so much that an attacker a few units ahead pins the
+# supporter in place (that wide-cone full-stop is what made the second attacker sit
+# still until the first one cleared out, and what made robots freeze). The floors
+# are non-zero on purpose so two robots can never deadlock — they always creep.
+PROXIMITY_CONTACT_DIST = 2.0 * PLAYER_SIZE     # at/below this the robots are touching
+PROXIMITY_FORWARD_COS = math.cos(math.radians(75.0))  # only slow for robots ahead of travel
+# Opponents — crash/push prevention, but stay fast until the final approach so a
+# defender can actually press/intercept. We decelerate over the last ~1.7 units
+# rather than from a long way out (the wide 5·PLAYER_SIZE start made intercepts
+# sluggish); the ramp + floor still keep the contact closing speed low.
+PROXIMITY_SLOW_DIST = 3.8 * PLAYER_SIZE        # start slowing this far from an opponent
+PROXIMITY_MIN_SPEED_FACTOR = 0.10              # near-stop at contact (still creeps, no deadlock)
+# Teammates — light touch so support runs are not throttled.
+PROXIMITY_TEAMMATE_SLOW_DIST = 2.6 * PLAYER_SIZE  # only slow when quite close to a teammate
+PROXIMITY_TEAMMATE_MIN_FACTOR = 0.45              # gentle: ease past, never pin/freeze
+
+# On the final approach to a destination we go straight in and let the proximity
+# cap decelerate us, rather than recomputing a left/right detour every cycle. That
+# side-flip is what made the attacker visibly vibrate when reaching a contested
+# loose ball, so detours are only planned when the target is still farther than this.
+DETOUR_SKIP_DIST = 3.0 * PLAYER_SIZE
+
+
+def _robot_proximity_speed_factor(origin, travel_unit, game_state, self_pose) -> float:
+    """Return a [floor, 1.0] multiplier for the dash speed when closing on a robot.
+
+    Scans every other robot in ``game_state``; if one is ahead within the forward
+    cone and inside the slow radius, the speed is ramped down linearly toward a
+    floor at ``PROXIMITY_CONTACT_DIST``. The tightest (smallest) factor wins.
+    Robots behind or beside us do not slow travel — only ones we are closing on.
+    Opponents use the strict radius/floor (SSL crash rule); teammates use a much
+    gentler radius/floor so support runs are eased past, never pinned. The floors
+    are non-zero so two robots cannot deadlock to a permanent freeze.
+    """
+    origin = _as_float_array(origin)
+    travel_unit = _as_float_array(travel_unit)
+    robot_poses = getattr(game_state, "robot_poses", None)
+    if robot_poses is None:
+        return 1.0
+
+    # Identify our own team so teammates can be treated more gently than opponents.
+    self_team = None
+    for team, team_robots in robot_poses.items():
+        for robot in team_robots:
+            pose = _as_float_array(robot[int(next(iter(robot.keys())))])
+            if np.isclose(pose, self_pose).all():
+                self_team = team
+                break
+        if self_team is not None:
+            break
+
+    factor = 1.0
+    for team, team_robots in robot_poses.items():
+        is_teammate = team == self_team
+        slow_dist = PROXIMITY_TEAMMATE_SLOW_DIST if is_teammate else PROXIMITY_SLOW_DIST
+        floor = PROXIMITY_TEAMMATE_MIN_FACTOR if is_teammate else PROXIMITY_MIN_SPEED_FACTOR
+        span = max(slow_dist - PROXIMITY_CONTACT_DIST, 1e-6)
+        for robot in team_robots:
+            pose = _as_float_array(robot[int(next(iter(robot.keys())))])
+            to_robot = pose[:2] - origin
+            dist = float(np.linalg.norm(to_robot))
+            if dist <= 1e-6 or dist >= slow_dist:
+                continue
+            if np.isclose(pose, self_pose).all():
+                continue  # skip self
+            # Only slow if the robot is ahead of us in the direction we are moving.
+            if float(np.dot(to_robot / dist, travel_unit)) < PROXIMITY_FORWARD_COS:
+                continue
+            ramp = (dist - PROXIMITY_CONTACT_DIST) / span
+            factor = min(factor, float(np.clip(ramp, floor, 1.0)))
+    return factor
+
+
 def _as_float_array(value: np.ndarray | Tuple | List) -> np.ndarray:
     """Normalize vector-like inputs at function boundaries."""
     return np.asarray(value, dtype=float)
@@ -34,9 +121,15 @@ def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> 
 
 def _select_detour(origin: np.ndarray, destination: np.ndarray,
                    obstacles: Iterable[tuple[np.ndarray, float]],
-                   detour_margin: float) -> np.ndarray | None:
+                   detour_margin: float,
+                   heading: float | None = None) -> np.ndarray | None:
     """
     Pick a single waypoint that skirts around the first blocking obstacle.
+
+    When ``heading`` (the robot's current facing, radians) is supplied, a near-tie
+    between the left and right candidate is broken toward the side the robot is
+    already turned toward. Without it the two sides have almost-equal path cost and
+    floating-point noise flips the choice every cycle, which reads as a vibration.
     """
     origin = _as_float_array(origin)
     destination = _as_float_array(destination)
@@ -65,6 +158,11 @@ def _select_detour(origin: np.ndarray, destination: np.ndarray,
             if cand_dist < radius * 0.9:
                 continue
             cost = np.linalg.norm(cand - origin) + np.linalg.norm(destination - cand)
+            # Bias toward the side we are already heading so the choice is stable.
+            if heading is not None:
+                bearing = math.atan2(cand[1] - origin[1], cand[0] - origin[0])
+                turn_needed = abs(normalize_angle(bearing - heading))
+                cost += turn_needed * PLAYER_SIZE
             if best_cost is None or cost < best_cost:
                 best = cand
                 best_cost = cost
@@ -73,16 +171,20 @@ def _select_detour(origin: np.ndarray, destination: np.ndarray,
 
 def build_avoid_points(game_state, self_pose,
                        ball_radius: float = KICKABLE_MARGIN,
-                       player_radius: float = 1.0) -> list[tuple[float, float, float]]:
+                       player_radius: float = 1.0,
+                       include_ball: bool = True,
+                       include_players: bool = True) -> list[tuple[float, float, float]]:
     """
     Build avoid points for a player, skipping itself.
     """
     self_pose = _as_float_array(self_pose)
     avoid_points = []
     ball_pos = getattr(game_state, "ball_pos", None)
-    if ball_pos is not None:
+    if include_ball and ball_pos is not None:
         ball_pos = _as_float_array(ball_pos)
         avoid_points.append((ball_pos[0], ball_pos[1], ball_radius))
+    if not include_players:
+        return avoid_points
     for other_team, team_robots in game_state.robot_poses.items():
         for robot in team_robots:
             other_unum = int(next(iter(robot.keys())))
@@ -96,7 +198,10 @@ def build_avoid_points(game_state, self_pose,
 def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
          margin: float = 0.1, theta: float | None = None, speed: float = 100.0,
          detour_margin: float = 1.5, is_goalie: bool = False,
-         obstacle_avoidance: bool = True) -> str:
+         obstacle_avoidance: bool = True,
+         include_ball_obstacle: bool = True,
+         include_player_obstacles: bool = True,
+         crash_speed_cap: bool = True) -> str:
     """
     Create a `dash` or `turn` command to move toward a destination.
 
@@ -108,10 +213,20 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
     self_pose = _as_float_array(self_pose)
     origin = _as_float_array(self_pose[:2])
     destination = _as_float_array([x, y])
+    direct_distance = float(np.linalg.norm(destination - origin))
+    # Only plan a left/right detour while the target is still far away. On the
+    # final approach we go straight in and let the proximity cap decelerate us;
+    # recomputing the detour side every cycle is what made the robot vibrate when
+    # reaching a contested loose ball.
     avoid_points = []
-    if obstacle_avoidance:
+    if obstacle_avoidance and direct_distance >= DETOUR_SKIP_DIST:
         avoid_points = build_avoid_points(
-            game_state, self_pose, ball_radius=0.215, player_radius=0.9
+            game_state,
+            self_pose,
+            ball_radius=0.215,
+            player_radius=0.9,
+            include_ball=include_ball_obstacle,
+            include_players=include_player_obstacles,
         )
 
     if avoid_points:
@@ -124,7 +239,8 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
             assert length == 3, "Each avoid point must be a tuple of (x, y, radius)"
             ox, oy, radius = item[0], item[1], item[2]
             obstacles.append((_as_float_array([ox, oy]), float(radius)))
-        waypoint = _select_detour(origin, destination, obstacles, detour_margin)
+        waypoint = _select_detour(origin, destination, obstacles, detour_margin,
+                                  heading=float(self_pose[2]))
         if waypoint is not None:
             destination = waypoint
 
@@ -138,12 +254,22 @@ def goto(self_pose: np.ndarray | Tuple | List, x: float, y: float, game_state,
             return "done"
     if not is_goalie:
         speed = min(speed, max(distance * (1 / PLAYER_DECAY - 1) / dt, 20))
+    # SSL crashing/pushing constraint: slow down when closing on another robot.
+    # Enforced on every player-aware dash, independent of path detouring, so even
+    # full-speed pursuit (defender intercept) cannot crash. Only the keeper opts
+    # out via crash_speed_cap=False, since it must dive freely across the mouth.
+    if crash_speed_cap and include_player_obstacles:
+        travel_unit = (destination - origin) / distance
+        speed *= _robot_proximity_speed_factor(origin, travel_unit, game_state, self_pose)
     return f"dash {speed} {angle}"
 
 
 def approach_ball(self_pose: np.ndarray | Tuple | List, game_state,
                   margin: float = 1.0, theta: float | None = None, speed: float = 100.0,
-                  is_goalie: bool = False) -> str:
+                  is_goalie: bool = False,
+                  obstacle_avoidance: bool = False,
+                  avoid_ball: bool = False,
+                  avoid_players: bool = True) -> str:
     """
     Dash or turn toward the ball from ``game_state.ball_pos`` without obstacle avoidance.
 
@@ -153,9 +279,12 @@ def approach_ball(self_pose: np.ndarray | Tuple | List, game_state,
     ball_pos = getattr(game_state, "ball_pos", None)
     if ball_pos is None:
         raise ValueError("approach_ball requires game_state.ball_pos")
+    self_pose_arr = _as_float_array(self_pose)
     ball_pos = _as_float_array(ball_pos)
+    if theta is None:
+        theta = float(np.arctan2(ball_pos[1] - self_pose_arr[1], ball_pos[0] - self_pose_arr[0]))
     return goto(
-        self_pose,
+        self_pose_arr,
         float(ball_pos[0]),
         float(ball_pos[1]),
         game_state,
@@ -163,7 +292,9 @@ def approach_ball(self_pose: np.ndarray | Tuple | List, game_state,
         theta=theta,
         speed=speed,
         is_goalie=is_goalie,
-        obstacle_avoidance=False,
+        obstacle_avoidance=obstacle_avoidance,
+        include_ball_obstacle=avoid_ball,
+        include_player_obstacles=avoid_players,
     )
 
 

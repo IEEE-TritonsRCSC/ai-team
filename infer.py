@@ -786,7 +786,7 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         global_dim=int(config.get("global_dim", 6)),
         per_agent_dim=int(config.get("per_agent_dim", 10)),
         d_ctx=int(config.get("d_ctx", 7)),
-        max_steps=int(config.get("max_steps", 300)),
+        max_steps=int(getattr(args, "max_steps_per_episode", None) or config.get("max_steps", 300)),
         debug=bool(args.debug_infer),
         invalid_action_penalty=float(stage_config.get("invalid_action_penalty", 0.2)),
         disabled_actions=list(stage_config.get("disabled_actions", [])),
@@ -800,6 +800,17 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         random_spawn_theta_range_deg=tuple(stage_config.get("random_spawn_theta_range_deg", [-45.0, 45.0])),
         ball_action_recovery=bool(stage_config.get("ball_action_recovery", False)),
         ball_claimant_robot_ids=stage_config.get("ball_claimant_robot_ids"),
+        claimant_follow_robot_ids=stage_config.get("claimant_follow_robot_ids"),
+        claimant_follow_solo_lane_blocked_max=float(stage_config.get("claimant_follow_solo_lane_blocked_max", 0.55)),
+        claimant_follow_pass_lane_min=float(stage_config.get("claimant_follow_pass_lane_min", 0.65)),
+        claimant_follow_teammate_margin=float(stage_config.get("claimant_follow_teammate_margin", 0.15)),
+        claimant_follow_min_pass_distance=float(stage_config.get("claimant_follow_min_pass_distance", 8.0)),
+        claimant_follow_post_receive_cooldown_steps=int(stage_config.get("claimant_follow_post_receive_cooldown_steps", 30)),
+        hybrid_pass_max_align_steps=(
+            int(stage_config["hybrid_pass_max_align_steps"])
+            if stage_config.get("hybrid_pass_max_align_steps") is not None
+            else None
+        ),
         ball_claimant_switch_margin=float(stage_config.get("ball_claimant_switch_margin", 0.75)),
         turn_stall_limit=int(stage_config.get("turn_stall_limit", 12)),
         turn_stall_displacement=float(stage_config.get("turn_stall_displacement", 0.05)),
@@ -933,6 +944,7 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                 main_attacker_robot_id=int(spec.get("main_attacker_robot_id", 1)),
                 opponent_team_name=str(spec.get("opponent_team_name", opponent_goalie_team or "TeamB")),
                 opponent_goalie_robot_ids=[int(rid) for rid in spec.get("opponent_goalie_robot_ids", [1])],
+                robot_pool_ids=[int(rid) for rid in spec.get("robot_pool_ids", [])],
             ))
             _SUMMARY_LOG.info(
                 "Aux controller: hardcoded_supporter team=%s robot_id=%d main=%d opponent=%s",
@@ -1015,6 +1027,8 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
     WINDOW = 20
     shot_probe_events: list[dict] = []
     episode_shot_probe_events: list[dict] = []
+    hardcoded_shot_terminal_total: Counter = Counter()
+    hardcoded_last_shot_terminal_total: Counter = Counter()
 
     # Per-step diagnostic trace (debug only) — one JSON line per step capturing
     # the turn-vs-kick decision so we can confirm/deny the "continuous turning"
@@ -1053,8 +1067,23 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         if getattr(env, "_cached_game_state", None) is not None:
             for aux_ctrl in aux_controllers:
                 try:
+                    if hasattr(aux_ctrl, "set_active_robot_id"):
+                        aux_ctrl.set_active_robot_id(
+                            getattr(env, "_active_robot_id", None)
+                        )
+                    if hasattr(aux_ctrl, "set_claimant_follow_info"):
+                        aux_ctrl.set_claimant_follow_info(
+                            getattr(env, "_claimant_follow_gate_info", {})
+                        )
                     aux_cmds = aux_ctrl.predict_commands(env._cached_game_state)
                     env.networker.execute_ai_output(aux_cmds, aux_ctrl.team_name)
+                    if hasattr(aux_ctrl, "last_event"):
+                        event = aux_ctrl.last_event()
+                        label = str(event.get("label", "") or "")
+                        if label:
+                            env.record_external_action(label, event)
+                            actions_total[label] += 1
+                            actions_window[label] += 1
                 except Exception as e:
                     _SUMMARY_LOG.debug("Aux controller command send failed: %s", e)
 
@@ -1194,6 +1223,11 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                     "kick_retarget_quality_before": robot_info.get("kick_retarget_quality_before"),
                     "kick_blocked_bad_aim": bool(robot_info.get("kick_blocked_bad_aim", False)),
                     "kick_blocked_bad_reception": bool(robot_info.get("kick_blocked_bad_reception", False)),
+                    "kick_defender_lane_clear": robot_info.get("kick_defender_lane_clear"),
+                    "kick_blocked_defender_lane": bool(robot_info.get("kick_blocked_defender_lane", False)),
+                    "hardcoded_lane_clear": robot_info.get("lane_clear"),
+                    "hardcoded_nearest_blocker": robot_info.get("nearest_blocker"),
+                    "hardcoded_blocked_target": robot_info.get("blocked_target"),
                     "ball_in_reception_cone": bool(robot_info.get("ball_in_reception_cone", False)),
                     "kick_aim_quality": robot_info.get("kick_aim_quality"),
                     "kick_predicted_y_at_goal_line": robot_info.get("kick_predicted_y_at_goal_line"),
@@ -1223,6 +1257,28 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
                 episode_shot_probe_events[-1]["terminal_kick"] = True
             outcomes.append(reason)
             episode_rewards.append(total_reward)
+            external_counts = info.get("external_action_counts", {}) if isinstance(info, dict) else {}
+            if external_counts:
+                _SUMMARY_LOG.debug(
+                    "Episode %d hardcoded action counts: %s",
+                    episode_count,
+                    " ".join(f"{k}={v}" for k, v in sorted(external_counts.items())),
+                )
+            hardcoded_terminal = (
+                info.get("hardcoded_shot_terminal", {})
+                if isinstance(info, dict) else {}
+            )
+            for label, outcome_counts in (
+                hardcoded_terminal.get("outcomes_by_label", {}) or {}
+            ).items():
+                for outcome, count in dict(outcome_counts).items():
+                    hardcoded_shot_terminal_total[(str(label), str(outcome))] += int(count)
+            last_hc_shot = hardcoded_terminal.get("last_fired") if hardcoded_terminal else None
+            if last_hc_shot:
+                hardcoded_last_shot_terminal_total[(
+                    str(last_hc_shot.get("label", "hardcoded_shot")),
+                    str(last_hc_shot.get("outcome", reason)),
+                )] += 1
 
             if episode_count % WINDOW == 0:
                 window_kicks = collector.kicks[last_kick_idx:]
@@ -1275,6 +1331,26 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         "[ALL] requested: %s",
         " ".join(f"{k}={v}" for k, v in sorted(requested_actions_total.items())) or "—",
     )
+    hardcoded_terminal_summary = {
+        "all_fired_events": {
+            f"{label}->{outcome}": count
+            for (label, outcome), count in sorted(hardcoded_shot_terminal_total.items())
+        },
+        "last_fired_per_episode": {
+            f"{label}->{outcome}": count
+            for (label, outcome), count in sorted(hardcoded_last_shot_terminal_total.items())
+        },
+    }
+    if hardcoded_terminal_summary["all_fired_events"]:
+        _SUMMARY_LOG.info(
+            "[ALL] hardcoded shot terminal outcomes: all_fired=%s last_fired=%s",
+            " ".join(
+                f"{k}={v}" for k, v in hardcoded_terminal_summary["all_fired_events"].items()
+            ),
+            " ".join(
+                f"{k}={v}" for k, v in hardcoded_terminal_summary["last_fired_per_episode"].items()
+            ) or "—",
+        )
     last_stats = None
     if len(outcomes) > 100:
         last_stats = _print_window_summary(
@@ -1310,6 +1386,7 @@ def _run_ppo_jal(args, networker: Networker, team_name: str):
         "requested_actions": dict(requested_actions_total),
         "executed_actions": dict(actions_total),
         "shot_probe": shot_probe_summary,
+        "hardcoded_shot_terminal": hardcoded_terminal_summary,
     }
     summary_file = log_dir / "summary.json"
     with summary_file.open("w") as f:
@@ -1559,6 +1636,8 @@ def main():
                         help="Non-robot (global) observation dimension (for td3_jal)")
     parser.add_argument("--steps_per_episode", type=int, default=200,
                         help="Max steps per episode (for td3_jal)")
+    parser.add_argument("--max_steps_per_episode", type=int, default=None,
+                        help="Override max steps per episode for ppo_jal (overrides config max_steps)")
     parser.add_argument("--debug_infer", action="store_true",
                         help="Enable debug logging during inference")
     parser.add_argument("--config", type=str, default="configs/td3_jal_her_config.json",

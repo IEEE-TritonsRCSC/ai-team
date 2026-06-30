@@ -273,6 +273,27 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             random_spawn_theta_range_deg=tuple(random_spawn_theta_range_deg),
             ball_action_recovery=bool(_stage_or_top("ball_action_recovery", False)),
             ball_claimant_robot_ids=_stage_or_top("ball_claimant_robot_ids", None),
+            claimant_follow_robot_ids=_stage_or_top("claimant_follow_robot_ids", None),
+            claimant_follow_solo_lane_blocked_max=float(
+                _stage_or_top("claimant_follow_solo_lane_blocked_max", 0.55)
+            ),
+            claimant_follow_pass_lane_min=float(
+                _stage_or_top("claimant_follow_pass_lane_min", 0.65)
+            ),
+            claimant_follow_teammate_margin=float(
+                _stage_or_top("claimant_follow_teammate_margin", 0.15)
+            ),
+            claimant_follow_min_pass_distance=float(
+                _stage_or_top("claimant_follow_min_pass_distance", 8.0)
+            ),
+            claimant_follow_post_receive_cooldown_steps=int(
+                _stage_or_top("claimant_follow_post_receive_cooldown_steps", 30)
+            ),
+            hybrid_pass_max_align_steps=(
+                int(_stage_or_top("hybrid_pass_max_align_steps", None))
+                if _stage_or_top("hybrid_pass_max_align_steps", None) is not None
+                else None
+            ),
             ball_claimant_switch_margin=float(
                 _stage_or_top("ball_claimant_switch_margin", 0.75)
             ),
@@ -496,6 +517,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                     main_attacker_robot_id=int(spec.get("main_attacker_robot_id", 1)),
                     opponent_team_name=str(spec.get("opponent_team_name", "TeamB")),
                     opponent_goalie_robot_ids=[int(rid) for rid in spec.get("opponent_goalie_robot_ids", [1])],
+                    robot_pool_ids=[int(rid) for rid in spec.get("robot_pool_ids", [])],
                 )
                 self.logger.info(
                     "Aux controller: hardcoded_supporter team=%s robot_id=%d main=%d opponent=%s",
@@ -744,6 +766,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
         next_save = save_interval
         wall_start = time.time()
         last_update_step = 0
+        pending_hardcoded_reward: float = 0.0
 
         # Rolling diagnostic summary (goal rate / outcome mix / action mix) —
         # the live signals the curriculum stop-rule watches. log_episode only
@@ -797,14 +820,34 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             if self.env._cached_game_state is not None:
                 for aux_ctrl in getattr(self, "_aux_controllers", []):
                     try:
+                        if hasattr(aux_ctrl, "set_active_robot_id"):
+                            aux_ctrl.set_active_robot_id(
+                                getattr(self.env, "_active_robot_id", None)
+                            )
+                        if hasattr(aux_ctrl, "set_claimant_follow_info"):
+                            aux_ctrl.set_claimant_follow_info(
+                                getattr(self.env, "_claimant_follow_gate_info", {})
+                            )
                         aux_cmds = aux_ctrl.predict_commands(self.env._cached_game_state)
                         self.env.networker.execute_ai_output(aux_cmds, aux_ctrl.team_name)
+                        if hasattr(aux_ctrl, "last_event"):
+                            event = aux_ctrl.last_event()
+                            label = str(event.get("label", "") or "")
+                            if label:
+                                self.env.record_external_action(label, event)
+                                win_actions[label] += 1
                     except Exception as e:
                         self.logger.debug("Aux controller command send failed: %s", e)
 
             # Step env.
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = bool(terminated or truncated)
+            ppo_control_active = bool(
+                info.get(
+                    "ppo_control_active",
+                    info.get("action_info", {}).get("ppo_control_active", True),
+                )
+            )
             # For value bootstrapping: don't bootstrap past a terminal state.
             # truncated (time-limit) should still bootstrap from the next value.
             mask = 0.0 if terminated else 1.0
@@ -816,24 +859,32 @@ class PPOJALCurriculumTrainer(BaseTrainer):
             # Episode return tracking uses the raw reward so log_episode() and
             # downstream plots stay in the original reward scale.
             raw_reward = float(reward)
-            if self._reward_normalizer is not None:
-                norm_reward = self._reward_normalizer.normalize(raw_reward, done)
-            else:
-                norm_reward = raw_reward
+            stored_transition = False
+            if ppo_control_active:
+                semimdp_reward = pending_hardcoded_reward + raw_reward
+                pending_hardcoded_reward = 0.0
+                if self._reward_normalizer is not None:
+                    norm_reward = self._reward_normalizer.normalize(semimdp_reward, done)
+                else:
+                    norm_reward = semimdp_reward
 
-            self.agent.store_transition(transition)
-            self.agent.store_reward(norm_reward, mask)
+                self.agent.store_transition(transition)
+                self.agent.store_reward(norm_reward, mask)
+                stored_transition = True
+            else:
+                pending_hardcoded_reward += raw_reward
 
             ep_return += raw_reward
             ep_length += 1
-            steps_done += 1
+            if stored_transition:
+                steps_done += 1
 
             # Progress schedule (1.0 at start → 0.0 at end of stage).
             progress_remaining = max(0.0, 1.0 - steps_done / total_timesteps)
             self.agent.set_progress_remaining(progress_remaining)
 
             # PPO update when rollout buffer is full.
-            if self.agent.rollout_full:
+            if stored_transition and self.agent.rollout_full:
                 # If we landed on a terminal step, last_obs is irrelevant (the
                 # bootstrapped value will be ignored via the mask). Otherwise
                 # we pass next_obs so the value estimate continues from there.
@@ -872,6 +923,8 @@ class PPOJALCurriculumTrainer(BaseTrainer):
 
             # Episode end bookkeeping.
             if done:
+                if not stored_transition:
+                    pending_hardcoded_reward = 0.0
                 self._global_episode_count += 1
                 stage_ep += 1
                 self.log_episode(self._global_episode_count, ep_return, ep_length)
@@ -908,7 +961,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 context_mask = info.get("context_active_mask", context_mask)
 
             # Periodic checkpoint.
-            if steps_done >= next_save:
+            if stored_transition and steps_done >= next_save:
                 ckpt = checkpoint_dir / f"{stage_name}_steps{next_save}.pt"
                 self.save_model(str(ckpt))
                 self.logger.info(
@@ -918,7 +971,7 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                 next_save += save_interval
 
             # Periodic progress log (every 1k steps).
-            if steps_done % 1000 == 0:
+            if stored_transition and steps_done % 1000 == 0:
                 self.logger.info(
                     "[%s] progress: %s/%s timesteps (%.1f%%)  wall=%.1fs",
                     stage_name,
@@ -1032,6 +1085,12 @@ class PPOJALCurriculumTrainer(BaseTrainer):
                         try:
                             aux_cmds = aux_ctrl.predict_commands(env._cached_game_state)
                             env.networker.execute_ai_output(aux_cmds, aux_ctrl.team_name)
+                            if hasattr(aux_ctrl, "last_event"):
+                                event = aux_ctrl.last_event()
+                                label = str(event.get("label", "") or "")
+                                if label:
+                                    env.record_external_action(label, event)
+                                    win_actions[label] += 1
                         except Exception as e:
                             self.logger.debug("Aux controller command send failed (env %d): %s", i, e)
 

@@ -482,6 +482,7 @@ class Goalie(Player):
             speed=100.0,
             is_goalie=full_speed,  # skips deceleration scaling near the target
             obstacle_avoidance=avoid and not full_speed,
+            crash_speed_cap=False,  # keeper must dive freely across a crowded mouth
         )
         return cmd
 

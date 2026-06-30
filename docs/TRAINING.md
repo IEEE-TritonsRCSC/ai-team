@@ -4357,3 +4357,345 @@ Two levers, applied together:
 
 1. **Continue training** — extend to 400k total (add another 200k warm-starting from the checkpoint saved here). The trend suggests convergence is in reach; the policy just needs more time in the new context.
 2. **Lower kick threshold** — reduce `goalie_gap_min_quality` from 0.3 → 0.2 and lower `step_bonus` from -0.1 → -0.2 to penalise time-wasting harder. This tightens the EV tradeoff: at `step_bonus=-0.2`, each wasted step costs twice as much, so the expected cost of waiting for a 0.3 gap outweighs the occasional kick-quality improvement.
+
+---
+
+## 63. Training run: 20260629_233341_053084 — PPO `stage4_hardcoded_support_2v3` / robot-agnostic hybrid smoke (STOPPED — stale-sim detector false positive)
+
+**Start time:** 2026-06-29 23:33:41  
+**Steps:** 6,711 / 200,000  
+**Warm-start:** `models/ppo_jal_hybrid_support_2v1/stage4_hardcoded_support_2v3_complete.pt`
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 52 |
+| Overall goals | 2 / 52 = **3.8%** |
+| `frozen_state_stale_sim` | 37 / 52 = **71.2%** |
+| `max_steps` | 9 / 52 = **17.3%** |
+| `ball_in_penalty_off_target` | 3 / 52 = **5.8%** |
+| `goalie_catch` | 1 / 52 = **1.9%** |
+
+**Aim quality:** avg `0.394`, bad-aim `8.6%` across the small kick sample.
+
+**Action signature:** frozen episodes were often short and dominated by `hardcoded_interlude_hold`
+instead of normal PPO control:
+
+- ep2: 50 steps, `hardcoded_interlude_hold=52%`, ended `frozen_state_stale_sim`
+- ep3: 55 steps, `hardcoded_interlude_hold=47%`, ended `frozen_state_stale_sim`
+- ep24: 43 steps, `hardcoded_interlude_hold=76%`, ended `frozen_state_stale_sim`
+- ep51: 168 steps, `hardcoded_interlude_hold=83%`, ended `frozen_state_stale_sim`
+
+### Code changes (non-config)
+
+- Added robot-agnostic claimant-follow plumbing: the single PPO action slot can remap to either
+  attacker from `claimant_follow_robot_ids`, while the hardcoded supporter controls the non-active
+  robot.
+- Added semi-MDP skip behavior in the PPO trainer: hardcoded-pass interlude steps are executed in
+  the environment but not stored as PPO transitions.
+- Fixed the first runtime crash where `get_primitive_valid_mask()` produced all-zero inactive rows
+  during a hardcoded-pass interlude. The sampled action is ignored in that mode, so the runtime mask
+  now leaves every row sampleable and the trainer skips the transition.
+
+### What went wrong
+
+The run was stopped because the terminal reason distribution was dominated by stale-sim exits, but
+the evidence points to a **false positive in the detector**, not a real embedded-sim freeze. In
+claimant-follow mode, `self.robot_ids` is dynamically `[active_robot_id]`. During `hardcoded_pass`,
+the PPO-controlled active robot is intentionally held with `hardcoded_interlude_hold` while the
+auxiliary hardcoded provider drives the other attacker. The frozen-state detector was only checking
+`self.robot_ids`, so a held PPO receiver plus static ball could look like a stale frame even if the
+other controlled attacker was still moving.
+
+This made the performance numbers unusable: 71.2% of episodes ended via the suspect terminal before
+the hybrid control loop could be evaluated.
+
+### Fix for next run
+
+Patch terminal and rule tracking to use the full controlled attacker pool when claimant-follow is
+active:
+
+- frozen-state terminal checks `[1, 2]`, not only the currently mapped PPO slot;
+- robot out-of-bounds / teleport checks use the same full controlled pool;
+- SSL rule tracking receives the full controlled pool, so supporter collisions/touches are not missed;
+- `train_log.log` now records DEBUG diagnostics without printing them to the terminal;
+- added debug lines for claimant-follow gate changes and frozen-state terminal details.
+
+Rerun a short embedded smoke first. If `frozen_state_stale_sim` remains high, the new DEBUG lines will
+show whether all controlled robots and the ball were truly static, or whether a different reset/server
+staleness path is involved.
+
+---
+
+## 64. Training run: 20260629_234305_835646 — PPO `stage4_hardcoded_support_2v3` / robot-agnostic hybrid smoke (STOPPED — command routing bug)
+
+**Start time:** 2026-06-29 23:43:05  
+**Steps:** 10,974 / 200,000  
+**Warm-start:** `models/ppo_jal_hybrid_support_2v1/stage4_hardcoded_support_2v3_complete.pt`
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 110 |
+| Overall goals | 3 / 110 = **2.7%** |
+| Last 100 goal rate | **3.0%** |
+| `frozen_state_stale_sim` | 80 / 110 = **72.7%** |
+| `max_steps` | 18 / 110 = **16.4%** |
+| `defender_push_foul` | 3 / 110 = **2.7%** |
+| `ball_in_penalty_off_target` | 3 / 110 = **2.7%** |
+
+**Aim quality:** avg `0.38`, bad-aim `6.2%` across the small kick sample.
+
+**Action signature:** episode 1 was already mostly solo carry (`dribble_to=82%`) with some
+`hardcoded_interlude_hold=5%`, but frozen exits became dominated by hardcoded-pass interludes. Example:
+
+- ep2: 135 steps, `hardcoded_interlude_hold=75%`, ended `frozen_state_stale_sim`
+- ep105: 279 steps, `hardcoded_interlude_hold=57%`, ended `frozen_state_stale_sim`
+- ep107: 89 steps, `hardcoded_interlude_hold=69%`, ended `frozen_state_stale_sim`
+- ep108: 130 steps, `hardcoded_interlude_hold=86%`, ended `frozen_state_stale_sim`
+
+### Code changes (non-config)
+
+Before this run:
+
+- Frozen-state detection had been expanded to check the full claimant-follow robot pool `[1, 2]`.
+- DEBUG logging was added for claimant-follow gate changes and frozen terminal details.
+
+After diagnosing this run:
+
+- Added `JALTeamEnv._commands_for_current_robot_ids(...)`.
+- `_send_commands(...)` now pads compact PPO env commands to simulator uniform-number positions.
+- `_preprocess_commands_for_send(...)` now preserves `None` command gaps instead of converting them
+  to `turn 0`.
+- Added a regression test proving that `robot_ids=[2]` plus `["turn 0"]` is sent as
+  `[None, "turn 0"]`, not as a command to robot 1.
+
+### What went wrong
+
+This was not a true stale simulator. The DEBUG lines showed stale terminals were still occurring in
+`mode=hardcoded_pass`, `ppo_control=false`, usually with `active_robot_id=2`. The detector was now
+checking both controlled attackers correctly, but the command list was still wrong.
+
+In claimant-follow mode, the env remaps the single PPO slot by mutating `self.robot_ids`, e.g.
+`robot_ids=[2]`. `_action_to_commands()` returned a compact one-command list for that slot. The
+simulator sender interprets command lists positionally by uniform number, so index 0 commands robot 1
+and index 1 commands robot 2. That meant the receiver hold command intended for robot 2 was being sent
+to robot 1, where it could overwrite the auxiliary hardcoded carrier/pass command. The carrier then
+stalled, the ball stayed static, and the stale-state terminal fired.
+
+The training metrics are therefore invalid for model evaluation; the run was mostly measuring a
+command-routing bug in the hybrid controller.
+
+### Fix for next run
+
+Use positional command padding for any dynamic `robot_ids` mapping:
+
+- active PPO robot 1: env command list remains `["cmd"]` or `["cmd", None]`;
+- active PPO robot 2: env command list becomes `[None, "cmd"]`;
+- auxiliary hardcoded commands keep their own positional padding, so env and aux no longer overwrite
+  each other.
+
+Validation completed:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`9 passed`).
+
+Next run should be a short embedded smoke first. If stale terminals remain above a small background
+rate, the next suspect is a genuine embedded reset/held-ball latch, not the claimant-follow command
+routing path.
+
+---
+
+## 65. Training run: 20260630_001040_645855 — PPO `stage4_hardcoded_support_2v3` / command-routing fix smoke (FAILED — hardcoded-pass gate entered without possession)
+
+**Start time:** 2026-06-30 00:10:40  
+**Steps:** 4,744 / 5,000  
+**Warm-start:** `models/ppo_jal_hybrid_support_2v1/stage4_hardcoded_support_2v3_complete.pt`
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 59 |
+| Overall goals | 1 / 59 = **1.7%** |
+| `frozen_state_stale_sim` | 47 / 59 = **79.7%** |
+| `max_steps` | 10 / 59 = **16.9%** |
+| `ball_in_penalty_off_target` | 1 / 59 = **1.7%** |
+
+**Aim quality:** avg `0.163`, bad-aim `40.0%` across the small kick sample.
+
+**Action signature:** `hardcoded_interlude_hold` dominated the failed episodes again. Examples from
+the debug log:
+
+- ep32: `hardcoded_interlude_hold=86%`, ended `frozen_state_stale_sim`
+- ep43: `hardcoded_interlude_hold=77%`, ended `max_steps`
+- ep54: `hardcoded_interlude_hold=94%`, ended `frozen_state_stale_sim`
+
+### Code changes (non-config)
+
+This run validated the previous command-routing fix:
+
+- `JALTeamEnv._commands_for_current_robot_ids(...)` correctly pads compact commands to physical
+  robot IDs.
+- `_send_commands(...)` and `_preprocess_commands_for_send(...)` preserve `None` gaps so a PPO slot
+  remapped to robot 2 no longer overwrites robot 1.
+
+### What went wrong
+
+The routing bug was fixed, but the next stale source became visible. Frozen terminals still occurred
+in `mode=hardcoded_pass`, `ppo_control=false`, usually with `active_robot_id=2`. The gate was making a
+pure geometric decision: if the carrier-to-goal lane was blocked and the teammate had a better lane,
+it paused PPO and entered hardcoded-pass mode. It did not require the carrier to actually have usable
+ball control.
+
+That means the system could enter hardcoded-pass mode while the carrier was still far from the ball.
+During that interlude the PPO slot is held and the auxiliary supporter logic does not necessarily
+recover the loose ball, so ball and robots can remain static until `frozen_state_stale_sim`.
+
+### Fix for next run
+
+Add a physical readiness gate before hardcoded-pass takeover:
+
+- require carrier-ball distance within `kickable_dist + 0.25` env units, matching the hardcoded
+  supporter `_has_usable_ball(...)` tolerance;
+- keep PPO in `solo_finish`/recovery mode with reason `carrier_not_ready_to_pass` until the carrier
+  can actually settle/pass;
+- log `carrier_pass_ready`, `carrier_ball_dist`, and `carrier_ball_in_reception_cone` in the gate
+  info.
+
+The gate should not require perfect front-cone alignment, because the hardcoded pass helper already
+settles/reorients once it owns a physically usable ball.
+
+---
+
+## 66. Training run: 20260630_001519_500935 — PPO `stage4_hardcoded_support_2v3` / possession-gated hardcoded pass smoke (FIXED stale freezes; performance still weak)
+
+**Start time:** 2026-06-30 00:15:19  
+**Steps:** 4,669 / 5,000  
+**Warm-start:** `models/ppo_jal_hybrid_support_2v1/stage4_hardcoded_support_2v3_complete.pt`
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total episodes | 15 |
+| Overall goals | 2 / 15 = **13.3%** |
+| `frozen_state_stale_sim` | 0 / 15 = **0.0%** |
+| `max_steps` | 10 / 15 = **66.7%** |
+| `ball_in_penalty_off_target` | 3 / 15 = **20.0%** |
+
+**Aim quality:** avg `0.434`, bad-aim `4.3%` across the small kick sample.
+
+**Action signature:** summary actions were `approach_ball=23%`, `dribble_to=70%`, `kick=3%`,
+`turn=2%`, with no stale endings. Hardcoded interludes were no longer the whole episode: e.g. ep15
+had `hardcoded_interlude_hold=34%` and ended with a goal.
+
+### Code changes (non-config)
+
+- Added `JALTeamEnv._claimant_follow_carrier_ready_to_pass(...)`.
+- `_update_claimant_follow_mapping(...)` now requires carrier readiness before entering
+  `hardcoded_pass`.
+- Added gate diagnostics: `carrier_pass_ready`, `carrier_ball_dist`,
+  `carrier_ball_in_reception_cone`, and reason `carrier_not_ready_to_pass`.
+- Added regression coverage in `tests/test_hardcoded_supporter.py`:
+  - blocked lane + carrier at ball still enters `hardcoded_pass`;
+  - blocked lane + carrier far from ball stays PPO-controlled as `solo_finish`.
+
+Validation:
+
+```bash
+/opt/anaconda3/envs/rcai/bin/python -m py_compile ai_interface/envs/JAL_env.py tests/test_hardcoded_supporter.py
+/opt/anaconda3/envs/rcai/bin/python -m pytest tests/test_hardcoded_supporter.py
+```
+
+Result: `tests/test_hardcoded_supporter.py` passed (`10 passed`).
+
+### What worked
+
+The stale-freeze regression is fixed for this smoke: stale endings dropped from 47 / 59 (79.7%) to
+0 / 15. The debug log shows the intended reason firing:
+`reason=carrier_not_ready_to_pass` keeps `ppo_control=true` until the carrier has usable contact.
+
+The smoke also proves robot-agnostic claimant-follow can hand PPO to either attacker: later debug
+lines show `carrier=2` with `active=2` for solo finish and `carrier=2 receiver=1` for hardcoded pass.
+
+### Fix for next run
+
+The remaining problem is tactical/performance, not stale simulator state. Most episodes still hit
+`max_steps`, and the action mix is dribble-heavy (`dribble_to=70%`). Before a long training run:
+
+- add hysteresis/timeout to reduce rapid `solo_finish`/`hardcoded_pass` gate flicker near contested
+  ball contact;
+- inspect whether hardcoded pass mode is producing actual pass/receive/finish events, not just short
+  interludes;
+- then run embedded debug inference for 5k-10k steps to evaluate goal rate and pass usefulness.
+
+---
+
+## 67. Training run: 20260630_152322_914213 — PPO `stage4_hardcoded_support_2v2` / passing-disabled solo-finisher fine-tune (SUCCESS — 11%→15.2% goal rate, kicks 37→273)
+
+**Start time:** 2026-06-30 15:23:22
+**Stage:** `stage4_hardcoded_support_2v2` (renamed from `_2v3` — the live matchup is 2v2: TritonBots robot 1 RL + robot 2 hardcoded supporter vs TeamB goalie + 1 scripted defender)
+**Steps:** 200,000
+**Load model:** `final_models/stage3_complete.pt` (frozen Stage-3 solo finisher)
+**Checkpoint:** `models/ppo_jal_hybrid_support_2v2/stage4_hardcoded_support_2v2_complete.pt`
+
+### Context
+
+Match-like inference (50k steps, 1k-step episodes) on the **frozen** Stage-3 solo finisher in this
+env, with the hardcoded pass system **disabled** (`claimant_follow_solo_lane_blocked_max: 0.0`),
+gave a clean baseline of **11.0% goals (7/64)** but exposed the core failure: the policy *dribbles
+until timeout and barely shoots* — only **37 kicks fired** out of 1002 requested (the gap is
+turn-to-align churn under the 2°/cycle cap, not an aim gate; this stage has no active aim gate),
+**48% of episodes hit `max_steps`**, and aim on the few shots was poor (avg 0.18, bad-aim 46%). That
+behavior is baked into the frozen weights, so the only lever was continued training. This run
+warm-starts the same checkpoint and fine-tunes it *in the 2v2 env* with the stage-4 reward shaping
+(step penalty + `post_dribble_kick_bonus` + aim bonus, which Stage 3 lacked) to push it toward
+committing to shots. Passing stays disabled so the hardcoded pass overlay never hijacks robot 1 and
+PPO trains on its own actions (the trainer's semi-MDP `ppo_control_active` gate guarantees no
+action-attribution corruption regardless).
+
+### Results
+
+| Metric | Value |
+|---|---|
+| Total episodes | 571 |
+| Overall goal rate | 47/571 = **8.2%** |
+| Last 100 episodes goal rate | **13.0%** |
+| Goal rate by bucket | 4.5% → 7.0% → **14.0%** (clear monotonic climb) |
+
+**Match-like eval (50k steps, 1k-step episodes, `--ppo_stochastic`) vs the frozen baseline:**
+
+| Metric | Frozen Stage-3 (baseline) | **Fine-tuned 2v2** |
+|---|---|---|
+| Goal rate | 11.0% (7/64) | **15.2% (12/79)** |
+| Kicks fired | 37 | **273** (7.4×) |
+| Aim quality (avg) | 0.18 | **0.33** |
+| Bad-aim rate | 46% | **18%** |
+| Timeouts (`max_steps`) | 48% (31/64) | **35% (28/79)** |
+| Avg reward | −201 | **−135** |
+
+Eval log: `infer_logs/<latest>_stage4_hardcoded_support_2v2_complete/`.
+
+### What worked
+
+Fine-tuning in the 2v2 env fixed the dribble-until-timeout failure. The policy now **commits to
+shots 7.4× more often** (37→273 kicks), aims roughly twice as well (0.18→0.33, bad-aim 46%→18%),
+times out less (48%→35%), and converts more (11%→15.2%) with much better reward (−201→−135). The
+training-side goal rate climbed monotonically (4.5%→7.0%→14.0%), and late-run episodes ended in
+`goal_scored` in 99–381 steps rather than timing out. The semi-MDP `ppo_control_active` gate plus
+disabled passing kept the training signal clean.
+
+### Next stage
+
+Keep the fine-tuned checkpoint as the shipped 2v2 finisher. Caveat for any follow-up: it scores by
+firing **more 10–15m shots with better aim** (59 shots there, 20% goal rate), not by working the
+ball closer — the baseline's rare 8–10m point-blank goals are gone and off-target rate is ~37% in
+the 10–15m bin. If a future run targets higher conversion, bias toward closer shots (e.g. dribble
+target shaping toward the mouth / a closer-range kick incentive) rather than more volume from range.

@@ -260,7 +260,7 @@
                 "goto",
                 "dribble_to"
             ],
-            "spawn_robot_at_ball": false,
+            "spawn_robot_at_ball": true,
             "random_ball_x": true,
             "random_ball_x_range": [
                 5.0,
@@ -273,8 +273,8 @@
             ],
             "random_spawn_theta": true,
             "random_spawn_theta_range_deg": [
-                -180.0,
-                180.0
+                -15.0,
+                15.0
             ],
             "invalid_action_penalty": 0.5,
             "reward_config_overrides": {
@@ -806,8 +806,8 @@
                 "possession_transfer_bonus": 5.0
             }
         },
-        "stage4_hardcoded_support_2v3": {
-            "description": "ACTIVE \u2014 HYBRID FALLBACK \u2014 one Stage-3 PPO attacker (TritonBots robot 1) plus one hardcoded supporting attacker (robot 2) vs TeamB goalie + two scripted defenders. Use this when the learned Stage-4 two-attacker policy is not reliable enough: PPO keeps the solo scorer role, the scripted supporter creates receive lanes, collects passes/loose balls, and shoots or returns the ball.",
+        "stage4_hardcoded_support_2v2": {
+            "description": "ACTIVE \u2014 HYBRID FALLBACK (2v2) \u2014 one Stage-3 PPO attacker (TritonBots robot 1) plus one hardcoded supporting attacker (robot 2) vs TeamB goalie + one scripted defender. Use this when the learned Stage-4 two-attacker policy is not reliable enough: PPO keeps the solo scorer role, the scripted supporter creates receive lanes, collects passes/loose balls, and shoots or returns the ball.",
             "num_robots": 1,
             "timesteps": 200000,
             "robot_ids": [
@@ -816,6 +816,18 @@
             "team_config": "team_config_hardcoded_support_2v1.json",
             "num_opponents": 2,
             "opponent_team_name": "TeamB",
+            "ball_action_recovery": true,
+            "claimant_follow_robot_ids": [
+                1,
+                2
+            ],
+            "claimant_follow_solo_lane_blocked_max": 0.35,
+            "claimant_follow_pass_lane_min": 0.85,
+            "claimant_follow_teammate_margin": 0.45,
+            "claimant_follow_min_pass_distance": 8.0,
+            "claimant_follow_post_receive_cooldown_steps": 120,
+            "hybrid_pass_max_align_steps": 110,
+            "ball_claimant_switch_margin": 0.75,
             "aux_team_policies": [
                 {
                     "controller_type": "goalie",
@@ -837,6 +849,10 @@
                     "controller_type": "hardcoded_supporter",
                     "team_name": "TritonBots",
                     "robot_ids": [
+                        2
+                    ],
+                    "robot_pool_ids": [
+                        1,
                         2
                     ],
                     "side": "left",
@@ -861,8 +877,8 @@
             ],
             "random_spawn_theta": true,
             "random_spawn_theta_range_deg": [
-                -180.0,
-                180.0
+                -45.0,
+                45.0
             ],
             "invalid_action_penalty": 0.5,
             "reward_config_overrides": {
@@ -1726,8 +1742,8 @@
     "num_heads": 4,
     "max_steps": 400,
     "save_interval": 10000,
-    "save_path": "models/ppo_jal_hybrid_support_2v1",
-    "load_model": "models/ppo_jal_expandable_wide_stage3_v3/stage3_defender_v2_finetune_complete.pt",
+    "save_path": "models/ppo_jal_hybrid_support_2v2",
+    "load_model": "final_models/stage3_complete.pt",
     "model_params": {
         "gamma": 0.99,
         "gae_lambda": 0.95,
