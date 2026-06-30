@@ -980,16 +980,16 @@
                 }
             ],
             "disabled_actions": [],
-            "spawn_robot_at_ball": false,
+            "spawn_robot_at_ball": true,
             "random_ball_x": true,
             "random_ball_x_range": [
-                18.0,
+                25.0,
                 34.0
             ],
             "random_ball_y": true,
             "random_ball_y_range": [
-                -12.0,
-                12.0
+                -10.0,
+                10.0
             ],
             "random_spawn_theta": true,
             "random_spawn_theta_range_deg": [

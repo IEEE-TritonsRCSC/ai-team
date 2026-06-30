@@ -114,12 +114,14 @@ class JALTeamEnv(gym.Env):
         num_opponents: int = 1,
         own_goalie_robot_id: Optional[int] = None,
         opponent_goalie_robot_ids: Optional[List[int]] = None,
+        our_side: str = "left",
         ):
 
         super().__init__()
 
         self.networker = networker
         self.team_name = team_name
+        self.our_side = our_side
         if robot_ids is None:
             robot_ids = [1]
         self.robot_ids = list(robot_ids)
@@ -301,13 +303,13 @@ class JALTeamEnv(gym.Env):
         self.hardcoded_pass = HardcodedPassCoordinator(
             team_name=self.team_name,
             opponent_team_name=self.opponent_team_name or "TeamB",
-            side="left",
+            side=self.our_side,
             config=hybrid_pass_config,
         )
         self.hardcoded_attack = HardcodedAttackCoordinator(
             team_name=self.team_name,
             opponent_team_name=self.opponent_team_name or "TeamB",
-            side="left",
+            side=self.our_side,
         )
         # During a hardcoded_attack interlude the env only drives the carrier; the
         # other pool robot would otherwise be forced to `turn 0` and sit still until
@@ -317,7 +319,7 @@ class JALTeamEnv(gym.Env):
         self.hardcoded_supporter = HardcodedSupporter(
             teamname=self.team_name,
             unum=1,
-            side="left",
+            side=self.our_side,
             main_attacker_robot_id=1,
             opponent_team_name=self.opponent_team_name or "TeamB",
             opponent_goalie_robot_ids=[1],
@@ -2257,6 +2259,16 @@ class JALTeamEnv(gym.Env):
                     self.episode_num, total, dist,
                 )
             end_reason = term_reason if terminated else "max_steps"
+            if end_reason == "ball_teleport":
+                # The embedded sim has a pending ball-reset event that caused
+                # the teleport. A soft reset (PM_PlayOn + move_ball) will NOT
+                # flush it — the event re-fires on the first step of the next
+                # episode, causing cascading ball_teleport terminations. Force a
+                # full _initialize_simulator() on the next reset() to wipe the
+                # latched state.
+                backend = getattr(getattr(self.networker, "commander", None), "embedded_backend", None)
+                if backend is not None:
+                    backend._force_hard_reset = True
             hardcoded_shot_terminal = self._hardcoded_shot_terminal_tracking(end_reason)
             self.logger.info(
                 "Episode %d ended — reason=%s  steps=%d  total_reward=%.2f",

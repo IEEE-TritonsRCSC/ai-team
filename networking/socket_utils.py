@@ -136,6 +136,7 @@ class EmbeddedSimulatorBackend:
         self.team_by_side = {}
         self._sim = None
         self._last_state = None
+        self._force_hard_reset = False
         self._initialize_simulator()
 
     def _initialize_simulator(self):
@@ -365,7 +366,12 @@ class EmbeddedSimulatorBackend:
             # that a PM_PlayOn + move_ball soft reset cannot clear. The caught case
             # stays on play_on, so it must be detected from tracked catch ownership
             # rather than the play mode. _initialize_simulator clears _ball_caught_by.
-            if prev_pm_name not in _SOFT_RESETTABLE_PLAYMODES or self._ball_caught_by is not None:
+            if (
+                prev_pm_name not in _SOFT_RESETTABLE_PLAYMODES
+                or self._ball_caught_by is not None
+                or self._force_hard_reset
+            ):
+                self._force_hard_reset = False
                 self._initialize_simulator()
 
             # PlayOn first so subsequent teleports are not overwritten by a
