@@ -913,6 +913,122 @@
                 "defender_lane_min_quality": 0.3
             }
         },
+        "stage4_ai_hardcoded": {
+            "description": "STAGE 4 AI HARDCODED \u2014 2v3 \u2014 one Stage-3 PPO RL attacker (TritonBots robot 1) plus one hardcoded attacker adapted from TIGERS Mannheim (robot 2) vs TeamB goalie (robot 1) + two scripted defenders in two modes: ball-side defender (robot 2) and marker defender (robot 3). Train from the Stage 3 checkpoint. This is the primary Stage-4 hardcoded curriculum entry.",
+            "num_robots": 1,
+            "timesteps": 300000,
+            "robot_ids": [
+                1
+            ],
+            "team_config": "team_config_hardcoded_support_2v3.json",
+            "num_opponents": 3,
+            "opponent_team_name": "TeamB",
+            "ball_action_recovery": true,
+            "claimant_follow_robot_ids": [
+                1,
+                2
+            ],
+            "claimant_follow_solo_lane_blocked_max": 0.35,
+            "claimant_follow_pass_lane_min": 0.85,
+            "claimant_follow_teammate_margin": 0.45,
+            "claimant_follow_min_pass_distance": 8.0,
+            "claimant_follow_post_receive_cooldown_steps": 120,
+            "hybrid_pass_max_align_steps": 110,
+            "ball_claimant_switch_margin": 0.75,
+            "aux_team_policies": [
+                {
+                    "controller_type": "goalie",
+                    "team_name": "TeamB",
+                    "robot_ids": [
+                        1
+                    ],
+                    "side": "right"
+                },
+                {
+                    "controller_type": "defender",
+                    "team_name": "TeamB",
+                    "robot_ids": [
+                        2
+                    ],
+                    "side": "right"
+                },
+                {
+                    "controller_type": "marker_defender",
+                    "team_name": "TeamB",
+                    "robot_ids": [
+                        3
+                    ],
+                    "side": "right",
+                    "ball_defender_robot_id": 2
+                },
+                {
+                    "controller_type": "hardcoded_supporter",
+                    "team_name": "TritonBots",
+                    "robot_ids": [
+                        2
+                    ],
+                    "robot_pool_ids": [
+                        1,
+                        2
+                    ],
+                    "side": "left",
+                    "main_attacker_robot_id": 1,
+                    "opponent_team_name": "TeamB",
+                    "opponent_goalie_robot_ids": [
+                        1
+                    ]
+                }
+            ],
+            "disabled_actions": [],
+            "spawn_robot_at_ball": false,
+            "random_ball_x": true,
+            "random_ball_x_range": [
+                18.0,
+                34.0
+            ],
+            "random_ball_y": true,
+            "random_ball_y_range": [
+                -12.0,
+                12.0
+            ],
+            "random_spawn_theta": true,
+            "random_spawn_theta_range_deg": [
+                -45.0,
+                45.0
+            ],
+            "invalid_action_penalty": 0.5,
+            "reward_config_overrides": {
+                "has_ball_bonus": 0.08,
+                "near_ball_bonus": 0.05,
+                "approach_weight": 1.0,
+                "step_bonus": -0.1,
+                "goal_progress_weight": 2.0,
+                "goal_progress_clip": 1.5,
+                "ball_speed_bonus_weight": 2.0,
+                "goal_reward": 70.0,
+                "alignment_weight": 3.0,
+                "alignment_has_ball_only": true,
+                "kick_aim_bonus_weight": 20.0,
+                "bad_aim_kick_penalty": 1.0,
+                "bad_aim_grad_scale": 15.0,
+                "use_goalie_aim_gate": true,
+                "goalie_gap_min_quality": 0.3,
+                "kick_into_keeper_penalty": 1.0,
+                "goalie_gap_blend_center": 0.0,
+                "dribble_target_progress_weight": 1.0,
+                "dribble_target_quality_weight": 2.0,
+                "dribble_active_bonus": 0.03,
+                "post_dribble_kick_bonus": 8.0,
+                "post_dribble_kick_combo_window": 8,
+                "post_dribble_kick_quality_scale": true,
+                "kick_near_goalie_penalty": 1.0,
+                "opponent_near_ball_penalty": -0.3,
+                "use_defender_lane_gate": true,
+                "defender_lane_block_dist": 2.6,
+                "defender_lane_penalty": 0.5,
+                "defender_lane_min_quality": 0.3
+            }
+        },
         "stage5_3v3": {
             "description": "STAGE 5 \u2014 3v3. 2 RL robots + 1 HC goalie vs 2 frozen Stage 4 policies + HC goalie. Multi-robot coordination: role gating, spread, support positioning. Modular for Stages 6-8 (same reward structure, more robots).",
             "num_robots": 2,
