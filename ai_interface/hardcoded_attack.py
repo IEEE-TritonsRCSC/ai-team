@@ -421,19 +421,22 @@ class HardcodedAttackCoordinator:
         )
         if cmd == "done":
             state.reset()
-            contact = self._contact_pose_for_target(ball, target)
-            cmd = goto(
+            # Staging dribble finished — transition directly to the grab/align/kick
+            # sequence rather than re-entering goto(contact). The goto path gives
+            # a ~4-power corrective dash while the ball is right there, and because
+            # state was just reset dribble_to() returns "done" again on the very next
+            # step, creating an infinite micro-loop that never fires the shot.
+            return self._kick_or_settle(
+                robot_id,
                 pose,
-                contact[0],
-                contact[1],
+                ball,
+                shot_target,
+                self.config.shoot_power,
                 game_state,
-                margin=0.18,
-                theta=contact[2],
-                speed=self.config.settle_speed,
-                detour_margin=1.0,
-                obstacle_avoidance=True,
-                include_ball_obstacle=False,
-                include_player_obstacles=True,
+                label_prefix="hc_attack_stage_kick",
+                quality=shot_quality,
+                lane_clear=shot_lane,
+                nearest_blocker=shot_blocker,
             )
         cmd = limit_turn_rate(cmd if cmd != "done" else "turn 0")
         return cmd, {
