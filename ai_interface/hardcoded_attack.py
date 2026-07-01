@@ -94,6 +94,10 @@ class HardcodedAttackCoordinator:
     config: HardcodedAttackConfig = field(default_factory=HardcodedAttackConfig)
     dribble_states: Dict[int, DribbleState] = field(default_factory=dict)
     caught_for_kick: Dict[int, bool] = field(default_factory=dict)
+    # Sticky open-side sign per robot for the recover detour (see _owner_command).
+    # Keeps the attacker from flip-flopping which way it swings around a blocking
+    # defender when the geometry is a near-tie.
+    recover_side: Dict[int, float] = field(default_factory=dict)
     last_events: list[dict[str, Any]] = field(default_factory=list)
 
     def reset(self) -> None:
@@ -101,6 +105,7 @@ class HardcodedAttackCoordinator:
 
         self.last_events = []
         self.caught_for_kick.clear()
+        self.recover_side.clear()
         for state in self.dribble_states.values():
             state.reset()
 
@@ -324,21 +329,54 @@ class HardcodedAttackCoordinator:
         robot_ball_dist = distance(pose, ball)
         if robot_ball_dist > kickable_dist + 0.35:
             self.caught_for_kick[robot_id] = False
-            cmd = approach_ball(
-                pose,
-                game_state,
-                speed=95.0,
-                obstacle_avoidance=True,
+            # A raw approach_ball charges the ball's centre in a straight line.
+            # When an opponent's body sits on the ball that path is blocked: the
+            # proximity speed cap crawls the attacker into the defender and it
+            # presses at ~one body-width (never reaching the ball) instead of
+            # repositioning. If a blocker is on the attacker->ball segment, steer
+            # to a point beside the ball on the open side so the attacker circles
+            # the defender and then collects from a clear angle.
+            blockers = list(defenders)
+            for gp in goalie_poses:
+                if gp is not None:
+                    blockers.append((float(gp[0]), float(gp[1])))
+            detour_pt = self._recover_open_side_point(
+                robot_id, pose, ball, blockers, robot_ball_dist
             )
+            if detour_pt is not None:
+                face = math.atan2(ball[1] - pose[1], ball[0] - pose[0])
+                cmd = goto(
+                    pose,
+                    detour_pt[0],
+                    detour_pt[1],
+                    game_state,
+                    margin=0.35,
+                    theta=face,
+                    speed=95.0,
+                    obstacle_avoidance=True,
+                    include_ball_obstacle=False,
+                    include_player_obstacles=True,
+                )
+                label = "hc_attack_recover_reposition"
+            else:
+                self.recover_side.pop(robot_id, None)
+                cmd = approach_ball(
+                    pose,
+                    game_state,
+                    speed=95.0,
+                    obstacle_avoidance=True,
+                )
+                label = "hc_attack_recover"
             if cmd == "done":
                 cmd = "turn 0"
             cmd = limit_turn_rate(cmd)
             return cmd, {
-                "label": "hc_attack_recover",
+                "label": label,
                 "robot_id": robot_id,
                 "command": cmd,
                 "reason": readiness.reason,
                 "robot_ball_dist": robot_ball_dist,
+                "detour_target": detour_pt,
             }
 
         shot_target, shot_quality = self.best_shot(ball, defenders, goalie_poses)
@@ -670,6 +708,86 @@ class HardcodedAttackCoordinator:
             ux, uy = dx / norm, dy / norm
         stand_off = PLAYER_SIZE + BALL_SIZE + 0.08
         return (ball[0] - ux * stand_off, ball[1] - uy * stand_off, math.atan2(uy, ux))
+
+    def _recover_open_side_point(
+        self,
+        robot_id: int,
+        pose: Pose,
+        ball: Point,
+        blockers: Sequence[Point],
+        robot_ball_dist: float,
+    ) -> Optional[Point]:
+        """Return a point beside the ball to swing around a blocking opponent.
+
+        Returns ``None`` when the straight approach to the ball is clear (no
+        opponent body sits on the attacker->ball segment near the ball), in which
+        case the caller falls back to a normal ``approach_ball``. When a blocker
+        is in the way, the returned point is offset from the ball, perpendicular
+        to the approach, on the side away from the blocker.
+
+        Two hysteresis mechanisms prevent the attacker from jittering against the
+        defender instead of committing to the swing-around: (1) the chosen side is
+        latched per robot in ``recover_side``, and (2) once repositioning has
+        started (robot is latched) the "still blocked?" test uses a wider release
+        radius than the trigger radius. Without the wider release, a small lateral
+        step clears the instantaneous block test, the caller reverts to a straight
+        approach, the defender blocks again, and the robot oscillates at
+        body-contact range (~1.57u) without ever reaching the ball.
+        """
+
+        # Only relevant on the final approach; farther out, goto's own detour
+        # planner (active beyond DETOUR_SKIP_DIST) already routes around bodies.
+        if robot_ball_dist > 4.0 or not blockers:
+            self.recover_side.pop(robot_id, None)
+            return None
+
+        px, py = float(pose[0]), float(pose[1])
+        bx, by = float(ball[0]), float(ball[1])
+        vx, vy = bx - px, by - py
+        seg_len = math.hypot(vx, vy)
+        if seg_len <= 1e-6:
+            self.recover_side.pop(robot_id, None)
+            return None
+        ux, uy = vx / seg_len, vy / seg_len          # attacker -> ball unit
+        perp_x, perp_y = -uy, ux
+
+        # Trigger the swing when a blocker is within roughly a body+ball radius of
+        # the lane; once committed keep going until it is clearly (a full body)
+        # off the lane — the hysteresis band that stops the oscillation.
+        latched = robot_id in self.recover_side
+        block_thresh = (2.0 * PLAYER_SIZE + BALL_SIZE) if latched else (PLAYER_SIZE + BALL_SIZE + 0.35)
+        best: Optional[Point] = None
+        best_dist = float("inf")
+        for blk in blockers:
+            wx, wy = float(blk[0]) - px, float(blk[1]) - py
+            t = (wx * ux + wy * uy)
+            if t <= 0.2 or t >= seg_len + PLAYER_SIZE:
+                continue
+            lane_dist = abs(wx * perp_x + wy * perp_y)
+            if lane_dist < block_thresh and lane_dist < best_dist:
+                best_dist = lane_dist
+                best = (float(blk[0]), float(blk[1]))
+        if best is None:
+            self.recover_side.pop(robot_id, None)
+            return None
+
+        # Choose the side of the ball away from the blocker, with a sticky sign so
+        # a near-tie (blocker dead-centre on the lane) does not flip left/right.
+        side_proj = (best[0] - bx) * perp_x + (best[1] - by) * perp_y
+        prev = self.recover_side.get(robot_id)
+        if abs(side_proj) < 0.2 and prev is not None:
+            sign = prev
+        else:
+            sign = -1.0 if side_proj > 0 else 1.0
+        self.recover_side[robot_id] = sign
+
+        # Swing point beside the ball on the open side. Kept just inside
+        # kickable+0.35 (~1.5 body-widths) so once the attacker curves onto it the
+        # ball is within reach and the recover branch exits into the grab rather
+        # than orbiting the swing point.
+        offset = 1.5 * PLAYER_SIZE
+        point = (bx + sign * perp_x * offset, by + sign * perp_y * offset)
+        return self._clamp_field(point)
 
     def _nearest_blocker(
         self,
