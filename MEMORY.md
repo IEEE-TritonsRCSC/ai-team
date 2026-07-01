@@ -158,6 +158,29 @@ always-applied context, alongside `CLAUDE.md`.
   (called once in `start()`) shifts the pass target perpendicular away from an opponent sitting on
   the ball→receiver lane; the receiver follows via `_receive_pose`. Computed once at pass start
   (not re-evaluated as the defender moves) to keep the carrier's aim target stable.
+- **Attacker "stuck to the defender, won't reposition to acquire the ball" = straight-line
+  `hc_attack_recover` into a body-blocked ball (7/1).** `HardcodedAttackCoordinator._owner_command`'s
+  recover branch called `approach_ball` (ball centre, straight line); when a defender's body sat on
+  the ball the proximity crash cap crawled the attacker into the defender and it pressed at ~one
+  body-width (~1.57u) forever — never closing, never going around (diagnosed from inference: 792/792
+  long recover runs plateaued at dmin≈1.57u). FIX: `_recover_open_side_point` — when a blocker is on
+  the attacker→ball segment on the final approach (dist ≤ 4u), steer to a point ~1.5·PLAYER_SIZE
+  beside the ball on the side away from the blocker so the attacker circles the defender and collects
+  from a clear angle. Needs BOTH a per-robot sticky side (`recover_side`) AND a wider release radius
+  once committed (2·PLAYER_SIZE+BALL_SIZE latched vs PLAYER_SIZE+BALL_SIZE+0.35 to trigger) — without
+  the hysteresis a small lateral step clears the block test, it reverts to the straight charge, and
+  it oscillates at the defender's body. New event label `hc_attack_recover_reposition`. Verified
+  sim-embedded (stage4_ai_hardcoded, 50k): carry_steps 1942→5025 (+159%), body-jam time 13%→8%.
+  **DON'T "fix" this by raising the proximity speed floor** — tried `PROXIMITY_BALL_CONTEST_MIN_FACTOR
+  0.10→0.30` first and it made the attacker overshoot/knock the ball on the final settle,
+  collapsing carry_segments 105→11. The lever is the approach GEOMETRY (go around), not speed.
+- **stage4_ai_hardcoded goal rate is bottlenecked on FINISHING, not ball recovery (7/1).** Across
+  50k-step sim-embedded inference the goalie catches ~89% of everything and goal rate sits <1%
+  (noise); more possession (the recover fix above) does not move goals because the shots (hardcoded
+  advance-fired from ~15–20m + PPO) get caught. Passing (`hc_pass_fired`) also never fires in this
+  stage. Both are separate problems from recovery — chase them via shot quality / a fresh fine-tune,
+  not more hardcoded-approach tuning. 5–6 goals over ~700–800 eps is within noise; judge recovery
+  changes by carry_steps/carry_segments, not goal count.
 
 ## Conventions
 
