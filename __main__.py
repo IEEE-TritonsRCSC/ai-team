@@ -50,12 +50,12 @@ parser.add_argument("--ppo_param_noise_std", type=float, default=0.3,
     help="Gaussian noise std on PPO params to prevent bang-bang turn stall")
 parser.add_argument("--our_color", choices=["blue", "yellow"], default="blue",
     help="Our team's SSL color assigned by the Game Controller")
-parser.add_argument("--num_robots", type=int, choices=[1, 2, 3], default=None,
+parser.add_argument("--num_robots", type=int, choices=[1, 2, 3], default=1,
     help="Field a defensive-only lineup with this many robots (hardware-limited "
-         "deployment): 1=goalie, 2=goalie+intercepting defender, "
-         "3=goalie+intercepting defender+marking defender. When set, the RL "
-         "attacker stack is skipped and (unless --team_config is overridden) the "
-         "matching team_config_defense_<N>.json is loaded.")
+         "deployment, default 1): 1=goalie, 2=goalie+intercepting defender, "
+         "3=goalie+intercepting defender+marking defender. The RL attacker stack "
+         "is skipped and (unless --team_config is overridden) the matching "
+         "team_config_defense_<N>.json is loaded.")
 
 
 def main():
