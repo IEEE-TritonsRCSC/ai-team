@@ -48,6 +48,8 @@ parser.add_argument("--our_side", choices=["left", "right"], default="left",
     help="Which side TritonBots defends: left=defend left goal, attack right; right=flipped")
 parser.add_argument("--ppo_param_noise_std", type=float, default=0.3,
     help="Gaussian noise std on PPO params to prevent bang-bang turn stall")
+parser.add_argument("--our_color", choices=["blue", "yellow"], default="blue",
+    help="Our team's SSL color assigned by the Game Controller")
 
 
 def main():
@@ -133,6 +135,8 @@ def main():
         print("\nShutting down...please patiently wait for a few seconds.")
     finally:
         stop_event.set()
+        if competition_ai is not None and hasattr(competition_ai, 'shutdown'):
+            competition_ai.shutdown()
         networker.shutdown()
         state_thread.join(timeout=1)
         if args.estimate_params is not None:

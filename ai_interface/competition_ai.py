@@ -11,6 +11,12 @@ import numpy as np
 from typing import Optional
 
 from networking.data_utils import GameState, TeamInfo
+from support.dispatcher import Dispatcher
+from networking.gc_receiver import MockGCReceiver
+try:
+    from networking.gc_receiver import GCReceiver
+except (ImportError, Exception):
+    GCReceiver = None
 
 # Dead-ball states that require formation positioning.
 FORMATION_PLAYMODES = {
@@ -125,79 +131,104 @@ class CompetitionAI:
     """
 
     def __init__(self, team_infos: list, args):
-        from ai_interface.algorithms.ppo_jal import PPOJALAgent
-        from ai_interface.envs.JAL_env import JALTeamEnv
-        from ai_interface.trainers.policy_control import (
-            GoalieCommandProvider,
-            DefenderCommandProvider,
-            MarkerDefenderCommandProvider,
-            HardcodedSupporterCommandProvider,
-        )
-        from networking.networker import Networker
+        from ai_interface.trainers.policy_control import GoalieCommandProvider
 
         self.our_side = args.our_side
         self.team_name = "TritonBots"
-        opponent_team = team_infos[1].name if len(team_infos) > 1 else "TeamB"
+        self.networker = None
 
-        with open(args.config, "r") as f:
-            config = json.load(f)
-        stage_config = config["curriculum"][args.stage]
+        # Find our team info to check robot count
+        our_team = next((t for t in team_infos if t.name == self.team_name), team_infos[0])
+        n_players = our_team.n_players
 
-        robot_ids = list(stage_config.get("robot_ids", [1]))
-        reward_overrides = stage_config.get("reward_config_overrides")
-        num_robots = len(robot_ids)
+        # Emergency dual-goalie mode: ≤2 robots, skip PPO JAL entirely
+        self._dual_goalie = n_players <= 2
+        if self._dual_goalie:
+            self.aux_controllers = [
+                GoalieCommandProvider(team_name=self.team_name, robot_id=1, side=self.our_side),
+                GoalieCommandProvider(team_name=self.team_name, robot_id=2, side=self.our_side),
+            ]
+            self.env = None
+            self.agent = None
+        else:
+            from ai_interface.algorithms.ppo_jal import PPOJALAgent
+            from ai_interface.envs.JAL_env import JALTeamEnv
+            from ai_interface.trainers.policy_control import (
+                DefenderCommandProvider,
+                MarkerDefenderCommandProvider,
+                HardcodedSupporterCommandProvider,
+            )
 
-        self.networker = None  # injected at first step call via setup()
-        self._config = config
-        self._stage_config = stage_config
+            opponent_team = team_infos[1].name if len(team_infos) > 1 else "TeamB"
+            with open(args.config, "r") as f:
+                config = json.load(f)
+            stage_config = config["curriculum"][args.stage]
+
+            self._config = config
+            self._stage_config = stage_config
+            self._opponent_team = opponent_team
+            self._robot_ids = list(stage_config.get("robot_ids", [1]))
+            self._reward_overrides = stage_config.get("reward_config_overrides")
+            self._num_robots = len(self._robot_ids)
+            self._disabled_actions = list(stage_config.get("disabled_actions", []))
+
+            self.aux_controllers = [
+                HardcodedSupporterCommandProvider(
+                    team_name=self.team_name, robot_id=2, side=self.our_side,
+                    main_attacker_robot_id=1,
+                    opponent_team_name=opponent_team,
+                    opponent_goalie_robot_ids=[team_infos[1].goalie_id] if len(team_infos) > 1 else [1],
+                    robot_pool_ids=[1, 2],
+                ),
+                HardcodedSupporterCommandProvider(
+                    team_name=self.team_name, robot_id=3, side=self.our_side,
+                    main_attacker_robot_id=1,
+                    opponent_team_name=opponent_team,
+                    opponent_goalie_robot_ids=[team_infos[1].goalie_id] if len(team_infos) > 1 else [1],
+                    robot_pool_ids=[1, 3],
+                ),
+                DefenderCommandProvider(team_name=self.team_name, robot_id=4, side=self.our_side),
+                MarkerDefenderCommandProvider(
+                    team_name=self.team_name, robot_id=5, side=self.our_side,
+                    ball_defender_robot_id=4,
+                ),
+                GoalieCommandProvider(team_name=self.team_name, robot_id=6, side=self.our_side),
+            ]
+            self.env: Optional[JALTeamEnv] = None
+            self.agent: Optional[PPOJALAgent] = None
+            self._obs = None
+            self._agent_mask = None
+            self._context_mask = None
+            self._param_active_mask = None
+
         self._args = args
-        self._robot_ids = robot_ids
-        self._reward_overrides = reward_overrides
-        self._opponent_team = opponent_team
-        self._num_robots = num_robots
 
-        # Aux controllers for TritonBots robots 2-6
-        self.aux_controllers = [
-            HardcodedSupporterCommandProvider(
-                team_name=self.team_name, robot_id=2, side=self.our_side,
-                main_attacker_robot_id=1,
-                opponent_team_name=opponent_team,
-                opponent_goalie_robot_ids=[team_infos[1].goalie_id] if len(team_infos) > 1 else [1],
-                robot_pool_ids=[1, 2],
-            ),
-            HardcodedSupporterCommandProvider(
-                team_name=self.team_name, robot_id=3, side=self.our_side,
-                main_attacker_robot_id=1,
-                opponent_team_name=opponent_team,
-                opponent_goalie_robot_ids=[team_infos[1].goalie_id] if len(team_infos) > 1 else [1],
-                robot_pool_ids=[1, 3],
-            ),
-            DefenderCommandProvider(
-                team_name=self.team_name, robot_id=4, side=self.our_side,
-            ),
-            MarkerDefenderCommandProvider(
-                team_name=self.team_name, robot_id=5, side=self.our_side,
-                ball_defender_robot_id=4,
-            ),
-            GoalieCommandProvider(
-                team_name=self.team_name, robot_id=6, side=self.our_side,
-            ),
-        ]
-
-        self.env: Optional[JALTeamEnv] = None
-        self.agent: Optional[PPOJALAgent] = None
-        self._obs = None
-        self._agent_mask = None
-        self._context_mask = None
-        self._disabled_actions: list = list(stage_config.get("disabled_actions", []))
-        self._param_active_mask = None
+        # GC integration (both modes)
+        our_color = getattr(args, "our_color", "blue")
+        if GCReceiver is not None:
+            try:
+                self._gc_receiver = GCReceiver()
+            except Exception:
+                self._gc_receiver = MockGCReceiver()
+        else:
+            self._gc_receiver = MockGCReceiver()
+        self._gc_receiver.start()
+        self._dispatcher = Dispatcher(
+            team_infos=team_infos,
+            our_color=our_color,
+            our_teamname=self.team_name,
+            our_side=self.our_side,
+        )
 
     def setup(self, networker):
         """Call once after networker is ready to wire up the env and load the model."""
+        self.networker = networker
+        if self._dual_goalie:
+            return  # no env or model needed in dual-goalie mode
+
         from ai_interface.algorithms.ppo_jal import PPOJALAgent
         from ai_interface.envs.JAL_env import JALTeamEnv
 
-        self.networker = networker
         config = self._config
         stage_config = self._stage_config
         args = self._args
@@ -312,20 +343,48 @@ class CompetitionAI:
         self._agent_mask = info.get("agent_active_mask")
         self._context_mask = info.get("context_active_mask")
 
+    # Commands where we let PPO JAL run (live play)
+    _LIVE_PLAY_COMMANDS = {None, 'NORMAL_START', 'FORCE_START'}
+
     def step(self, game_state: GameState):
         """Drive one cycle of the competition stack."""
+        gc_state = self._gc_receiver.get_latest()
+
+        # Emergency dual-goalie mode: both robots run GoalieCommandProvider every cycle.
+        # GC-managed states (HALT, STOP, etc.) still go through Dispatcher.
+        if self._dual_goalie:
+            if gc_state is not None and gc_state.command not in self._LIVE_PLAY_COMMANDS:
+                actions = self._dispatcher.decide_action(game_state, gc_state)
+                self.networker.execute_ai_output(actions, self.team_name)
+                return
+            for ctrl in self.aux_controllers:
+                try:
+                    cmds = ctrl.predict_commands(game_state)
+                    self.networker.execute_ai_output(cmds, self.team_name)
+                except Exception as e:
+                    print(f"[CompetitionAI] goalie {ctrl.robot_id} error: {e}")
+            return
+
         if self.env is None or self.agent is None:
             return
 
-        playmode = game_state.playmode or ""
-
-        if playmode in STOP_PLAYMODES:
-            self._send_stop()
-            return
-
-        if playmode in FORMATION_PLAYMODES:
-            self._send_formation(game_state)
-            return
+        if gc_state is not None:
+            # GC is connected — use its command to decide behavior
+            if gc_state.command not in self._LIVE_PLAY_COMMANDS:
+                # GC-managed state: Dispatcher handles everything
+                actions = self._dispatcher.decide_action(game_state, gc_state)
+                self.networker.execute_ai_output(actions, self.team_name)
+                return
+            # else: live play — fall through to PPO JAL below
+        else:
+            # No GC packet yet — fall back to rcssserver playmode for sim testing
+            playmode = game_state.playmode or ""
+            if playmode in STOP_PLAYMODES:
+                self._send_stop()
+                return
+            if playmode in FORMATION_PLAYMODES:
+                self._send_formation(game_state)
+                return
 
         # Normal play: step aux controllers then RL robot
         cached_gs = getattr(self.env, "_cached_game_state", None) or game_state
@@ -415,3 +474,10 @@ class CompetitionAI:
         """Halt all robots."""
         cmds = [None] * 6
         self.networker.execute_ai_output(cmds, self.team_name)
+
+    def shutdown(self):
+        """Stop background threads (GC receiver)."""
+        try:
+            self._gc_receiver.stop()
+        except Exception:
+            pass
