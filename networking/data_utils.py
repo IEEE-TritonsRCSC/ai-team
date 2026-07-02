@@ -291,6 +291,12 @@ class Serializer:
                 message += f"{robot_id} None\n"
             else:
                 action = limit_turn_rate(action)
+                # Physical-robot firmware stops the dribbler with the token `o`
+                # (wire format "<robot_id> o"). The internal/sim command vocabulary
+                # keeps the bare `drop` (native in the embedded sim); only the
+                # real-robot serialization swaps it for `o`.
+                if action == "drop":
+                    action = "o"
                 message += f"{robot_id} {action}\n"
             robot_id += 1
         
