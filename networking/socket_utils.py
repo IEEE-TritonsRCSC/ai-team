@@ -19,6 +19,12 @@ from contextlib import contextmanager
 from typing import Optional
 import sslclient
 from .data_utils import GameState, TeamInfo, Deserializer
+from .net_config import (
+    LOCALHOST_IP,
+    ROBOT_COMMAND_MULTICAST_IP,
+    ROBOT_COMMAND_PORT,
+    SSL_NETWORK_INTERFACE,
+)
 
 try:
     import rcssserver_embedded as embedded_sim
@@ -27,15 +33,15 @@ except ImportError:
 
 # Network constants for listening to simulator data
 BUFFER_SIZE = 1536
-LOCALHOST_IP = "127.0.0.1"
 DEFAULT_SIM_PLAYER_PORT = 6000
 DEFAULT_SIM_TRAINER_PORT = 6001
 INIT_PATTERN = r"\(init ([lr]) (1[0-1]|[1-9]) \w+\)"
 PLAYMODE_REGEX = r"\(hear \d+ referee (\w+)\)"
 
-# Multicast settings for real robots
-COMMAND_IP = "239.42.42.42"
-COMMAND_PORT = 10000
+# Multicast settings for real robots (sourced from net_config.py / env vars,
+# so the field subnet can be updated at competition without touching code)
+COMMAND_IP = ROBOT_COMMAND_MULTICAST_IP
+COMMAND_PORT = ROBOT_COMMAND_PORT
 
 UDP_SIM_ENVIRONMENTS = {"sim-only", "sim-mixed"}
 EMBEDDED_SIM_ENVIRONMENTS = {"sim-embedded"}
@@ -687,7 +693,15 @@ class Commander:
             for i, team_info in enumerate(team_infos):
                 teamname = team_info.name
                 port_num = COMMAND_PORT + (i * 1000)
-                self.socks[teamname] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                if SSL_NETWORK_INTERFACE:
+                    # Select the field ethernet (rather than Wi-Fi or
+                    # another NIC) for outgoing multicast robot commands.
+                    sock.setsockopt(
+                        socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                        socket.inet_aton(SSL_NETWORK_INTERFACE),
+                    )
+                self.socks[teamname] = sock
                 self.addrs[teamname] = (COMMAND_IP, port_num)
 
     def create_sim_clients(self):

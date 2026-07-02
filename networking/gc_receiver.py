@@ -38,13 +38,18 @@ from .gc_state import (
     GCState, GCTeamInfo,
     COMMAND_NAMES, STAGE_NAMES,
 )
+from .net_config import (
+    SSL_GC_MULTICAST_IP,
+    SSL_GC_PORT,
+    SSL_NETWORK_INTERFACE,
+)
 
 # ------------------------------------------------------------------ #
-#  Network defaults                                                   #
+#  Network defaults (sourced from net_config.py / env vars)           #
 # ------------------------------------------------------------------ #
 
-GC_MULTICAST_IP = '224.5.23.1'
-GC_PORT = 10003
+GC_MULTICAST_IP = SSL_GC_MULTICAST_IP
+GC_PORT = SSL_GC_PORT
 BUFFER_SIZE = 65536
 
 
@@ -146,6 +151,7 @@ class GCReceiver:
         multicast_ip: str = GC_MULTICAST_IP,
         port: int = GC_PORT,
         on_state: Callable[[GCState], None] | None = None,
+        interface: str | None = SSL_NETWORK_INTERFACE,
     ):
         if not _PROTO_AVAILABLE:
             raise ImportError(
@@ -159,11 +165,18 @@ class GCReceiver:
         self._multicast_ip = multicast_ip
         self._port = port
         self._on_state = on_state
+        self._interface = interface
 
         self._latest: GCState | None = None
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
+
+        # Source address of the most recently received referee packet.
+        # Per the SSL spec, this is how the GC's own IP is discovered for
+        # the Team -> GC rcon TCP channel (port 10008), since the GC IP is
+        # assigned per-match and not known in advance.
+        self._last_gc_addr: tuple[str, int] | None = None
 
     # ---------------------------------------------------------------- #
     #  Public API                                                       #
@@ -191,6 +204,16 @@ class GCReceiver:
         with self._lock:
             return self._latest
 
+    def get_gc_ip(self) -> str | None:
+        """
+        Return the IP address the last referee packet arrived from, i.e. the
+        GC's own address. Used to open the Team -> GC rcon TCP connection
+        (port 10008) without hardcoding the GC's IP, since it's assigned
+        per-match. Returns None until the first packet has been received.
+        """
+        with self._lock:
+            return self._last_gc_addr[0] if self._last_gc_addr else None
+
     # ---------------------------------------------------------------- #
     #  Internal                                                         #
     # ---------------------------------------------------------------- #
@@ -199,8 +222,11 @@ class GCReceiver:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('', self._port))
-        # Join the multicast group
-        mreq = struct.pack('4sL', socket.inet_aton(self._multicast_ip), socket.INADDR_ANY)
+        # Join the multicast group on the configured interface (falls back
+        # to INADDR_ANY / OS default when none is set), so the correct NIC
+        # is used when the machine has both Wi-Fi and field ethernet.
+        join_iface = socket.inet_aton(self._interface) if self._interface else struct.pack('I', socket.INADDR_ANY)
+        mreq = struct.pack('4s4s', socket.inet_aton(self._multicast_ip), join_iface)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(1.0)
         return sock
@@ -208,7 +234,7 @@ class GCReceiver:
     def _recv_loop(self) -> None:
         while self._running:
             try:
-                data, _ = self._sock.recvfrom(BUFFER_SIZE)
+                data, addr = self._sock.recvfrom(BUFFER_SIZE)
             except socket.timeout:
                 continue
             except OSError:
@@ -224,6 +250,7 @@ class GCReceiver:
 
             with self._lock:
                 self._latest = gc_state
+                self._last_gc_addr = addr
 
             if self._on_state:
                 self._on_state(gc_state)
