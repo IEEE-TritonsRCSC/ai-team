@@ -410,12 +410,23 @@ class CompetitionAI:
                 actions = self._dispatcher.decide_action(game_state, gc_state)
                 self.networker.execute_ai_output(actions, self.team_name)
                 return
+            # GoalieCommandProvider returns a single-element list that the serializer
+            # would route to robot 1 regardless of the goalie's unum. Merge both
+            # goalies into one unum-slotted list (robot 1 and robot 2) and send once,
+            # so neither goalie's command clobbers the other's slot (same pattern as
+            # _step_defensive).
+            n_slots = max((c.robot_id for c in self.aux_controllers), default=0)
+            merged = [None] * n_slots
             for ctrl in self.aux_controllers:
                 try:
                     cmds = ctrl.predict_commands(game_state)
-                    self.networker.execute_ai_output(cmds, self.team_name)
                 except Exception as e:
                     print(f"[CompetitionAI] goalie {ctrl.robot_id} error: {e}")
+                    continue
+                idx = ctrl.robot_id - 1
+                if cmds and 0 <= idx < n_slots and cmds[0] is not None:
+                    merged[idx] = cmds[0]
+            self.networker.execute_ai_output(merged, self.team_name)
             return
 
         if self.env is None or self.agent is None:
