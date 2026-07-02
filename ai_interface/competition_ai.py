@@ -141,9 +141,47 @@ class CompetitionAI:
         our_team = next((t for t in team_infos if t.name == self.team_name), team_infos[0])
         n_players = our_team.n_players
 
+        # Hardware-limited defensive deployment: --num_robots in {1,2,3} fields a
+        # purely scripted defensive lineup and skips the RL attacker stack entirely.
+        #   1 -> goalie (robot 1)
+        #   2 -> goalie (robot 1) + intercepting defender (robot 2)
+        #   3 -> goalie (robot 1) + defender (robot 2) + marking defender (robot 3)
+        # Robot ids are forced by the command-list routing: GoalieCommandProvider
+        # emits a single-element list (robot 1), defender/marker pad to their unum.
+        self.defensive_only = getattr(args, "num_robots", None) is not None
+
         # Emergency dual-goalie mode: ≤2 robots, skip PPO JAL entirely
-        self._dual_goalie = n_players <= 2
-        if self._dual_goalie:
+        # (defensive-only takes precedence when --num_robots is set).
+        self._dual_goalie = (not self.defensive_only) and n_players <= 2
+
+        if self.defensive_only:
+            from ai_interface.trainers.policy_control import (
+                DefenderCommandProvider,
+                MarkerDefenderCommandProvider,
+            )
+            self._num_robots = int(args.num_robots)
+            controllers = [
+                GoalieCommandProvider(
+                    team_name=self.team_name, robot_id=1, side=self.our_side,
+                ),
+            ]
+            if self._num_robots >= 2:
+                controllers.append(
+                    DefenderCommandProvider(
+                        team_name=self.team_name, robot_id=2, side=self.our_side,
+                    )
+                )
+            if self._num_robots >= 3:
+                controllers.append(
+                    MarkerDefenderCommandProvider(
+                        team_name=self.team_name, robot_id=3, side=self.our_side,
+                        ball_defender_robot_id=2,
+                    )
+                )
+            self.aux_controllers = controllers
+            self.env = None
+            self.agent = None
+        elif self._dual_goalie:
             self.aux_controllers = [
                 GoalieCommandProvider(team_name=self.team_name, robot_id=1, side=self.our_side),
                 GoalieCommandProvider(team_name=self.team_name, robot_id=2, side=self.our_side),
@@ -225,6 +263,11 @@ class CompetitionAI:
         self.networker = networker
         if self._dual_goalie:
             return  # no env or model needed in dual-goalie mode
+        if self.defensive_only:
+            # No RL env/agent to build; scripted controllers only.
+            print(f"[CompetitionAI] Defensive-only lineup: {self._num_robots} robot(s) "
+                  f"({', '.join(c.__class__.__name__ for c in self.aux_controllers)})")
+            return
 
         from ai_interface.algorithms.ppo_jal import PPOJALAgent
         from ai_interface.envs.JAL_env import JALTeamEnv
@@ -350,6 +393,16 @@ class CompetitionAI:
         """Drive one cycle of the competition stack."""
         gc_state = self._gc_receiver.get_latest()
 
+        # Hardware-limited defensive-only lineup: scripted goalie/defender/marker.
+        # GC-managed states (HALT, STOP, etc.) still route through the Dispatcher.
+        if self.defensive_only:
+            if gc_state is not None and gc_state.command not in self._LIVE_PLAY_COMMANDS:
+                actions = self._dispatcher.decide_action(game_state, gc_state)
+                self.networker.execute_ai_output(actions, self.team_name)
+                return
+            self._step_defensive(game_state)
+            return
+
         # Emergency dual-goalie mode: both robots run GoalieCommandProvider every cycle.
         # GC-managed states (HALT, STOP, etc.) still go through Dispatcher.
         if self._dual_goalie:
@@ -430,6 +483,34 @@ class CompetitionAI:
             self._obs = obs
             self._agent_mask = info.get("agent_active_mask")
             self._context_mask = info.get("context_active_mask")
+
+    def _step_defensive(self, game_state: GameState):
+        """Drive the scripted defensive lineup (goalie/defender/marker) for one cycle.
+
+        Each provider returns a unum-slotted command list; we merge them into a
+        single length-`num_robots` list and send once so no controller's `None`
+        slot clobbers another robot's command on the field multicast.
+        """
+        if self.networker is None:
+            return
+
+        playmode = getattr(game_state, "playmode", "") or ""
+        if playmode in STOP_PLAYMODES:
+            self.networker.execute_ai_output([None] * self._num_robots, self.team_name)
+            return
+
+        merged = [None] * self._num_robots
+        for ctrl in self.aux_controllers:
+            try:
+                slot = ctrl.predict_commands(game_state)
+            except Exception as e:
+                print(f"[CompetitionAI] defensive controller "
+                      f"{ctrl.__class__.__name__} error: {e}")
+                continue
+            for i, cmd in enumerate(slot):
+                if cmd is not None and i < len(merged):
+                    merged[i] = cmd
+        self.networker.execute_ai_output(merged, self.team_name)
 
     def _send_formation(self, game_state: GameState):
         """Send goto commands for all 6 robots to their formation positions."""

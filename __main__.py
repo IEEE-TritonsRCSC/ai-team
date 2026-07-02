@@ -50,6 +50,12 @@ parser.add_argument("--ppo_param_noise_std", type=float, default=0.3,
     help="Gaussian noise std on PPO params to prevent bang-bang turn stall")
 parser.add_argument("--our_color", choices=["blue", "yellow"], default="blue",
     help="Our team's SSL color assigned by the Game Controller")
+parser.add_argument("--num_robots", type=int, choices=[1, 2, 3], default=None,
+    help="Field a defensive-only lineup with this many robots (hardware-limited "
+         "deployment): 1=goalie, 2=goalie+intercepting defender, "
+         "3=goalie+intercepting defender+marking defender. When set, the RL "
+         "attacker stack is skipped and (unless --team_config is overridden) the "
+         "matching team_config_defense_<N>.json is loaded.")
 
 
 def main():
@@ -61,11 +67,25 @@ def main():
     """
     args = parser.parse_args()
 
+    # Hardware-limited defensive deployment: --num_robots picks a defensive-only
+    # lineup (goalie / +defender / +marker). Unless the user overrode --team_config,
+    # auto-select the matching team_config_defense_<N>.json so n_players/goalie_id
+    # match the number of robots we actually field.
+    if args.num_robots is not None and args.team_config == parser.get_default("team_config"):
+        args.team_config = f"team_config_defense_{args.num_robots}.json"
+
     if args.estimate_params is not None:
         from ai_interface.utils.param_estimator import ParamEstimatorAI
         team_infos = load_team_config("ai_interface/utils/estimator_config.json")
         soccer_ai = ParamEstimatorAI(team_infos, mode=args.estimate_params)
         competition_ai = None
+    elif args.num_robots is not None:
+        # Defensive-only lineup — works in any env (field or sim), no RL attacker.
+        from ai_interface.competition_ai import CompetitionAI
+        team_infos = load_team_config(args.team_config)
+        team_infos = _apply_side_order(team_infos, args.env, getattr(args, "our_side", "left"))
+        competition_ai = CompetitionAI(team_infos, args)
+        soccer_ai = None
     elif args.env == "field-tournament":
         from ai_interface.competition_ai import CompetitionAI
         team_infos = load_team_config(args.team_config)

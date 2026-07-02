@@ -9,3 +9,5 @@ text_logs/
 infer_logs/
 models/
 notion_files/
+graphify-out/
+robocup_downloads/

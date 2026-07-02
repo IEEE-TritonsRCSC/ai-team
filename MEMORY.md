@@ -182,6 +182,18 @@ always-applied context, alongside `CLAUDE.md`.
   not more hardcoded-approach tuning. 5–6 goals over ~700–800 eps is within noise; judge recovery
   changes by carry_steps/carry_segments, not goal count.
 
+## Deployment
+
+- **Hardware-limited defensive lineup: `python __main__.py --num_robots {1,2,3}`** (2026-07-02).
+  For when only a few robots work, this fields a purely scripted defensive team and **skips the RL
+  attacker stack entirely**: `1`=goalie (robot 1), `2`=+intercepting defender (robot 2),
+  `3`=+marking defender (robot 3, marks/covers, `ball_defender_robot_id=2`). Robot ids are forced
+  by the command-list routing (`GoalieCommandProvider` emits a single-element list = robot 1;
+  defender/marker pad to their unum). `--num_robots N` auto-loads `team_config_defense_N.json`
+  (TritonBots n_players=N, goalie_id=1) unless `--team_config` is overridden, and works in any
+  `--env` (routes to `CompetitionAI.defensive_only`, which builds only the scripted controllers and
+  merges their slotted commands into one send per cycle; `halt`/`time_over` → all-None).
+
 ## Conventions
 
 - Run everything with `/opt/anaconda3/envs/rcai/bin/python` (the `rcai` conda env).
