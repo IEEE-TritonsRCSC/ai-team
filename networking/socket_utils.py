@@ -17,7 +17,6 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from typing import Optional
-import sslclient
 from .data_utils import GameState, TeamInfo, Deserializer
 from .net_config import (
     LOCALHOST_IP,
@@ -25,6 +24,7 @@ from .net_config import (
     ROBOT_COMMAND_PORT,
     SSL_NETWORK_INTERFACE,
 )
+from .vision_client import SSLVisionClient
 
 try:
     import rcssserver_embedded as embedded_sim
@@ -442,7 +442,11 @@ class Listener:
             self.desired_init_poses = self.embedded_backend.desired_init_poses
         else:
             self.source = "camera"
-            self.vision_client = sslclient.client()
+            # Use our SSLVisionClient (not the raw sslclient package) so the
+            # multicast join honors SSL_NETWORK_INTERFACE instead of
+            # sslclient's unreliable gethostbyname(gethostname()) guess —
+            # critical when vision is on its own directly-wired NIC.
+            self.vision_client = SSLVisionClient()
             self.vision_client.connect()
 
     def watch_game(self) -> GameState:
