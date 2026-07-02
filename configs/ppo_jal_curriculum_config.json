@@ -809,7 +809,7 @@
         "stage4_hardcoded_support_2v2": {
             "description": "ACTIVE \u2014 HYBRID FALLBACK (2v2) \u2014 one Stage-3 PPO attacker (TritonBots robot 1) plus one hardcoded supporting attacker (robot 2) vs TeamB goalie + one scripted defender. Use this when the learned Stage-4 two-attacker policy is not reliable enough: PPO keeps the solo scorer role, the scripted supporter creates receive lanes, collects passes/loose balls, and shoots or returns the ball.",
             "num_robots": 1,
-            "timesteps": 200000,
+            "timesteps": 0,
             "robot_ids": [
                 1
             ],
@@ -983,8 +983,8 @@
             "spawn_robot_at_ball": true,
             "random_ball_x": true,
             "random_ball_x_range": [
-                25.0,
-                34.0
+                -15.0,
+                5.0
             ],
             "random_ball_y": true,
             "random_ball_y_range": [
