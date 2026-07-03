@@ -143,7 +143,7 @@ class Deserializer:
             ball_pos = self.cam_get_ball_pos(data.balls)
             robot_data = (data.robots_yellow, data.robots_blue)
             robot_poses = self.cam_get_robot_poses(robot_data)
-            return GameState(count, timestamp, ball_pos, robot_poses)
+            return GameState(count, timestamp, ball_pos, robot_poses, playmode=None)
         except Exception as e:
             print(f"Error deserializing camera data: {e}")
         return None
@@ -168,7 +168,10 @@ class Deserializer:
                 highest_confident_ball = ball
 
         if highest_confident_ball is not None:
-            ball_pos = (highest_confident_ball.x, highest_confident_ball.y)
+            # SSL-Vision reports detection coordinates in millimeters; the rest
+            # of the stack (formations, goto/kick math, field boundaries) works
+            # in meters, matching gc_receiver.py's designated_position handling.
+            ball_pos = (highest_confident_ball.x / 1000.0, highest_confident_ball.y / 1000.0)
             self.ball_last_pos = ball_pos
             return ball_pos
         
@@ -193,14 +196,22 @@ class Deserializer:
             for robot in team_robots:
                 pattern_id = robot.robot_id
                 theta = robot.orientation
-                # Convert camera radians [-π, π] to simulator degrees [-180, 180]
-                # Camera and simulator have 180° reference difference, 
-                # both use clockwise direction
-                orientation = math.degrees(theta) + 180
+                # SSL-Vision's orientation is standard math convention: 0 rad
+                # along +x, positive = counter-clockwise (confirmed against
+                # messages_robocup_ssl_detection.proto). This codebase's game
+                # pose convention is clockwise-positive degrees — see
+                # RobotAttentionEnv._clockwise_deg_to_math_rad, whose inverse
+                # is this negation. (Previously this shifted by +180 with no
+                # sign flip, which got the rotation direction backwards; if a
+                # real fixed offset turns out to be needed for how the vision
+                # pattern is mounted on our robots, verify empirically on the
+                # field and add it back explicitly.)
+                orientation = -math.degrees(theta)
                 # Normalize to [-180, 180] range
-                if orientation > 180:
-                    orientation -= 360
-                pose = (robot.x, robot.y, orientation)
+                orientation = ((orientation + 180) % 360) - 180
+                # SSL-Vision reports x/y in millimeters; convert to meters (see
+                # cam_get_ball_pos).
+                pose = (robot.x / 1000.0, robot.y / 1000.0, orientation)
                 robot_poses[teamname].append({pattern_id: pose})
         return robot_poses
 

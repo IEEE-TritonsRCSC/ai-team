@@ -469,7 +469,13 @@ class Listener:
         elif self.source == "embedded":
             return self.embedded_backend.watch_game()
         else:
-            data = self.vision_client.receive()
+            try:
+                data = self.vision_client.receive()
+            except OSError:
+                # Socket closed out from under a blocked recvfrom (e.g. shutdown()
+                # closing vision_client.sock from another thread mid-receive) —
+                # same treatment as the simulator branch above: no data this tick.
+                return None
             if data.HasField("detection"):
                 game_state = self.parser.cam_deserialize(data.detection)
                 return game_state
